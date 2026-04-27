@@ -140,10 +140,10 @@ body {
     display: inline-block;
 }
 
-.settings-content {
+.settings-content, .dropdown-content {
     position: absolute;
     right: 0;
-    top: 30px;
+    top: 40px;
     background-color: var(--bg-panel);
     min-width: 240px;
     box-shadow: 0px 8px 16px rgba(0,0,0,0.5);
@@ -151,6 +151,11 @@ body {
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 12px;
+    display: none;
+}
+
+.settings-content.show, .dropdown-content.show {
+    display: block !important;
 }
 
 .setting-row {

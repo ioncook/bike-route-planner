@@ -1,17 +1,21 @@
 // CartoDB vector tile styles — same visual look as the old raster dark/light tiles
 // but rendered by GPU (smaller downloads, crisper at all zoom levels)
 const VECTOR_STYLES = {
-    dark:     'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
-    light:    'https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json',
+    dark: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+    light: 'https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json',
     positron: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json'
 };
 
 // Raster-only basemaps (no vector equivalent)
 const RASTER_BASEMAPS = {
-    topo:      'https://a.tile.opentopomap.org/{z}/{x}/{y}.png',
+    topo: 'https://a.tile.opentopomap.org/{z}/{x}/{y}.png',
     satellite: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    cyclosm:   'https://a.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png',
-    osm:       'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
+    cyclosm: [
+        'https://a.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png',
+        'https://b.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png',
+        'https://c.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png'
+    ],
+    osm: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
 };
 
 let currentBasemap = localStorage.getItem('route_basemap') || 'dark';
@@ -22,16 +26,17 @@ const map = new maplibregl.Map({
     center: [-122.4194, 37.7749],
     zoom: 13,
     maxZoom: 20,
-    projection: 'mercator',
+    projection: { type: localStorage.getItem('route_projection') || 'mercator' },
     antialias: false,
     fadeDuration: 0,
     trackResize: true
 });
 
 function buildRasterStyle(tileUrl) {
+    const tiles = Array.isArray(tileUrl) ? tileUrl : [tileUrl];
     return {
         version: 8,
-        sources: { basemap: { type: 'raster', tiles: [tileUrl], tileSize: 256, maxzoom: 19 } },
+        sources: { basemap: { type: 'raster', tiles: tiles, tileSize: 256, maxzoom: 19 } },
         layers: [
             { id: 'bg', type: 'background', paint: { 'background-color': '#111' } },
             { id: 'basemap-layer', type: 'raster', source: 'basemap' }
@@ -52,43 +57,150 @@ let routeTotalDist = 0;
 let routeScreenPts = null;
 
 // Performance settings — display only. Backend elevation always uses max resolution.
-let PERF_MAP_POINTS = 100;    // vertices pushed to MapLibre source for rendering
-let PERF_GRAD_STOPS = 30;     // gradient colour segments on the map
-const BACKEND_ELEV_POINTS = 1000; // elevation data density — always max
+const PERF_MAP_POINTS = 5000; 
+const PERF_INTERACTION_POINTS = 1000; // Simplified hit-target for performance
+const BACKEND_ELEV_POINTS = 1000; // elevation sample density
 
 // Chart and elevation update state — declared here to avoid TDZ errors when
 // map.on('load') fires and immediately triggers updateElevationProfile
 let elevationChart = null;
 let isUpdatingElevation = false;
+let lastHoverIdx = -1;
+let isZooming = false;
+let bestCiGlobal = -1; // Exported from mousemove for use in dragging
+let waypointPathIndices = []; // Indices in currentRouteGeoJSON.coordinates where waypoints reside
+let lastSegIdx = -1;
+
+function decodePolyline6(str) {
+    let index = 0, lat = 0, lng = 0, coordinates = [];
+    while (index < str.length) {
+        let b, shift = 0, result = 0;
+        do { b = str.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+        lat += ((result & 1) ? ~(result >> 1) : (result >> 1));
+        shift = 0; result = 0;
+        do { b = str.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+        lng += ((result & 1) ? ~(result >> 1) : (result >> 1));
+        coordinates.push([lng / 1e6, lat / 1e6]);
+    }
+    return coordinates;
+}
+
+// Haversine distance between two [lng, lat] points — used in force/direct mode
+function turf_distance(a, b) {
+    const R = 6371000; // metres
+    const φ1 = a[1] * Math.PI / 180, φ2 = b[1] * Math.PI / 180;
+    const Δφ = (b[1] - a[1]) * Math.PI / 180;
+    const Δλ = (b[0] - a[0]) * Math.PI / 180;
+    const s = Math.sin(Δφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
+}
+
+function syncRoutingUI() {
+    const directCheck = document.getElementById('direct-mode-check');
+    if (directCheck) directCheck.checked = forceMode;
+}
+
+
 
 // Segments are static once built — no need to rebuild them on every pan/zoom.
 // Only rebuild routeScreenPts (for hover hit-testing) when map view changes.
 function rebuildRouteScreenPts() {
     if (!currentRouteGeoJSON) { routeScreenPts = null; return; }
-    routeScreenPts = currentRouteGeoJSON.coordinates.map(c => map.project(c));
+    const coords = currentRouteGeoJSON.coordinates;
+    const bounds = map.getBounds();
+    // Use a small buffer around bounds to ensure smooth transitions
+    const west = bounds.getWest(), east = bounds.getEast();
+    const south = bounds.getSouth(), north = bounds.getNorth();
+
+    routeScreenPts = coords.map(c => {
+        // Strict viewport check to minimize projection overhead
+        if (c[0] < west || c[0] > east || c[1] < south || c[1] > north) {
+            return null;
+        }
+        return map.project(c);
+    });
 }
 
 // Build colored GeoJSON segments and upload to the map.
 // Called once after elevation data loads (grade colors) and also immediately
-// after route load with flat green so the line is always visible.
+// Rebuild the route colour gradient using MapLibre's native line-gradient.
+// We set a single LineString source (lineMetrics:true) and drive colour via
+// ['line-progress'] — one continuous gradient, zero segment-boundary artifacts.
 function rebuildMapGradient() {
     if (!currentRouteGeoJSON) return;
     const coords = currentRouteGeoJSON.coordinates;
-    const grades = routeGrades; // may be null before elevation loads
-    const N = PERF_GRAD_STOPS;
-    const step = Math.max(1, Math.floor(coords.length / N));
-    const features = [];
-    for (let i = 0; i < coords.length - 1; i += step) {
-        const end = Math.min(i + step, coords.length - 1);
-        const grade = grades ? grades[Math.min(i, grades.length - 1)] : 0;
-        features.push({
-            type: 'Feature',
-            properties: { color: getColorForGrade(grade) },
-            geometry: { type: 'LineString', coordinates: coords.slice(i, end + 1) }
-        });
+
+    // Always update the geometry
+    const gradSrc = map.getSource('route-gradient');
+    if (gradSrc) gradSrc.setData({
+        type: 'Feature', properties: {},
+        geometry: { type: 'LineString', coordinates: coords }
+    });
+
+    const grades = routeGrades;
+    if (!grades || !routeCumDistances || routeTotalDist <= 0) {
+        // Elevation not loaded yet — flat green placeholder
+        if (map.getLayer('route-gradient-layer'))
+            map.setPaintProperty('route-gradient-layer', 'line-gradient', 'rgb(34,197,94)');
+        return;
     }
-    const src = map.getSource('route-segments');
-    if (src) src.setData({ type: 'FeatureCollection', features });
+
+    // Build ~200 evenly-spaced colour stops along [0,1] line-progress.
+    // 200 stops is far more than enough for smooth grade transitions.
+    const N_STOPS = 200;
+    const gradStops = [];
+    for (let s = 0; s <= N_STOPS; s++) {
+        const frac = s / N_STOPS;
+        const meters = frac * routeTotalDist;
+        // Binary-search for the nearest cumulative distance entry
+        let lo = 0, hi = routeCumDistances.length - 1;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (routeCumDistances[mid] < meters) lo = mid + 1;
+            else hi = mid;
+        }
+        gradStops.push(Math.min(Math.max(frac, 0), 1), getColorForGrade(grades[lo] ?? 0));
+    }
+
+    if (map.getLayer('route-gradient-layer'))
+        map.setPaintProperty('route-gradient-layer', 'line-gradient',
+            ['interpolate', ['linear'], ['line-progress'], ...gradStops]);
+
+    updateTurnaroundJoins();
+}
+
+function updateTurnaroundJoins() {
+    if (!currentRouteGeoJSON || !map.getSource('turnarounds')) return;
+    const coords = currentRouteGeoJSON.coordinates;
+    const turns = [];
+    
+    // Identify sharp turnaround points (>130 degrees)
+    for (let i = 1; i < coords.length - 1; i++) {
+        const bIn = getBearing(coords[i - 1], coords[i]);
+        const bOut = getBearing(coords[i], coords[i + 1]);
+        let delta = Math.abs(bOut - bIn);
+        if (delta > 180) delta = 360 - delta;
+        
+        if (delta > 130) {
+            turns.push({
+                type: 'Feature',
+                properties: { color: routeGrades ? getColorForGrade(routeGrades[i] ?? 0) : 'rgb(34,197,94)' },
+                geometry: { type: 'Point', coordinates: coords[i] }
+            });
+        }
+    }
+    map.getSource('turnarounds').setData({ type: 'FeatureCollection', features: turns });
+}
+
+
+
+
+function getBearing(from, to) {
+    const lat1 = from[1] * Math.PI / 180, lat2 = to[1] * Math.PI / 180;
+    const dLng = (to[0] - from[0]) * Math.PI / 180;
+    const y = Math.sin(dLng) * Math.cos(lat2);
+    const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+    return Math.atan2(y, x) * 180 / Math.PI;
 }
 
 const pinSvg = `<svg width="24" height="34" viewBox="0 -1 24 33" style="filter: drop-shadow(0 2px 2px rgba(0,0,0,0.4));"><path d="M12 0C5.37 0 0 5.37 0 12c0 9 12 20 12 20s12-11 12-20c0-6.63-5.37-12-12-12zm0 18c-3.31 0-6-2.69-6-6s2.69-6 6-6 6 2.69 6 6-2.69 6-6 6z" fill="#4b5563" fill-rule="evenodd" /></svg>`;
@@ -130,6 +242,14 @@ function hideHoverMarker() {
 
 function getDisplayDistance(meters) {
     return currentUnits === 'metric' ? meters / 1000 : meters * 0.000621371;
+}
+
+function getPixelOffset(zoom) {
+    if (zoom <= 8) return 0;
+    if (zoom <= 12) return 2 * (zoom - 8) / 4;
+    if (zoom <= 15) return 2 + 2 * (zoom - 12) / 3;
+    if (zoom <= 18) return 4 + 2 * (zoom - 15) / 3;
+    return 6;
 }
 
 function updateDistanceUI() {
@@ -183,13 +303,95 @@ function setupRouteLayers() {
     if (!map.getSource('route-segments'))
         map.addSource('route-segments', { type: 'geojson', data: { type: 'FeatureCollection', features: [] }, buffer: 0, tolerance: 0 });
 
-    // Colored grade segments — gradient, no grey outline
-    if (!map.getLayer('route-segments-layer'))
-        map.addLayer({ id: 'route-segments-layer', type: 'line', source: 'route-segments', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': ['get', 'color'], 'line-width': 6, 'line-opacity': 0.97 } });
+    // Single LineString with lineMetrics:true — required for line-gradient paint.
+    // Using one continuous feature eliminates all the corner-gap / overlap artifacts
+    // that appear when many short 2-point features are offset at bends.
+    if (!map.getSource('route-gradient'))
+        map.addSource('route-gradient', {
+            type: 'geojson',
+            data: { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [] } },
+            lineMetrics: true,
+            buffer: 64, tolerance: 0.375
+        });
 
-    // Transparent interaction layer (hit target for drag, zero visual impact)
+    if (!map.getLayer('route-gradient-layer'))
+        map.addLayer({
+            id: 'route-gradient-layer',
+            type: 'line',
+            source: 'route-gradient',
+            // miter join is required when using line-offset:
+            // round joins generate overlapping triangles at inside corners
+            // which causes the visible "overlap" artifact at bends.
+            layout: { 'line-join': 'round', 'line-cap': 'round' },
+            paint: {
+                'line-color': 'rgb(34,197,94)', // placeholder until gradient is built
+                'line-width': 5,
+                'line-opacity': 0.97,
+                'line-gradient': 'rgb(34,197,94)', // overridden by rebuildMapGradient
+                'line-offset': ['interpolate', ['linear'], ['zoom'],
+                    8, 0,
+                    12, 2,
+                    15, 4,
+                    18, 6
+                ]
+            }
+        });
+
+    // Transparent interaction layer (hit target for drag, finger cursor)
     if (!map.getLayer('route-line'))
-        map.addLayer({ id: 'route-line', type: 'line', source: 'route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#888', 'line-width': 14, 'line-opacity': 0 } });
+        map.addLayer({ id: 'route-line', type: 'line', source: 'route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#000', 'line-width': 20, 'line-opacity': 0 } });
+
+    // Invisible wide hover target (for distance/elev snapping, zero visual impact)
+    if (!map.getLayer('route-hover-target'))
+        map.addLayer({ id: 'route-hover-target', type: 'line', source: 'route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#000', 'line-width': 100, 'line-opacity': 0 } });
+
+    // Turnaround Joins: Circles that fill the gaps at sharp turns
+    if (!map.getSource('turnarounds'))
+        map.addSource('turnarounds', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+    if (!map.getLayer('turnaround-layer'))
+        map.addLayer({
+            id: 'turnaround-layer',
+            type: 'circle',
+            source: 'turnarounds',
+            paint: {
+                'circle-color': ['get', 'color'],
+                'circle-opacity': 0.97,
+                // Automatically scale circle radius to match (line-offset + line-width/2)
+                'circle-radius': ['interpolate', ['linear'], ['zoom'],
+                    8,  2.5,  // offset 0 + width/2 (2.5)
+                    12, 4.5,  // offset 2 + width/2
+                    15, 6.5,  // offset 4 + width/2
+                    18, 8.5   // offset 6 + width/2
+                ],
+                // Align with terrain
+                'circle-pitch-alignment': 'map',
+                'circle-stroke-width': 0
+            }
+        }, 'route-gradient-layer');
+
+    // Highlight for the active segment being hovered
+    if (!map.getSource('hover-segment'))
+        map.addSource('hover-segment', { type: 'geojson', data: { type: 'LineString', coordinates: [] } });
+    if (!map.getLayer('hover-segment-layer'))
+        map.addLayer({
+            id: 'hover-segment-layer',
+            type: 'line',
+            source: 'hover-segment',
+            layout: { 'line-join': 'round', 'line-cap': 'round' },
+            paint: { 'line-color': '#3b82f6', 'line-width': 7, 'line-opacity': 0.6 }
+        }, 'route-gradient-layer'); // Draw under the main route but above the background
+
+    // Dragging guides (rubber-band lines)
+    if (!map.getSource('drag-guide'))
+        map.addSource('drag-guide', { type: 'geojson', data: { type: 'LineString', coordinates: [] } });
+    if (!map.getLayer('drag-guide-layer'))
+        map.addLayer({
+            id: 'drag-guide-layer',
+            type: 'line',
+            source: 'drag-guide',
+            layout: { 'line-join': 'round', 'line-cap': 'round' },
+            paint: { 'line-color': '#3b82f6', 'line-width': 3, 'line-dasharray': [2, 1], 'line-opacity': 0.8 }
+        });
 
     // Hover circle (GPU-rendered, no DOM wrapper, no CSS square)
     if (!map.getSource('hover-point'))
@@ -199,93 +401,214 @@ function setupRouteLayers() {
     if (!map.getLayer('hover-circle-inner'))
         map.addLayer({ id: 'hover-circle-inner', type: 'circle', source: 'hover-point', paint: { 'circle-radius': 4, 'circle-color': '#374151' } });
 
+
     // Re-upload route data if already computed (e.g. after a style swap)
     if (currentRouteGeoJSON && map.getSource('route')) {
-        const mapCoords = decimateLine(currentRouteGeoJSON.coordinates, PERF_MAP_POINTS);
-        map.getSource('route').setData({ type: 'LineString', coordinates: mapCoords });
-        rebuildMapGradient();
+        const coords = currentRouteGeoJSON.coordinates;
+        // Interaction layer uses a simplified version of the line for faster R-tree lookups
+        const interactCoords = decimateLine(coords, PERF_INTERACTION_POINTS);
+        map.getSource('route').setData({ type: 'LineString', coordinates: interactCoords });
+        
+        // Visual layer uses higher resolution
+        const mapCoords = decimateLine(coords, PERF_MAP_POINTS);
+        map.getSource('route-gradient').setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: mapCoords } });
+        
+        rebuildMapGradient(); 
     }
 }
+let isFirstLoad = true;
+map.on('style.load', () => {
+    setupRouteLayers();
+    if (isFirstLoad) {
+        loadStoredSettings();
+        loadUrlState();
+        isFirstLoad = false;
+    }
+
+    // Update screen-space route cache only when map is stable
+    const updateView = () => {
+        rebuildRouteScreenPts();
+        updateTurnaroundJoins();
+    };
+    map.on('moveend', updateView);
+    map.on('zoomend', () => { isZooming = false; updateView(); });
+    map.on('zoomstart', () => { isZooming = true; });
+    map.on('idle', updateView);
+});
 
 map.on('load', () => {
-    setupRouteLayers();
+    // Basic setup already done in style.load
+});
 
-    let lastHoverIdx = -1;
-    let rafPending = false;
+// Hide hover label when the user is actively panning (not zooming).
+// During zoom we want the hover to stay visible and track the cursor.
+map.on('movestart', () => { if (!isZooming) hoverInfoEl.style.display = 'none'; });
 
-    // Only rebuild screen pts when view changes — gradient is static
-    map.on('moveend', rebuildRouteScreenPts);
-    map.on('zoomend', rebuildRouteScreenPts);
-    // Also hide info label on pan start so it doesn't lag behind
-    map.on('movestart', () => { hoverInfoEl.style.display = 'none'; });
+// Change cursor when hovering the route
+map.on('mouseenter', 'route-line', () => { map.getCanvas().style.cursor = 'pointer'; });
+map.on('mouseleave', 'route-line', () => { if (!isDraggingLine) map.getCanvas().style.cursor = ''; });
 
-    // Change cursor when hovering the route — use the transparent interaction layer
-    map.on('mouseenter', 'route-line', () => { map.getCanvas().style.cursor = 'pointer'; });
-    map.on('mouseleave', 'route-line', () => { if (!isDraggingLine) map.getCanvas().style.cursor = ''; });
+// Throttled Hover Logic: Only runs when mouse is near the route
+let lastHoverTime = 0;
+map.on('mousemove', 'route-hover-target', (e) => {
+    const now = performance.now();
+    if (now - lastHoverTime < 16) return; // 60fps throttle
+    lastHoverTime = now;
 
-    map.on('mousemove', (e) => {
-        if (!currentRouteGeoJSON || !routeScreenPts) return;
-        if (rafPending) return;
-        rafPending = true;
-        requestAnimationFrame(() => {
-            rafPending = false;
-            const coords = currentRouteGeoJSON.coordinates;
-            const mousePt = e.point;
-            let minD = Infinity;
-            let minIdx = -1;
-            for (let i = 0; i < routeScreenPts.length; i++) {
-                const p = routeScreenPts[i];
-                const d = (p.x - mousePt.x)**2 + (p.y - mousePt.y)**2;
-                if (d < minD) { minD = d; minIdx = i; }
+    if (!currentRouteGeoJSON || !routeScreenPts) return;
+    const coords = currentRouteGeoJSON.coordinates;
+    const mousePt = e.point;
+    const threshold = 2500; // 50px radius squared
+    const highlightThreshold = 49; // 7px radius squared
+
+    // Get current line-offset for projection
+    const currentOffset = getPixelOffset(map.getZoom());
+
+    let bestDistSq = Infinity;
+    let bestCi = -1;
+    let bestT = 0;
+    let bestProj = { x: 0, y: 0 };
+
+    for (let i = 0; i < routeScreenPts.length - 1; i++) {
+        const a = routeScreenPts[i];
+        const b = routeScreenPts[i + 1];
+        if (!a || !b) continue; // Skip off-screen segments
+        const abx = b.x - a.x, aby = b.y - a.y;
+        const abLenSq = abx * abx + aby * aby;
+        if (abLenSq === 0) continue;
+
+        const nx = -aby / Math.sqrt(abLenSq);
+        const ny = abx / Math.sqrt(abLenSq);
+
+        const aoX = a.x + nx * currentOffset, aoY = a.y + ny * currentOffset;
+        const boX = b.x + nx * currentOffset, boY = b.y + ny * currentOffset;
+        const abox = boX - aoX, aboy = boY - aoY;
+
+        let t = ((mousePt.x - aoX) * abox + (mousePt.y - aoY) * aboy) / abLenSq;
+        t = Math.max(0, Math.min(1, t));
+
+        const pProjX = aoX + t * abox;
+        const pProjY = aoY + t * aboy;
+        const dx = pProjX - mousePt.x;
+        const dy = pProjY - mousePt.y;
+        const dSq = dx * dx + dy * dy;
+
+        if (dSq < bestDistSq) {
+            bestDistSq = dSq;
+            bestCi = i;
+            bestT = t;
+            bestProj = { x: pProjX, y: pProjY };
+        }
+    }
+
+    if (bestCi !== -1 && bestDistSq < threshold) {
+        bestCiGlobal = bestCi;
+
+        // Unproject the best screen-space point on the offset line to get geographic coords
+        const shiftedLngLat = map.unproject([bestProj.x, bestProj.y]);
+        const lng = shiftedLngLat.lng;
+        const lat = shiftedLngLat.lat;
+
+        // Map interpolated distance → chart index via routeCumDistances
+        const ds = elevationChart?.data?.datasets?.[0];
+        const ci = bestCi;
+        let chartIdx = ci;
+        if (routeCumDistances && ds?.data?.length) {
+            const meters = routeCumDistances[ci] + bestT *
+                (routeCumDistances[Math.min(ci + 1, routeCumDistances.length - 1)] - routeCumDistances[ci]);
+            const dispDist = currentUnits === 'imperial' ? meters / 1609.344 : meters / 1000;
+            let lo = 0, hi = ds.data.length - 1;
+            while (lo < hi) {
+                const mid = (lo + hi) >> 1;
+                if (ds.data[mid].x < dispDist) lo = mid + 1; else hi = mid;
             }
+            chartIdx = lo;
+        }
+        chartIdx = Math.min(chartIdx, (ds?.data?.length ?? 1) - 1);
 
-            if (minIdx !== -1 && minD < 1600) { // 40px threshold
-                // Build info string for the floating label
-                const ds = elevationChart?.data?.datasets?.[0];
-                const pt = ds?.data?.[minIdx];
-                const grade = ds?.grades?.[minIdx];
-                const distLabel = pt ? pt.x.toFixed(2) + (currentUnits === 'metric' ? ' km' : ' mi') : '';
-                const elevLabel = pt ? pt.y.toFixed(0) + (currentUnits === 'metric' ? ' m' : ' ft') : '';
-                const gradeLabel = grade !== undefined ? (grade >= 0 ? '+' : '') + grade.toFixed(1) + '%' : '';
-                const info = `${distLabel} &nbsp;|&nbsp; ${elevLabel} &nbsp;|&nbsp; ${gradeLabel}`;
-                showHoverMarker(coords[minIdx], info);
-                if (minIdx !== lastHoverIdx) {
-                    lastHoverIdx = minIdx;
-                    if (elevationChart) {
-                        elevationChart.setActiveElements([{ datasetIndex: 0, index: minIdx }]);
-                        elevationChart.tooltip.setActiveElements([{ datasetIndex: 0, index: minIdx }]);
-                        elevationChart.update('none');
-                    }
-                }
-            } else {
-                if (lastHoverIdx !== -1) {
-                    lastHoverIdx = -1;
-                    hideHoverMarker();
-                    if (elevationChart) {
-                        elevationChart.setActiveElements([]);
-                        elevationChart.tooltip.setActiveElements([]);
-                        elevationChart.update('none');
-                    }
+        const pt = ds?.data?.[chartIdx];
+        const grade = ds?.grades?.[ci];
+        const distMeters = routeCumDistances?.[ci] ?? 0;
+        const dispDist = currentUnits === 'imperial' ? distMeters / 1609.344 : distMeters / 1000;
+        const distLabel = dispDist.toFixed(2) + (currentUnits === 'metric' ? ' km' : ' mi');
+        const elevVal = pt?.y;
+        const elevLabel = elevVal != null ? elevVal.toFixed(0) + (currentUnits === 'metric' ? ' m' : ' ft') : '';
+        const gradeLabel = grade !== undefined ? (grade >= 0 ? '+' : '') + grade.toFixed(1) + '%' : '';
+        const info = `${distLabel} &nbsp;|&nbsp; ${elevLabel} &nbsp;|&nbsp; ${gradeLabel}`;
+        showHoverMarker([lng, lat], info);
+
+        const statsDiv = document.getElementById('hover-stats');
+        if (statsDiv) {
+            statsDiv.style.opacity = '1';
+            document.getElementById('hover-dist').textContent = distLabel;
+            document.getElementById('hover-elev').textContent = elevLabel;
+            document.getElementById('hover-grade').textContent = gradeLabel;
+        }
+
+        // Update segment highlight ONLY if the segment has changed
+        if (waypointPathIndices.length >= 2 && bestDistSq < highlightThreshold) {
+            let segIdx = -1;
+            for (let j = 0; j < waypointPathIndices.length - 1; j++) {
+                if (ci >= waypointPathIndices[j] && ci < waypointPathIndices[j + 1]) {
+                    segIdx = j; break;
                 }
             }
-        });
-    });
+            if (segIdx !== -1 && segIdx !== lastSegIdx) {
+                lastSegIdx = segIdx;
+                const subCoords = currentRouteGeoJSON.coordinates.slice(
+                    waypointPathIndices[segIdx],
+                    waypointPathIndices[segIdx + 1] + 1
+                );
+                map.getSource('hover-segment')?.setData({ type: 'LineString', coordinates: subCoords });
+            }
+        } else if (lastSegIdx !== -1) {
+            lastSegIdx = -1;
+            map.getSource('hover-segment')?.setData({ type: 'LineString', coordinates: [] });
+        }
 
-    map.on('mouseleave', () => {
+        if (ci !== lastHoverIdx) {
+            lastHoverIdx = ci;
+            if (elevationChart && elevationChart.tooltip && chartIdx < (ds?.data?.length ?? 0)) {
+                try {
+                    elevationChart.setActiveElements([{ datasetIndex: 0, index: chartIdx }]);
+                    elevationChart.tooltip.setActiveElements([{ datasetIndex: 0, index: chartIdx }]);
+                    elevationChart.update('none');
+                } catch (err) {}
+            }
+        }
+    } else {
+        const statsDiv = document.getElementById('hover-stats');
+        if (statsDiv) statsDiv.style.opacity = '0';
         if (lastHoverIdx !== -1) {
             lastHoverIdx = -1;
             hideHoverMarker();
-            if (elevationChart) {
-                elevationChart.setActiveElements([]);
-                elevationChart.tooltip.setActiveElements([]);
-                elevationChart.update('none');
+            map.getSource('hover-segment')?.setData({ type: 'LineString', coordinates: [] });
+            if (elevationChart && elevationChart.tooltip) {
+                try {
+                    elevationChart.setActiveElements([]);
+                    elevationChart.tooltip.setActiveElements([]);
+                    elevationChart.update('none');
+                } catch (err) { }
             }
         }
-    });
-
-    loadStoredSettings();
-    loadUrlState();
+    }
 });
+
+map.on('mouseleave', () => {
+    if (lastHoverIdx !== -1) {
+        lastHoverIdx = -1;
+        hideHoverMarker();
+        if (elevationChart) {
+            elevationChart.setActiveElements([]);
+            elevationChart.tooltip.setActiveElements([]);
+            elevationChart.update('none');
+        }
+    }
+});
+
+
+
+
 
 function createMarker(lngLat, index) {
     const el = document.createElement('div');
@@ -298,7 +621,7 @@ function createMarker(lngLat, index) {
         .setLngLat(lngLat)
         .addTo(map);
 
-    marker.getElement().addEventListener('mousedown', (evt) => {
+    const onMiddleClick = (evt) => {
         if (evt.button === 1) { // middle click
             evt.preventDefault();
             evt.stopPropagation();
@@ -306,11 +629,14 @@ function createMarker(lngLat, index) {
             if (idx > -1) {
                 markers.splice(idx, 1);
                 waypoints.splice(idx, 1);
+                if (idx > 0) segmentModes.splice(idx - 1, 1);
                 marker.remove();
                 updateRoute();
             }
         }
-    });
+    };
+    marker.getElement().addEventListener('mousedown', onMiddleClick);
+    marker.getElement().addEventListener('auxclick', onMiddleClick);
 
     marker.on('dragend', () => {
         const idx = markers.indexOf(marker);
@@ -324,11 +650,16 @@ function createMarker(lngLat, index) {
     if (index !== undefined) {
         markers.splice(index, 0, marker);
         waypoints.splice(index, 0, [lngLat.lng, lngLat.lat]);
+        // Inserting in the middle: the new segment (index-1 → index) gets current mode
+        // The segment that was (index-1 → index) becomes (index → index+1) and keeps its mode
+        segmentModes.splice(index - 1, 0, forceMode ? 'direct' : 'routed');
     } else {
         markers.push(marker);
         waypoints.push([lngLat.lng, lngLat.lat]);
+        // Appending: record the mode for this new trailing segment
+        if (waypoints.length > 1) segmentModes.push(forceMode ? 'direct' : 'routed');
     }
-    
+
     return marker;
 }
 
@@ -339,7 +670,7 @@ let draggedWaypointIndex = -1;
 function distance(p1, p2) {
     const dx = p1[0] - p2[0];
     const dy = p1[1] - p2[1];
-    return Math.sqrt(dx*dx + dy*dy);
+    return Math.sqrt(dx * dx + dy * dy);
 }
 
 function getInsertIndex(clickedLngLat) {
@@ -348,7 +679,7 @@ function getInsertIndex(clickedLngLat) {
     let minIncrease = Infinity;
     for (let i = 0; i < waypoints.length - 1; i++) {
         const p1 = waypoints[i];
-        const p2 = waypoints[i+1];
+        const p2 = waypoints[i + 1];
         const d1 = distance(p1, [clickedLngLat.lng, clickedLngLat.lat]);
         const d2 = distance(p2, [clickedLngLat.lng, clickedLngLat.lat]);
         const dLine = distance(p1, p2);
@@ -362,43 +693,64 @@ function getInsertIndex(clickedLngLat) {
 }
 
 map.on('mousedown', 'route-line', (e) => {
+    if (e.originalEvent.button !== 0) return; // Left click only
+    if (!currentRouteGeoJSON || bestCiGlobal === -1) return;
+
+    // 1. DEAD ZONE CHECK: Don't create new waypoint if clicking very close to an existing one
+    const clickPt = e.point;
+    for (const wp of waypoints) {
+        const wpPt = map.project(wp);
+        const dist = Math.hypot(wpPt.x - clickPt.x, wpPt.y - clickPt.y);
+        if (dist < 25) return; // 25px dead zone to avoid double-drag
+    }
+
     isDraggingLine = true;
     wasDraggingLine = true;
     map.dragPan.disable();
-    
-    const insertIdx = getInsertIndex(e.lngLat);
-    createMarker(e.lngLat, insertIdx);
-    draggedWaypointIndex = insertIdx;
-});
+    map.getCanvas().style.cursor = 'grabbing';
 
-map.on('mouseenter', 'route-line', () => {
-    map.getCanvas().style.cursor = 'pointer';
-});
-
-map.on('mouseleave', 'route-line', () => {
-    if (!isDraggingLine) {
-        map.getCanvas().style.cursor = '';
+    // Which two waypoints bound this segment?
+    let insertIdx = waypoints.length;
+    for (let j = 0; j < waypointPathIndices.length - 1; j++) {
+        if (bestCiGlobal >= waypointPathIndices[j] && bestCiGlobal < waypointPathIndices[j + 1]) {
+            insertIdx = j + 1;
+            break;
+        }
     }
-});
 
-map.on('mousemove', (e) => {
-    if (isDraggingLine && draggedWaypointIndex > -1) {
-        markers[draggedWaypointIndex].setLngLat(e.lngLat);
-        waypoints[draggedWaypointIndex] = [e.lngLat.lng, e.lngLat.lat];
-    }
-});
+    // Store neighboring waypoints for rubber-banding
+    const prevWp = waypoints[insertIdx - 1];
+    const nextWp = waypoints[insertIdx];
 
-map.on('mouseup', () => {
-    if (isDraggingLine) {
+    const onMove = (moveEvent) => {
+        const lngLat = moveEvent.lngLat;
+        // Update rubber-band guide: from prev to current, and current to next
+        const guideCoords = [prevWp, [lngLat.lng, lngLat.lat]];
+        if (nextWp) guideCoords.push(nextWp);
+        map.getSource('drag-guide')?.setData({ type: 'LineString', coordinates: guideCoords });
+    };
+
+    const onUp = (upEvent) => {
         isDraggingLine = false;
-        draggedWaypointIndex = -1;
         map.dragPan.enable();
+        map.getCanvas().style.cursor = 'pointer';
+        map.off('mousemove', onMove);
+        map.off('mouseup', onUp);
+
+        // Clear guides
+        map.getSource('drag-guide')?.setData({ type: 'LineString', coordinates: [] });
+
+        createMarker(upEvent.lngLat, insertIdx);
         updateRoute();
         setTimeout(() => wasDraggingLine = false, 50);
-    }
+    };
+
+    map.on('mousemove', onMove);
+    map.on('mouseup', onUp);
 });
 
 map.on('click', (e) => {
+    if (e.originalEvent.button !== 0) return; // Left click only
     if (wasDraggingLine) return;
     createMarker(e.lngLat);
     updateRoute();
@@ -418,72 +770,154 @@ document.getElementById('map').addEventListener('contextmenu', (e) => e.preventD
 
 let currentRouteGeoJSON = null;
 let needsElevationUpdate = false;
+let forceMode = false; // straight-line mode — skips OSRM routing
+let segmentModes = []; // 'routed' | 'direct' for each segment between consecutive waypoints
 
-function updateRoute() {
+// Fetch a single routed segment from OSRM; returns coordinate array or null
+async function fetchRoutedSegment(from, to) {
+    const coordStr = `${from[0]},${from[1]};${to[0]},${to[1]}`;
+    try {
+        const res = await fetch(`https://routing.openstreetmap.de/routed-bike/route/v1/driving/${coordStr}?overview=full&geometries=geojson`);
+        const data = await res.json();
+        if (data.code === 'Ok' && data.routes.length > 0) {
+            return { coords: data.routes[0].geometry.coordinates, dist: data.routes[0].distance };
+        }
+    } catch (e) { /* fall through */ }
+    return null;
+}
+
+async function updateRoute() {
     if (waypoints.length === 0 || waypoints.length === 1) {
-        if (map.getSource('route')) {
-            map.getSource('route').setData({ type: 'LineString', coordinates: [] });
-        }
-        if (map.getSource('route-segments')) {
-            map.getSource('route-segments').setData({ type: 'FeatureCollection', features: [] });
-        }
+        if (map.getSource('route')) map.getSource('route').setData({ type: 'LineString', coordinates: [] });
+        if (map.getSource('route-segments')) map.getSource('route-segments').setData({ type: 'FeatureCollection', features: [] });
+        if (map.getSource('route-gradient')) map.getSource('route-gradient').setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [] } });
         currentDistanceMeters = 0;
         currentRouteGeoJSON = null;
+        routeGrades = null; routeCumDistances = null; routeTotalDist = 0;
         updateDistanceUI();
         updateElevationProfile();
         syncUrl();
         return;
     }
 
-    // Fetch routing from OSRM
-    const coords = waypoints.map(wp => `${wp[0]},${wp[1]}`).join(';');
-    fetch(`https://routing.openstreetmap.de/routed-bike/route/v1/driving/${coords}?overview=full&geometries=geojson`)
-        .then(res => res.json())
-        .then(data => {
-            if (data.code === 'Ok' && data.routes.length > 0) {
-                const route = data.routes[0];
-                currentDistanceMeters = route.distance;
-                
-                waypointDistances = [0];
-                let d = 0;
-                if (route.legs) {
-                    for (const leg of route.legs) {
-                        d += leg.distance;
-                        waypointDistances.push(d);
-                    }
+    // Default to avoiding motorways/tolls since UI is hidden
+    const avoidMotorways = document.getElementById('avoid-motorways-check') ? document.getElementById('avoid-motorways-check').checked : true;
+    const avoidTolls = document.getElementById('avoid-tolls-check') ? document.getElementById('avoid-tolls-check').checked : true;
+    const avoidUnpaved = document.getElementById('avoid-unpaved-check') ? document.getElementById('avoid-unpaved-check').checked : false;
+
+    let exclude = [];
+    if (avoidMotorways) exclude.push('motorway');
+    if (avoidTolls) exclude.push('toll');
+
+    const excludeParam = ''; // OSRM demo server doesn't support exclude in cycling profile
+
+    // Build route segment by segment, respecting each segment's stored mode
+    let allCoords = [];
+    let totalDist = 0;
+
+    for (let i = 0; i < waypoints.length - 1; i++) {
+        const from = waypoints[i];
+        const to = waypoints[i + 1];
+        const mode = segmentModes[i] || 'routed';
+
+        let segCoords, segDist;
+
+        if (mode === 'direct') {
+            segCoords = [from, to];
+            segDist = turf_distance(from, to);
+        } else {
+            try {
+                // Tiered OSRM Fallback:
+                // 1. Swiss OSRM (Excellent bike profile, CORS enabled)
+                // 2. German OSRM (Strict bike safety, CORS enabled)
+                // 3. Project OSRM Demo (Reliable, but may use freeways)
+
+                const endpoints = [
+                    `https://osrm.osm.ch/route/v1/cycling/${from[0]},${from[1]};${to[0]},${to[1]}?overview=full&geometries=geojson`,
+                    `https://routing.openstreetmap.de/routed-bike/route/v1/bicycle/${from[0]},${from[1]};${to[0]},${to[1]}?overview=full&geometries=geojson`,
+                    `https://router.project-osrm.org/route/v1/cycling/${from[0]},${from[1]};${to[0]},${to[1]}?overview=full&geometries=geojson`
+                ];
+
+                let data = null;
+                for (const url of endpoints) {
+                    try {
+                        const resp = await fetch(url);
+                        if (!resp.ok) continue;
+                        data = await resp.json();
+                        if (data.code === 'Ok' && data.routes.length > 0) break;
+                    } catch (e) { continue; }
                 }
-                
-                updateDistanceUI();
-                
-                currentRouteGeoJSON = route.geometry;
-                currentRouteGeoJSON.coordinates = resampleLine(currentRouteGeoJSON.coordinates, BACKEND_ELEV_POINTS);
 
-                // Push a decimated version to the route source (used for hover)
-                const mapCoords = decimateLine(currentRouteGeoJSON.coordinates, PERF_MAP_POINTS);
-                if (map.getSource('route')) {
-                    map.getSource('route').setData({ type: 'LineString', coordinates: mapCoords });
+                if (data && data.code === 'Ok' && data.routes.length > 0) {
+                    segCoords = data.routes[0].geometry.coordinates;
+                    segDist = data.routes[0].distance;
+                } else {
+                    segCoords = [from, to];
+                    segDist = turf_distance(from, to);
                 }
-
-                // Immediately show the route in flat green — grade colors come after elevation loads
-                rebuildMapGradient();
-
-                // Rebuild screen-space cache for hover
-                if (typeof rebuildRouteScreenPts === 'function') rebuildRouteScreenPts();
-
-                needsElevationUpdate = true;
-                updateElevationProfile();
-                syncUrl();
+            } catch (err) {
+                segCoords = [from, to];
+                segDist = turf_distance(from, to);
             }
-        })
-        .catch(err => console.error("Routing error:", err));
+        }
+        if (i > 0) segCoords.shift(); // remove overlapping waypoint
+        allCoords.push(...segCoords);
+        totalDist += segDist;
+    }
+
+    currentDistanceMeters = totalDist;
+    const rawCoords = resampleLine(allCoords, BACKEND_ELEV_POINTS);
+    currentRouteGeoJSON = { type: 'LineString', coordinates: rawCoords };
+
+    // Track which indices in the final path correspond to our waypoints
+    // We search the resampled path for the closest points to our waypoints.
+    waypointPathIndices = waypoints.map(wp => {
+        let bestIdx = 0;
+        let minDist = Infinity;
+        for (let i = 0; i < rawCoords.length; i++) {
+            const rc = rawCoords[i];
+            if (!rc || isNaN(rc[0]) || isNaN(rc[1])) continue;
+            const d = turf_distance(wp, rc);
+            if (d < minDist) { minDist = d; bestIdx = i; }
+        }
+        return bestIdx;
+    });
+
+    const mapCoords = decimateLine(currentRouteGeoJSON.coordinates, PERF_MAP_POINTS);
+    if (map.getSource('route')) map.getSource('route').setData({ type: 'LineString', coordinates: mapCoords });
+    rebuildMapGradient();
+    if (typeof rebuildRouteScreenPts === 'function') rebuildRouteScreenPts();
+    updateDistanceUI();
+    needsElevationUpdate = true;
+    updateElevationProfile();
+    syncUrl();
+    updateTurnaroundJoins();
 }
+
 
 document.getElementById('clear-route').addEventListener('click', () => {
     waypoints = [];
     markers.forEach(m => m.remove());
     markers = [];
+    segmentModes = [];
     updateRoute();
 });
+
+function fitRoute() {
+    if (!currentRouteGeoJSON || currentRouteGeoJSON.coordinates.length === 0) {
+        if (waypoints.length > 0) {
+            const bounds = new maplibregl.LngLatBounds();
+            waypoints.forEach(wp => bounds.extend(wp));
+            map.fitBounds(bounds, { padding: 60, duration: 600 });
+        }
+        return;
+    }
+    const bounds = new maplibregl.LngLatBounds();
+    currentRouteGeoJSON.coordinates.forEach(c => bounds.extend(c));
+    map.fitBounds(bounds, { padding: 60, duration: 600 });
+}
+
+document.getElementById('fit-route-btn').addEventListener('click', fitRoute);
 
 function toggleSettings(event) {
     const menu = document.getElementById('settings-menu');
@@ -494,14 +928,6 @@ function toggleSettings(event) {
     }
     event.stopPropagation();
 }
-
-document.addEventListener('click', (event) => {
-    const menu = document.getElementById('settings-menu');
-    const btn = document.getElementById('settings-btn');
-    if (menu && btn && menu.style.display === 'block' && !menu.contains(event.target) && !btn.contains(event.target)) {
-        menu.style.display = 'none';
-    }
-});
 
 // Settings Handlers
 document.getElementById('theme').addEventListener('change', (e) => {
@@ -524,17 +950,30 @@ document.getElementById('basemap').addEventListener('change', (e) => {
         : buildRasterStyle(RASTER_BASEMAPS[val] || RASTER_BASEMAPS.osm);
 
     map.setStyle(newStyle);
-    // Re-add route/hover layers after the new style finishes loading
-    map.once('style.load', () => {
+
+    // After a setStyle() call all custom sources/layers are wiped.
+    // Re-add them once the new style is ready.
+    // We use both 'style.load' AND a 200ms fallback because inline raster styles
+    // can finish loading synchronously before the once() listener is registered.
+    let _setupDone = false;
+    const _doSetup = () => {
+        if (_setupDone) return;
+        _setupDone = true;
         setupRouteLayers();
         applyTerrain();
-    });
+    };
+    map.once('style.load', _doSetup);
+    setTimeout(() => {
+        if (!_setupDone && map.isStyleLoaded()) _doSetup();
+    }, 200);
 });
 
 document.getElementById('units').addEventListener('change', (e) => {
     currentUnits = e.target.value;
     localStorage.setItem('route_units', currentUnits);
     updateDistanceUI();
+    // Force chart to re-render with new units (elevation data is cached in the worker tile cache)
+    needsElevationUpdate = true;
     if (typeof updateElevationProfile === 'function') updateElevationProfile();
 });
 
@@ -544,22 +983,108 @@ document.getElementById('projection').addEventListener('change', (e) => {
     map.setProjection({ type: proj });
 });
 
-function applyPerfSetting() {
-    PERF_MAP_POINTS = parseInt(document.getElementById('map-line-points').value) || 100;
-    PERF_GRAD_STOPS = parseInt(document.getElementById('gradient-stops').value) || 30;
-    localStorage.setItem('route_map_points', PERF_MAP_POINTS);
-    localStorage.setItem('route_grad_stops', PERF_GRAD_STOPS);
-    // Rebuild map display with new settings (elevation data is unchanged)
-    if (currentRouteGeoJSON && map.getSource('route')) {
-        const mapCoords = decimateLine(currentRouteGeoJSON.coordinates, PERF_MAP_POINTS);
-        map.getSource('route').setData({ type: 'LineString', coordinates: mapCoords });
-        rebuildRouteScreenPts();
-        rebuildMapGradient();
-    }
+// GPX Import: supports track (trkpt) and route/waypoint (rtept, wpt) formats
+function importGPX(file) {
+    const reader = new FileReader();
+    reader.onload = e => {
+        try {
+            const xml = new DOMParser().parseFromString(e.target.result, 'application/xml');
+            const trkpts = [...xml.querySelectorAll('trkpt')];
+            const rtepts = [...xml.querySelectorAll('rtept')];
+            const wpts = [...xml.querySelectorAll('wpt')];
+
+            // Clear current route
+            waypoints = [];
+            markers.forEach(m => m.remove());
+            markers = [];
+            segmentModes = [];
+            currentRouteGeoJSON = null;
+
+            if (trkpts.length > 0) {
+                // GPS track — use coordinates directly, place markers at start/end only
+                const coords = trkpts
+                    .map(pt => [parseFloat(pt.getAttribute('lon')), parseFloat(pt.getAttribute('lat'))])
+                    .filter(c => !isNaN(c[0]) && !isNaN(c[1]));
+                if (coords.length < 2) { alert('GPX track has fewer than 2 valid points.'); return; }
+
+                createMarker({ lng: coords[0][0], lat: coords[0][1] });
+                createMarker({ lng: coords[coords.length - 1][0], lat: coords[coords.length - 1][1] });
+                segmentModes = ['direct'];
+
+                let totalDist = 0;
+                for (let i = 0; i < coords.length - 1; i++) totalDist += turf_distance(coords[i], coords[i + 1]);
+                currentDistanceMeters = totalDist;
+                currentRouteGeoJSON = { type: 'LineString', coordinates: resampleLine(coords, BACKEND_ELEV_POINTS) };
+
+                const mapCoords = decimateLine(currentRouteGeoJSON.coordinates, PERF_MAP_POINTS);
+                if (map.getSource('route')) map.getSource('route').setData({ type: 'LineString', coordinates: mapCoords });
+                rebuildMapGradient();
+                rebuildRouteScreenPts();
+                updateDistanceUI();
+
+                const bounds = new maplibregl.LngLatBounds();
+                coords.forEach(c => bounds.extend(c));
+                map.fitBounds(bounds, { padding: 60, maxZoom: 17, duration: 700 });
+
+                needsElevationUpdate = true;
+                updateElevationProfile();
+                syncUrl();
+            } else {
+                // Route/waypoints — create markers and route via OSRM / direct
+                const pts = rtepts.length > 0 ? rtepts : wpts;
+                if (pts.length < 2) { alert('GPX has fewer than 2 waypoints.'); return; }
+                pts.forEach(pt => {
+                    const lat = parseFloat(pt.getAttribute('lat'));
+                    const lng = parseFloat(pt.getAttribute('lon'));
+                    if (!isNaN(lat) && !isNaN(lng)) createMarker({ lng, lat });
+                });
+                updateRoute();
+            }
+        } catch (err) {
+            console.error('GPX import error:', err);
+            alert('Failed to parse GPX file. Make sure it is a valid .gpx file.');
+        }
+    };
+    reader.readAsText(file);
 }
 
-document.getElementById('map-line-points').addEventListener('change', applyPerfSetting);
-document.getElementById('gradient-stops').addEventListener('change', applyPerfSetting);
+// GPX Export: download current route as a standard .gpx track file
+function downloadGPX() {
+    if (!currentRouteGeoJSON) { alert('No route to download.'); return; }
+    const coords = currentRouteGeoJSON.coordinates;
+    const chartPts = elevationChart?.data?.datasets?.[0]?.data;
+
+    const trkpts = coords.map((c, i) => {
+        let eleTag = '';
+        if (chartPts && chartPts.length > 1) {
+            const ratio = i / (coords.length - 1);
+            const ci = Math.round(ratio * (chartPts.length - 1));
+            const displayElev = chartPts[ci]?.y;
+            if (displayElev != null) {
+                // Convert display value back to metres
+                const elevM = currentUnits === 'imperial' ? displayElev / 3.28084 : displayElev;
+                eleTag = `\n        <ele>${elevM.toFixed(1)}</ele>`;
+            }
+        }
+        return `      <trkpt lat="${c[1].toFixed(6)}" lon="${c[0].toFixed(6)}">${eleTag}\n      </trkpt>`;
+    }).join('\n');
+
+    const gpx = `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="Bike Route Planner" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk>
+    <name>Bike Route</name>
+    <trkseg>
+${trkpts}
+    </trkseg>
+  </trk>
+</gpx>`;
+
+    const blob = new Blob([gpx], { type: 'application/gpx+xml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'bike-route.gpx'; a.click();
+    URL.revokeObjectURL(url);
+}
 
 function applyTerrain() {
     const show = document.getElementById('hillshade-check').checked;
@@ -590,7 +1115,45 @@ function applyTerrain() {
 document.getElementById('hillshade-check').addEventListener('change', applyTerrain);
 document.getElementById('terrain-exaggeration').addEventListener('change', applyTerrain);
 
+document.getElementById('routing-settings-btn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    document.getElementById('routing-menu')?.classList.toggle('show');
+    document.getElementById('settings-menu').classList.remove('show');
+});
+
+function toggleSettings(event) {
+    event.stopPropagation();
+    document.getElementById('settings-menu').classList.toggle('show');
+    document.getElementById('routing-menu')?.classList.remove('show');
+}
+
+document.getElementById('direct-mode-check')?.addEventListener('change', (e) => {
+    forceMode = e.target.checked;
+    localStorage.setItem('route_force_mode', forceMode);
+});
+
+['avoid-motorways-check', 'avoid-tolls-check', 'avoid-unpaved-check'].forEach(id => {
+    document.getElementById(id)?.addEventListener('change', () => {
+        updateRoute();
+    });
+});
+
+window.addEventListener('click', () => {
+    document.getElementById('routing-menu')?.classList.remove('show');
+    document.getElementById('settings-menu').classList.remove('show');
+});
+
+document.getElementById('routing-menu')?.addEventListener('click', e => e.stopPropagation());
+document.getElementById('settings-menu').addEventListener('click', e => e.stopPropagation());
+
 function loadStoredSettings() {
+    const fMode = localStorage.getItem('route_force_mode');
+    if (fMode !== null) {
+        forceMode = fMode === 'true';
+        const cb = document.getElementById('direct-mode-check');
+        if (cb) cb.checked = forceMode;
+    }
+
     // Theme — purely CSS, safe to dispatch
     const theme = localStorage.getItem('route_theme');
     if (theme) {
@@ -615,11 +1178,13 @@ function loadStoredSettings() {
         updateDistanceUI();
     }
 
-    // Projection — calls map.setProjection, safe after load
+    // Projection — safe after load
     const proj = localStorage.getItem('route_projection');
     if (proj) {
         document.getElementById('projection').value = proj;
-        map.setProjection({ type: proj });
+        if (map.getProjection()?.type !== proj) {
+            map.setProjection({ type: proj });
+        }
     }
 
     // Terrain/hillshade UI values (applyTerrain reads them)
@@ -632,17 +1197,21 @@ function loadStoredSettings() {
         document.getElementById('terrain-exaggeration').value = exaggeration;
     }
 
-    // Performance settings
-    const mapPoints = localStorage.getItem('route_map_points');
-    if (mapPoints) { PERF_MAP_POINTS = parseInt(mapPoints); document.getElementById('map-line-points').value = PERF_MAP_POINTS; }
-    const gradStops = localStorage.getItem('route_grad_stops');
-    if (gradStops) { PERF_GRAD_STOPS = parseInt(gradStops); document.getElementById('gradient-stops').value = PERF_GRAD_STOPS; }
-
     // Apply terrain after all values are set (layers exist by now)
     applyTerrain();
 }
 
-Chart.Interaction.modes.routeHover = function(chart, e, options, useFinalPosition) {
+// Wire up GPX buttons
+document.getElementById('gpx-import-btn').addEventListener('click', () => {
+    document.getElementById('gpx-file-input').click();
+});
+document.getElementById('gpx-file-input').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (file) { importGPX(file); e.target.value = ''; }
+});
+document.getElementById('gpx-download-btn').addEventListener('click', downloadGPX);
+
+Chart.Interaction.modes.routeHover = function (chart, e, options, useFinalPosition) {
     const items = [];
     const meta = chart.getDatasetMeta(0);
     if (!meta || !meta.data || !meta.data.length) return items;
@@ -673,31 +1242,31 @@ Chart.Interaction.modes.routeHover = function(chart, e, options, useFinalPositio
 
 function haversineDistance(c1, c2) {
     const R = 6371e3;
-    const phi1 = c1[1] * Math.PI/180;
-    const phi2 = c2[1] * Math.PI/180;
-    const dPhi = (c2[1]-c1[1]) * Math.PI/180;
-    const dLambda = (c2[0]-c1[0]) * Math.PI/180;
-    const a = Math.sin(dPhi/2) * Math.sin(dPhi/2) +
-            Math.cos(phi1) * Math.cos(phi2) *
-            Math.sin(dLambda/2) * Math.sin(dLambda/2);
-    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    const phi1 = c1[1] * Math.PI / 180;
+    const phi2 = c2[1] * Math.PI / 180;
+    const dPhi = (c2[1] - c1[1]) * Math.PI / 180;
+    const dLambda = (c2[0] - c1[0]) * Math.PI / 180;
+    const a = Math.sin(dPhi / 2) * Math.sin(dPhi / 2) +
+        Math.cos(phi1) * Math.cos(phi2) *
+        Math.sin(dLambda / 2) * Math.sin(dLambda / 2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
 function resampleLine(coords, maxPoints = 500) {
     if (coords.length <= 1) return coords;
-    
+
     let totalDist = 0;
     for (let i = 1; i < coords.length; i++) {
-        totalDist += haversineDistance(coords[i-1], coords[i]);
+        totalDist += haversineDistance(coords[i - 1], coords[i]);
     }
-    
+
     let segmentLength = totalDist / maxPoints;
     if (segmentLength < 30) segmentLength = 30; // Minimum 30m resolution to prevent point explosion
-    
+
     const resampled = [];
     resampled.push(coords[0]);
     for (let i = 1; i < coords.length; i++) {
-        const p1 = coords[i-1];
+        const p1 = coords[i - 1];
         const p2 = coords[i];
         const dist = haversineDistance(p1, p2);
         if (dist > segmentLength) {
@@ -792,56 +1361,97 @@ function initChart() {
                 intersect: false
             },
             onHover: (event, activeElements, chart) => {
-                if (!currentRouteGeoJSON || !currentRouteGeoJSON.coordinates) return;
-                
-                const xValue = chart.scales.x.getValueForPixel(event.x);
-                const data = chart.data.datasets[0].data;
+                if (!currentRouteGeoJSON || !currentRouteGeoJSON.coordinates) { hideHoverMarker(); return; }
+
+                const data = chart.data.datasets[0]?.data;
                 const coords = currentRouteGeoJSON.coordinates;
-                
-                if (!data || data.length < 2) {
-                    if (activeElements.length > 0) {
-                        const el = activeElements.find(e => e.datasetIndex === 0);
-                        if (el) showHoverMarker(coords[el.index]);
-                    } else {
-                        hideHoverMarker();
-                    }
-                    return;
-                }
+                if (!data || data.length < 2 || !coords || coords.length < 2) { hideHoverMarker(); return; }
 
-                let low = 0;
-                let high = data.length - 2;
-                let i = 0;
+                const xValue = chart.scales.x.getValueForPixel(event.x); // display-unit distance
+
+                // Find the chart data index closest to the hover x
+                let low = 0, high = data.length - 2, i = 0;
                 while (low <= high) {
-                    let mid = Math.floor((low + high) / 2);
-                    if (data[mid].x <= xValue) {
-                        i = mid;
-                        low = mid + 1;
-                    } else {
-                        high = mid - 1;
-                    }
+                    const mid = (low + high) >> 1;
+                    if (data[mid].x <= xValue) { i = mid; low = mid + 1; }
+                    else high = mid - 1;
                 }
 
-                const nextIdx = i + 1;
-                const t = (data[nextIdx].x === data[i].x) ? 0 : 
-                          Math.max(0, Math.min(1, (xValue - data[i].x) / (data[nextIdx].x - data[i].x)));
-                
-                const lng = coords[i][0] + t * (coords[nextIdx][0] - coords[i][0]);
-                const lat = coords[i][1] + t * (coords[nextIdx][1] - coords[i][1]);
-                // Build the same info string used by the map hover
+                // Map hover x-value (display distance) → coordinate index via routeCumDistances
+                // This is accurate even if chart data has been filtered/resampled.
+                let ci = 0;
+                if (routeCumDistances && routeCumDistances.length === coords.length) {
+                    const xMeters = currentUnits === 'imperial' ? xValue * 1609.344 : xValue * 1000;
+                    let lo = 0, hi = routeCumDistances.length - 2;
+                    while (lo <= hi) {
+                        const mid = (lo + hi) >> 1;
+                        if (routeCumDistances[mid] <= xMeters) { ci = mid; lo = mid + 1; }
+                        else hi = mid - 1;
+                    }
+                    ci = Math.min(ci, coords.length - 2);
+                } else {
+                    // Fallback: proportional mapping
+                    const ratio = i / Math.max(1, data.length - 1);
+                    ci = Math.min(Math.floor(ratio * (coords.length - 1)), coords.length - 2);
+                }
+                const ciNext = ci + 1;
+
+                const t = (data[i + 1] && data[i + 1].x !== data[i].x)
+                    ? Math.max(0, Math.min(1, (xValue - data[i].x) / (data[i + 1].x - data[i].x)))
+                    : 0;
+
+                // Get geographic center point
+                const lngCenter = coords[ci][0] + t * (coords[ciNext][0] - coords[ci][0]);
+                const latCenter = coords[ci][1] + t * (coords[ciNext][1] - coords[ci][1]);
+
+                // Shift to offset side in screen space, then unproject
+                const pCenter = map.project([lngCenter, latCenter]);
+                const p0 = map.project(coords[ci]);
+                const p1 = map.project(coords[ciNext]);
+                const vX = p1.x - p0.x, vY = p1.y - p0.y;
+                const len = Math.sqrt(vX * vX + vY * vY);
+                let shiftedLngLat;
+                if (len > 0.1) {
+                    const nx = -vY / len, ny = vX / len;
+                    const off = getPixelOffset(map.getZoom());
+                    shiftedLngLat = map.unproject([pCenter.x + nx * off, pCenter.y + ny * off]);
+                } else {
+                    shiftedLngLat = { lng: lngCenter, lat: latCenter };
+                }
+                const lng = shiftedLngLat.lng;
+                const lat = shiftedLngLat.lat;
+
                 const ds = chart.data.datasets[0];
-                const grade = ds.grades?.[i];
+                const grade = ds.grades?.[ci];
                 const distLabel = data[i].x.toFixed(2) + (currentUnits === 'metric' ? ' km' : ' mi');
-                const elevLabel = (currentUnits === 'metric' ? data[i].y.toFixed(0) + ' m' : data[i].y.toFixed(0) + ' ft');
+                const elevVal = data[i].y;
+                const elevLabel = elevVal != null
+                    ? elevVal.toFixed(0) + (currentUnits === 'metric' ? ' m' : ' ft')
+                    : '';
                 const gradeLabel = grade !== undefined ? (grade >= 0 ? '+' : '') + grade.toFixed(1) + '%' : '';
+
                 const info = `${distLabel} &nbsp;|&nbsp; ${elevLabel} &nbsp;|&nbsp; ${gradeLabel}`;
                 showHoverMarker([lng, lat], info);
+
+                const statsDiv = document.getElementById('hover-stats');
+                if (statsDiv) {
+                    statsDiv.style.opacity = '1';
+                    document.getElementById('hover-dist').textContent = distLabel;
+                    document.getElementById('hover-elev').textContent = elevLabel;
+                    document.getElementById('hover-grade').textContent = gradeLabel;
+                }
+            },
+            onLeave: () => {
+                const statsDiv = document.getElementById('hover-stats');
+                if (statsDiv) statsDiv.style.opacity = '0';
+                hideHoverMarker();
             },
             plugins: {
                 legend: { display: false },
                 tooltip: { enabled: false }  // disabled — we use the floating hoverInfoEl instead
             },
             scales: {
-                x: { 
+                x: {
                     type: 'linear',
                     display: true,
                     min: 0,
@@ -849,7 +1459,7 @@ function initChart() {
                     grid: { color: '#333' },
                     ticks: { color: '#aaa' }
                 },
-                y: { 
+                y: {
                     display: true,
                     title: { display: true, text: 'Elevation', color: '#aaa' },
                     grid: { color: '#333' },
@@ -899,7 +1509,7 @@ function initChart() {
 async function updateElevationProfile() {
     if (isUpdatingElevation) return;
     if (!elevationChart) initChart();
-    
+
     if (!currentRouteGeoJSON || !needsElevationUpdate) {
         if (!currentRouteGeoJSON && elevationChart) {
             elevationChart.data.labels = [];
@@ -911,7 +1521,7 @@ async function updateElevationProfile() {
     }
 
     isUpdatingElevation = true;
-    
+
     try {
         const coords = currentRouteGeoJSON.coordinates;
         const chartData = [];
@@ -925,7 +1535,7 @@ async function updateElevationProfile() {
 
         // Build cumDistances for map gradient (elevation/grade rebuilt below via median filter)
         for (let i = 1; i < coords.length; i++) {
-            distMeters += haversineDistance(coords[i-1], coords[i]);
+            distMeters += haversineDistance(coords[i - 1], coords[i]);
             cumDistances.push(distMeters);
         }
 
@@ -948,16 +1558,16 @@ async function updateElevationProfile() {
         let filteredMax = -Infinity, filteredMin = Infinity;
         for (let i = 0; i < coords.length; i++) {
             const val = medianElevations[i];
-            if (i > 0) filteredDist += haversineDistance(coords[i-1], coords[i]);
+            if (i > 0) filteredDist += haversineDistance(coords[i - 1], coords[i]);
             const displayElev = currentUnits === 'metric' ? val : val * 3.28084;
             filteredChartData.push({ x: getDisplayDistance(filteredDist), y: displayElev ?? null });
             if (displayElev != null) {
                 if (displayElev > filteredMax) filteredMax = displayElev;
                 if (displayElev < filteredMin) filteredMin = displayElev;
             }
-            if (i > 0 && medianElevations[i] != null && medianElevations[i-1] != null) {
-                const rise = medianElevations[i] - medianElevations[i-1];
-                const run = haversineDistance(coords[i-1], coords[i]);
+            if (i > 0 && medianElevations[i] != null && medianElevations[i - 1] != null) {
+                const rise = medianElevations[i] - medianElevations[i - 1];
+                const run = haversineDistance(coords[i - 1], coords[i]);
                 filteredGrades.push(run > 0 ? (rise / run) * 100 : 0);
             } else {
                 filteredGrades.push(0);
@@ -985,61 +1595,66 @@ async function updateElevationProfile() {
 
         // Pre-build color arrays once so Chart.js has zero work per frame
         const borderColors = smoothedGrades.map(g => getColorForGrade(g));
-    const wpData = [];
-    for (let i = 1; i < waypointDistances.length - 1; i++) {
-        const wpMeters = waypointDistances[i];
-        const displayWpMeters = getDisplayDistance(wpMeters);
-        let closestPt = chartData[0];
-        let minDiff = Infinity;
-        for (const pt of chartData) {
-            if (pt.y === null) continue;
-            const diff = Math.abs(pt.x - displayWpMeters);
-            if (diff < minDiff) {
-                minDiff = diff;
-                closestPt = pt;
+        const wpData = [];
+        for (let i = 1; i < waypointDistances.length - 1; i++) {
+            const wpMeters = waypointDistances[i];
+            const displayWpMeters = getDisplayDistance(wpMeters);
+            let closestPt = chartData[0];
+            let minDiff = Infinity;
+            for (const pt of chartData) {
+                if (pt.y === null) continue;
+                const diff = Math.abs(pt.x - displayWpMeters);
+                if (diff < minDiff) {
+                    minDiff = diff;
+                    closestPt = pt;
+                }
             }
+            if (closestPt) wpData.push({ x: displayWpMeters, y: closestPt.y });
         }
-        if (closestPt) wpData.push({ x: displayWpMeters, y: closestPt.y });
-    }
 
-    elevationChart.data.datasets[0].data = chartData;
-    elevationChart.data.datasets[0].grades = smoothedGrades;
-    elevationChart.data.datasets[0].borderColor = borderColors;
-    
-    if (elevationChart.data.datasets.length > 1) {
-        elevationChart.data.datasets[1].data = wpData;
-    } else {
-        elevationChart.data.datasets.push({
-            label: 'Waypoints',
-            data: wpData,
-            type: 'scatter',
-            pointStyle: wpImage,
-        });
-    }
+        elevationChart.data.datasets[0].data = chartData;
+        elevationChart.data.datasets[0].grades = smoothedGrades;
+        elevationChart.data.datasets[0].borderColor = borderColors;
 
-    // Store grades/distances for viewport-aware map gradient rebuilds
-    routeGrades = smoothedGrades;
-    routeCumDistances = cumDistances;
-    routeTotalDist = distMeters;
+        if (elevationChart.data.datasets.length > 1) {
+            elevationChart.data.datasets[1].data = wpData;
+        } else {
+            elevationChart.data.datasets.push({
+                label: 'Waypoints',
+                data: wpData,
+                type: 'scatter',
+                pointStyle: wpImage,
+            });
+        }
 
-    // Trigger map gradient build — map outline shows until segments are ready
-    rebuildMapGradient();
-    rebuildRouteScreenPts();
+        // Store grades/distances for viewport-aware map gradient rebuilds
+        routeGrades = smoothedGrades;
+        routeCumDistances = cumDistances;
+        routeTotalDist = distMeters;
 
-    elevationChart.options.scales.x.max = getDisplayDistance(distMeters);
-    elevationChart.options.scales.x.title.text = `Distance (${currentUnits === 'metric' ? 'km' : 'mi'})`;
-    elevationChart.options.scales.y.title.text = `Elevation (${currentUnits === 'metric' ? 'm' : 'ft'})`;
-    
-    if (maxElev === -Infinity) maxElev = 100;
-    if (minElev === Infinity) minElev = 0;
-    const elevRange = maxElev - minElev;
-    const padding = elevRange === 0 ? 10 : elevRange * 0.15;
-    
-    elevationChart.options.scales.y.suggestedMax = maxElev + padding;
-    elevationChart.options.scales.y.suggestedMin = Math.max(0, minElev - padding);
+        // Trigger map gradient build — map outline shows until segments are ready
+        rebuildMapGradient();
+        rebuildRouteScreenPts();
 
-    elevationChart.update();
-    needsElevationUpdate = false;
+        elevationChart.options.scales.x.max = getDisplayDistance(distMeters);
+        elevationChart.options.scales.x.title.text = `Distance (${currentUnits === 'metric' ? 'km' : 'mi'})`;
+        elevationChart.options.scales.y.title.text = `Elevation (${currentUnits === 'metric' ? 'm' : 'ft'})`;
+
+        if (maxElev === -Infinity) maxElev = 100;
+        if (minElev === Infinity) minElev = 0;
+        const elevRange = maxElev - minElev;
+        const padding = elevRange === 0 ? 10 : elevRange * 0.15;
+
+        elevationChart.options.scales.y.suggestedMax = maxElev + padding;
+        elevationChart.options.scales.y.suggestedMin = Math.max(0, minElev - padding);
+
+        try {
+            elevationChart.update('none');
+        } catch (e) { }
+
+        rebuildMapGradient(); // update line colors on map
+        updateTurnaroundJoins(); // update turn colors
+        needsElevationUpdate = false;
     } finally {
         isUpdatingElevation = false;
     }
@@ -1057,22 +1672,28 @@ function syncUrl() {
     } else {
         params.delete('route');
     }
+    if (forceMode) params.set('force', '1'); else params.delete('force');
     window.history.replaceState({}, '', `${window.location.pathname}?${params.toString()}`);
 }
 
 function loadUrlState() {
     const params = new URLSearchParams(window.location.search);
+    // Restore force mode before building the route
+    if (params.get('force') === '1') {
+        forceMode = true;
+        updateForceModeBtn();
+    }
     const routeStr = params.get('route');
     if (routeStr) {
         const points = routeStr.split(';');
         for (const pt of points) {
             const [lng, lat] = pt.split(',').map(Number);
             if (!isNaN(lng) && !isNaN(lat)) {
-                createMarker({lng, lat});
+                createMarker({ lng, lat });
             }
         }
         updateRoute();
-        
+
         if (waypoints.length > 1) {
             const bounds = new maplibregl.LngLatBounds();
             for (const wp of waypoints) {
@@ -1102,13 +1723,13 @@ elHeader.addEventListener('mousedown', (e) => {
     isDraggingWindow = true;
     startX = e.clientX;
     startY = e.clientY;
-    
+
     const rect = elPanel.getBoundingClientRect();
     elPanel.style.left = rect.left + 'px';
     elPanel.style.top = rect.top + 'px';
     elPanel.style.bottom = 'auto';
     elPanel.style.right = 'auto';
-    
+
     initialLeft = rect.left;
     initialTop = rect.top;
 });
@@ -1121,10 +1742,10 @@ document.addEventListener('mousemove', (e) => {
     const panelW = elPanel.offsetWidth;
     const panelH = elPanel.offsetHeight;
     // Keep panel fully inside the map container
-    const newLeft = Math.min(Math.max(initialLeft + dx, container.left), container.right  - panelW);
-    const newTop  = Math.min(Math.max(initialTop  + dy, container.top),  container.bottom - panelH);
+    const newLeft = Math.min(Math.max(initialLeft + dx, container.left), container.right - panelW);
+    const newTop = Math.min(Math.max(initialTop + dy, container.top), container.bottom - panelH);
     elPanel.style.left = newLeft + 'px';
-    elPanel.style.top  = newTop  + 'px';
+    elPanel.style.top = newTop + 'px';
 });
 
 document.addEventListener('mouseup', () => {
@@ -1155,13 +1776,13 @@ function initResize(e) {
     currentResizer = e.target.className.replace('resizer ', '');
     startX = e.clientX; startY = e.clientY;
     startW = elPanel.offsetWidth; startH = elPanel.offsetHeight;
-    
+
     if (!elPanel.style.left) elPanel.style.left = elPanel.offsetLeft + 'px';
     if (!elPanel.style.top) elPanel.style.top = elPanel.offsetTop + 'px';
-    
-    startLeft = parseFloat(elPanel.style.left); 
+
+    startLeft = parseFloat(elPanel.style.left);
     startTop = parseFloat(elPanel.style.top);
-    
+
     document.addEventListener('mousemove', resizeWindow);
     document.addEventListener('mouseup', stopResize);
     e.preventDefault();
@@ -1191,7 +1812,7 @@ function resizeWindow(e) {
         const clampedLeft = Math.max(container.left, rawLeft);
         const clampedW = startLeft + startW - clampedLeft;
         elPanel.style.width = Math.max(MIN_W, clampedW) + 'px';
-        elPanel.style.left  = clampedLeft + 'px';
+        elPanel.style.left = clampedLeft + 'px';
     }
     if (currentResizer.includes('n')) {
         // top edge: clamp so panel's top doesn't go past container's top
@@ -1200,7 +1821,7 @@ function resizeWindow(e) {
         const clampedTop = Math.max(container.top, rawTop);
         const clampedH = startTop + startH - clampedTop;
         elPanel.style.height = Math.max(MIN_H, clampedH) + 'px';
-        elPanel.style.top    = clampedTop + 'px';
+        elPanel.style.top = clampedTop + 'px';
     }
 
     if (elevationChart) elevationChart.resize();
@@ -1259,7 +1880,7 @@ function loadWindowState() {
                 elPanel.classList.add('minimized');
                 elMinBtn.textContent = '+';
             }
-        } catch (e) {}
+        } catch (e) { }
     }
 }
 
