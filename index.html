@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Bike Route Planner</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%234b5563'/><path d='M8 20 Q12 10 16 16 Q20 22 24 12' stroke='%2334d399' stroke-width='2.5' fill='none' stroke-linecap='round'/></svg>">
+    <link rel="stylesheet" href="style.css">
+    <!-- MapLibre CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@^5.0.0/dist/maplibre-gl.css" />
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div id="app">
+        <main id="map-container">
+            <div id="top-bar">
+                <span class="stat-label">Total Distance:</span>
+                <span class="stat-value" id="total-distance">0.0 mi</span>
+
+                <div style="flex-grow: 1;"></div>
+
+                <button id="clear-route" class="btn btn-danger"
+                    style="width: auto; padding: 6px 12px; border-radius: 6px; font-size: 0.9rem;">Clear Route</button>
+                <button id="elevation-toggle-btn" class="btn"
+                    style="width: auto; padding: 6px 12px; border-radius: 6px; font-size: 0.9rem; background: var(--bg-panel); border: 1px solid var(--border); color: var(--text-muted);">Elevation
+                    ↑</button>
+
+                <div class="settings-dropdown" style="position: relative;">
+                    <button id="settings-btn"
+                        style="background:none; border:none; display:flex; align-items:center; padding: 0 5px; cursor:pointer;"
+                        onclick="toggleSettings(event)">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="3"></circle>
+                            <path
+                                d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z">
+                            </path>
+                        </svg>
+                    </button>
+                    <div id="settings-menu" class="settings-content" style="display: none;">
+                        <div class="setting-row">
+                            <span>Theme</span>
+                            <select id="theme">
+                                <option value="dark">Dark Mode</option>
+                                <option value="light">Light Mode</option>
+                            </select>
+                        </div>
+                        <div class="setting-row">
+                            <span>Basemap</span>
+                            <select id="basemap">
+                                <option value="dark">Dark Matter</option>
+                                <option value="topo">Topography</option>
+                                <option value="light">Clean Light Map</option>
+                                <option value="osm">Open Street Map</option>
+                                <option value="satellite">Satellite</option>
+                                <option value="cyclosm">CyclOSM</option>
+                            </select>
+                        </div>
+                        <div class="setting-row">
+                            <span>Projection</span>
+                            <select id="projection">
+                                <option value="globe">Globe</option>
+                                <option value="mercator">Flat</option>
+                            </select>
+                        </div>
+                        <hr style="border:0; border-top: 1px solid var(--border); margin: 8px 0;">
+                        <div class="setting-row">
+                            <span>Units</span>
+                            <select id="units">
+                                <option value="imperial">Imperial (°F, in)</option>
+                                <option value="metric">Metric (°C, mm)</option>
+                            </select>
+                        </div>
+                        <div class="setting-row">
+                            <span>3D Relief & Hillshade</span>
+                            <label class="switch">
+                                <input type="checkbox" id="hillshade-check">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                        <div class="setting-row">
+                            <span>3D Exaggeration</span>
+                            <input type="number" id="terrain-exaggeration" step="0.1" min="0" max="20" value="2.0"
+                                style="width: 60px; background:var(--bg-panel); color:var(--text-main); border:1px solid var(--border); border-radius:4px; padding:2px 5px;">
+                        </div>
+                        <hr style="border:0; border-top: 1px solid var(--border); margin: 8px 0;">
+                        <div class="setting-row">
+                            <span
+                                style="font-size:0.75rem; color: var(--text-muted); font-weight:600; text-transform:uppercase; letter-spacing:0.05em;">Performance</span>
+                        </div>
+                        <div class="setting-row">
+                            <span>Map Line Points</span>
+                            <select id="map-line-points">
+                                <option value="50">50 (fastest)</option>
+                                <option value="100" selected>100</option>
+                                <option value="200">200</option>
+                                <option value="500">500 (slowest)</option>
+                            </select>
+                        </div>
+                        <div class="setting-row">
+                            <span>Gradient Stops</span>
+                            <select id="gradient-stops">
+                                <option value="15">15 (fastest)</option>
+                                <option value="30" selected>30</option>
+                                <option value="50">50 (slowest)</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div id="map"></div>
+            <div id="elevation-panel" class="floating-window">
+                <div class="resizer n"></div>
+                <div class="resizer s"></div>
+                <div class="resizer e"></div>
+                <div class="resizer w"></div>
+                <div class="resizer ne"></div>
+                <div class="resizer nw"></div>
+                <div class="resizer se"></div>
+                <div class="resizer sw"></div>
+                <div class="window-header" id="elevation-header">
+                    <span class="title">Elevation Profile</span>
+                    <button class="minimize-btn" id="elevation-min-btn">−</button>
+                </div>
+                <div class="window-content" id="elevation-content">
+                    <canvas id="elevation-chart"></canvas>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- MapLibre JS -->
+    <script src="https://unpkg.com/maplibre-gl@^5.0.0/dist/maplibre-gl.js"></script>
+    <script src="script.js"></script>
+</body>
+
+</html>

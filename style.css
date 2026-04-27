@@ -1,0 +1,308 @@
+:root {
+    --primary: #4d94ff;
+    --primary-hover: #3b82f6;
+    --danger: #ef4444;
+    --bg-dark: #000000;
+    --bg-panel: #1a1a1a;
+    --header-bg: #121212;
+    --text-main: #e0e0e0;
+    --text-muted: #aaaaaa;
+    --border: #333333;
+    --btn-bg: #252525;
+}
+
+body.light-mode {
+    --bg-dark: #f5f5f5;
+    --bg-panel: #ffffff;
+    --header-bg: #ececec;
+    --text-main: #222222;
+    --text-muted: #666666;
+    --border: #cccccc;
+    --btn-bg: #e5e5e5;
+}
+
+select option {
+    background-color: var(--bg-panel);
+    color: var(--text-main);
+}
+
+body.light-mode .setting-row select,
+body.light-mode .setting-row input {
+    background: var(--btn-bg);
+    color: var(--text-main);
+    border: 1px solid var(--border);
+}
+
+body.light-mode .settings-content {
+    box-shadow: 0px 8px 16px rgba(0,0,0,0.1);
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    font-family: 'Inter', sans-serif;
+}
+
+body {
+    background-color: var(--bg-dark);
+    color: var(--text-main);
+    overflow: hidden;
+}
+
+#app {
+    display: flex;
+    height: 100vh;
+    width: 100vw;
+}
+
+
+
+.btn {
+    width: 100%;
+    padding: 14px;
+    border: none;
+    border-radius: 8px;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.btn-danger {
+    background-color: rgba(239, 68, 68, 0.1);
+    color: var(--danger);
+    border: 1px solid rgba(239, 68, 68, 0.2);
+}
+
+.btn-danger:hover {
+    background-color: var(--danger);
+    color: white;
+    transform: translateY(-1px);
+}
+
+.btn-danger:active {
+    transform: translateY(1px);
+}
+
+#map-container {
+    flex-grow: 1;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+}
+
+#top-bar {
+    height: 50px;
+    background-color: var(--header-bg);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 24px;
+    gap: 16px;
+    z-index: 1000;
+}
+
+#top-bar .stat-label {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 0.875rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-weight: 600;
+}
+
+#top-bar .stat-value {
+    margin: 0;
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: var(--text-main);
+}
+
+#map {
+    flex-grow: 1;
+    width: 100%;
+}
+
+/* Hide Leaflet Routing Machine text instructions to keep it clean */
+.leaflet-routing-container {
+    display: none !important;
+}
+
+/* Customize map markers if needed */
+.leaflet-marker-icon {
+    filter: hue-rotate(140deg);
+}
+
+/* Settings Menu Styles */
+.settings-dropdown {
+    position: relative;
+    display: inline-block;
+}
+
+.settings-content {
+    position: absolute;
+    right: 0;
+    top: 30px;
+    background-color: var(--bg-panel);
+    min-width: 240px;
+    box-shadow: 0px 8px 16px rgba(0,0,0,0.5);
+    z-index: 3000;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+}
+
+.setting-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 15px;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+}
+.setting-row:last-child {
+    margin-bottom: 0;
+}
+
+.setting-row select,
+.setting-row input {
+    background: var(--btn-bg);
+    color: var(--text-main);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 6px;
+    outline: none;
+    width: 120px;
+    font-size: 0.8rem;
+}
+
+.setting-row select {
+    cursor: pointer;
+}
+
+/* Toggle Switch */
+.switch {
+    position: relative;
+    display: inline-block;
+    width: 32px;
+    height: 18px;
+    flex-shrink: 0;
+}
+
+.switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: var(--border);
+    transition: .3s;
+    border-radius: 18px;
+}
+
+.slider:before {
+    position: absolute;
+    content: "";
+    height: 12px;
+    width: 12px;
+    left: 3px;
+    bottom: 3px;
+    background-color: var(--text-muted);
+    transition: .3s;
+    border-radius: 50%;
+}
+
+input:checked + .slider {
+    background-color: var(--primary);
+}
+
+input:checked + .slider:before {
+    transform: translateX(14px);
+    background-color: #fff;
+}
+
+/* Floating Window */
+.floating-window {
+    position: absolute;
+    bottom: 20px;
+    left: 20px;
+    width: 400px;
+    height: 200px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    z-index: 2000;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.resizer { position: absolute; z-index: 2001; }
+.resizer.n { top: -2px; left: 0; right: 0; height: 6px; cursor: n-resize; }
+.resizer.s { bottom: -2px; left: 0; right: 0; height: 6px; cursor: s-resize; }
+.resizer.e { right: -2px; top: 0; bottom: 0; width: 6px; cursor: e-resize; }
+.resizer.w { left: -2px; top: 0; bottom: 0; width: 6px; cursor: w-resize; }
+.resizer.ne { top: -2px; right: -2px; width: 10px; height: 10px; cursor: ne-resize; }
+.resizer.nw { top: -2px; left: -2px; width: 10px; height: 10px; cursor: nw-resize; }
+.resizer.se { bottom: -2px; right: -2px; width: 10px; height: 10px; cursor: se-resize; }
+.resizer.sw { bottom: -2px; left: -2px; width: 10px; height: 10px; cursor: sw-resize; }
+
+.floating-window.minimized {
+    height: 40px !important;
+    resize: none;
+}
+
+.floating-window.minimized .window-content {
+    display: none;
+}
+
+.window-header {
+    height: 40px;
+    background: var(--header-bg);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0 12px;
+    cursor: move;
+    user-select: none;
+    flex-shrink: 0;
+}
+
+.window-header .title {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text-main);
+}
+
+.window-header .minimize-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 1.2rem;
+    line-height: 1;
+}
+
+.window-header .minimize-btn:hover {
+    color: var(--text-main);
+}
+
+.window-content {
+    flex-grow: 1;
+    position: relative;
+    padding: 0px;
+    background: var(--bg-panel);
+    min-height: 0;
+    min-width: 0;
+}
