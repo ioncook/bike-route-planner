@@ -29,14 +29,24 @@ const map = new maplibregl.Map({
     projection: { type: localStorage.getItem('route_projection') || 'mercator' },
     antialias: false,
     fadeDuration: 0,
-    trackResize: true
+    trackResize: true,
+    transformRequest: (url, resourceType) => {
+        // No custom headers to avoid CORS preflight failures on tile servers
+    }
 });
 
 function buildRasterStyle(tileUrl) {
     const tiles = Array.isArray(tileUrl) ? tileUrl : [tileUrl];
     return {
         version: 8,
-        sources: { basemap: { type: 'raster', tiles: tiles, tileSize: 256, maxzoom: 19 } },
+        sources: { 
+            basemap: { 
+                type: 'raster', 
+                tiles: tiles, 
+                tileSize: 256, 
+                maxzoom: 20
+            } 
+        },
         layers: [
             { id: 'bg', type: 'background', paint: { 'background-color': '#111' } },
             { id: 'basemap-layer', type: 'raster', source: 'basemap' }
@@ -66,6 +76,7 @@ const BACKEND_ELEV_POINTS = 2000; // elevation sample density (increased for smo
 let elevationChart = null;
 let isUpdatingElevation = false;
 let lastHoverIdx = -1;
+let currentHoverDispDist = null;
 let isZooming = false;
 let bestCiGlobal = -1; // Exported from mousemove for use in dragging
 let waypointPathIndices = []; // Indices in currentRouteGeoJSON.coordinates where waypoints reside
@@ -292,8 +303,8 @@ function showHoverMarker(lngLat, info) {
 function hideHoverMarker() {
     const src = map.getSource('hover-point');
     if (src) src.setData({ type: 'FeatureCollection', features: [] });
-    if (elevationChart && elevationChart.data.datasets[2]) {
-        elevationChart.data.datasets[2].data = [];
+    currentHoverDispDist = null;
+    if (elevationChart) {
         elevationChart.update('none');
     }
     lastSegIdx = -1;
@@ -606,7 +617,7 @@ map.on('mousemove', 'route-hover-target', (e) => {
         const elevVal = pt?.y;
         const elevLabel = elevVal != null ? elevVal.toFixed(0) + (currentUnits === 'metric' ? ' m' : ' ft') : '';
         const gradeLabel = grade !== undefined ? (grade >= 0 ? '+' : '') + grade.toFixed(1) + '%' : '';
-        const info = `${distLabel} &nbsp;|&nbsp; ${elevLabel} &nbsp;|&nbsp; ${gradeLabel}`;
+        const info = `${distLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${elevLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${gradeLabel}`;
         showHoverMarker([lng, lat], info);
 
         const statsDiv = document.getElementById('hover-stats');
@@ -633,11 +644,23 @@ map.on('mousemove', 'route-hover-target', (e) => {
 
                 // Build a high-res gradient for the highlight to match the main route perfectly
                 const stops = ['interpolate', ['linear'], ['line-progress']];
-                if (routeGrades) {
-                    const segLen = endIndex - startIndex;
-                    for (let k = startIndex; k <= endIndex; k++) {
-                        const progress = segLen > 0 ? (k - startIndex) / segLen : 0;
-                        stops.push(progress, getColorForGrade(routeGrades[k] ?? 0));
+                if (routeGrades && routeCumDistances) {
+                    const N_SEG_STOPS = 256;
+                    const startMeters = routeCumDistances[startIndex];
+                    const endMeters = routeCumDistances[endIndex];
+                    const segDist = endMeters - startMeters;
+
+                    for (let s = 0; s <= N_SEG_STOPS; s++) {
+                        const frac = s / N_SEG_STOPS;
+                        const meters = startMeters + frac * segDist;
+                        // Binary search for the exact grade at this distance
+                        let lo = 0, hi = routeCumDistances.length - 1;
+                        while (lo < hi) {
+                            const mid = (lo + hi) >> 1;
+                            if (routeCumDistances[mid] < meters) lo = mid + 1;
+                            else hi = mid;
+                        }
+                        stops.push(frac, getColorForGrade(routeGrades[lo] ?? 0));
                     }
                 } else {
                     stops.push(0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)');
@@ -662,18 +685,7 @@ map.on('mousemove', 'route-hover-target', (e) => {
                 try {
                     const meters = routeCumDistances[ci] + bestT *
                         (routeCumDistances[Math.min(ci + 1, routeCumDistances.length - 1)] - routeCumDistances[ci]);
-                    const dispDist = getDisplayDistance(meters);
-
-                    // Interpolate Y (elevation)
-                    const y1 = ds.data[ci]?.y;
-                    const y2 = ds.data[Math.min(ci + 1, ds.data.length - 1)]?.y;
-                    let dispElev = y1;
-                    if (y1 != null && y2 != null) dispElev = y1 + bestT * (y2 - y1);
-
-                    // Update the dedicated Hover Dot dataset (index 2)
-                    if (elevationChart.data.datasets[2]) {
-                        elevationChart.data.datasets[2].data = [{ x: dispDist, y: dispElev }];
-                    }
+                    currentHoverDispDist = getDisplayDistance(meters);
                     elevationChart.update('none');
                 } catch (err) { console.error(err); }
             }
@@ -697,15 +709,16 @@ map.on('mousemove', 'route-hover-target', (e) => {
 });
 
 map.on('mouseleave', () => {
-    if (lastHoverIdx !== -1) {
+    lastHoverIdx = -1;
+    hideHoverMarker();
+});
+
+// Explicitly clear hover when moving into UI overlays
+['top-bar', 'elevation-panel'].forEach(id => {
+    document.getElementById(id)?.addEventListener('mouseenter', () => {
         lastHoverIdx = -1;
         hideHoverMarker();
-        if (elevationChart) {
-            elevationChart.setActiveElements([]);
-            elevationChart.tooltip.setActiveElements([]);
-            elevationChart.update('none');
-        }
-    }
+    });
 });
 
 
@@ -920,16 +933,17 @@ async function updateRoute() {
         return;
     }
 
-    // Default to avoiding motorways/tolls since UI is hidden
-    const avoidMotorways = document.getElementById('avoid-motorways-check') ? document.getElementById('avoid-motorways-check').checked : true;
-    const avoidTolls = document.getElementById('avoid-tolls-check') ? document.getElementById('avoid-tolls-check').checked : true;
-    const avoidUnpaved = document.getElementById('avoid-unpaved-check') ? document.getElementById('avoid-unpaved-check').checked : false;
+    const avoidMotorways = document.getElementById('avoid-motorways-check')?.checked ?? true;
+    const avoidTolls = document.getElementById('avoid-tolls-check')?.checked ?? true;
+    const avoidUnpaved = document.getElementById('avoid-unpaved-check')?.checked ?? false;
 
     let exclude = [];
     if (avoidMotorways) exclude.push('motorway');
     if (avoidTolls) exclude.push('toll');
+    // Note: 'unpaved' is not a standard OSRM exclusion but some custom profiles support it
+    if (avoidUnpaved) exclude.push('unpaved');
 
-    const excludeParam = ''; // OSRM demo server doesn't support exclude in cycling profile
+    const excludeParam = exclude.length > 0 ? `&exclude=${exclude.join(',')}` : '';
 
     // Build route segment by segment, respecting each segment's stored mode
     let allCoords = [];
@@ -947,13 +961,14 @@ async function updateRoute() {
             segDist = turf_distance(from, to);
         } else {
             try {
-                // Tiered OSRM Fallback:
-                // 1. Swiss OSRM (Excellent bike profile, CORS enabled)
-                // 2. German OSRM (Strict bike safety, CORS enabled)
-                // 3. Project OSRM Demo (Reliable, but may use freeways)
-
+                // Tiered Routing Fallback:
+                // 1. BRouter (Top-tier bike routing, respects surface/safety)
+                // 2. German OSRM (Reliable road-following)
+                // 3. Project OSRM Demo
+                
+                const bProfile = avoidUnpaved ? 'fastbike' : 'trekking';
                 const endpoints = [
-                    `https://osrm.osm.ch/route/v1/cycling/${from[0]},${from[1]};${to[0]},${to[1]}?overview=full&geometries=geojson`,
+                    `https://brouter.de/brouter?lonlats=${from[0]},${from[1]}|${to[0]},${to[1]}&profile=${bProfile}&alternativeidx=0&format=geojson`,
                     `https://routing.openstreetmap.de/routed-bike/route/v1/bicycle/${from[0]},${from[1]};${to[0]},${to[1]}?overview=full&geometries=geojson`,
                     `https://router.project-osrm.org/route/v1/cycling/${from[0]},${from[1]};${to[0]},${to[1]}?overview=full&geometries=geojson`
                 ];
@@ -964,13 +979,23 @@ async function updateRoute() {
                         const resp = await fetch(url);
                         if (!resp.ok) continue;
                         data = await resp.json();
+                        // BRouter returns a FeatureCollection, OSRM returns a custom JSON
+                        if (data.type === 'FeatureCollection' && data.features.length > 0) break;
                         if (data.code === 'Ok' && data.routes.length > 0) break;
                     } catch (e) { continue; }
                 }
 
-                if (data && data.code === 'Ok' && data.routes.length > 0) {
-                    segCoords = data.routes[0].geometry.coordinates;
-                    segDist = data.routes[0].distance;
+                if (data) {
+                    if (data.type === 'FeatureCollection' && data.features.length > 0) {
+                        segCoords = data.features[0].geometry.coordinates;
+                        segDist = parseFloat(data.features[0].properties['track-length']); // Ensure numerical addition
+                    } else if (data.code === 'Ok' && data.routes.length > 0) {
+                        segCoords = data.routes[0].geometry.coordinates;
+                        segDist = data.routes[0].distance;
+                    } else {
+                        segCoords = [from, to];
+                        segDist = turf_distance(from, to);
+                    }
                 } else {
                     segCoords = [from, to];
                     segDist = turf_distance(from, to);
@@ -1271,7 +1296,8 @@ function toggleSettings(event) {
 }
 
 ['avoid-motorways-check', 'avoid-tolls-check', 'avoid-unpaved-check'].forEach(id => {
-    document.getElementById(id)?.addEventListener('change', () => {
+    document.getElementById(id)?.addEventListener('change', (e) => {
+        localStorage.setItem('route_' + id.replace(/-/g, '_'), e.target.checked);
         updateRoute();
     });
 });
@@ -1333,6 +1359,15 @@ function loadStoredSettings() {
 
     // Apply terrain after all values are set (layers exist by now)
     applyTerrain();
+
+    // Routing options
+    ['avoid-motorways-check', 'avoid-tolls-check', 'avoid-unpaved-check'].forEach(id => {
+        const val = localStorage.getItem('route_' + id.replace(/-/g, '_'));
+        if (val !== null) {
+            const el = document.getElementById(id);
+            if (el) el.checked = val === 'true';
+        }
+    });
 }
 
 // Wire up GPX buttons
@@ -1483,16 +1518,6 @@ function initChart() {
                 type: 'scatter',
                 pointRadius: 10,
                 pointHoverRadius: 12
-            }, {
-                label: 'Hover Dot',
-                data: [],
-                type: 'scatter',
-                pointRadius: 6,
-                pointBackgroundColor: '#4b5563',
-                pointBorderColor: 'white',
-                pointBorderWidth: 1.5,
-                showLine: false,
-                pointHitRadius: 0
             }]
         },
         options: {
@@ -1570,13 +1595,9 @@ function initChart() {
                 const ds = chart.data.datasets[0];
                 const grade = ds.grades?.[ci];
 
-                // Update chart Hover Dot
-                const y1 = data[i].y, y2 = data[i + 1]?.y;
-                const interpY = (y1 != null && y2 != null) ? y1 + t * (y2 - y1) : y1;
-                if (chart.data.datasets[2]) {
-                    chart.data.datasets[2].data = [{ x: xValue, y: interpY }];
-                    chart.update('none');
-                }
+                // Update vertical hover line
+                currentHoverDispDist = xValue;
+                chart.update('none');
 
                 const distLabel = xValue.toFixed(2) + (currentUnits === 'metric' ? ' km' : ' mi');
                 const elevVal = data[i].y;
@@ -1585,7 +1606,7 @@ function initChart() {
                     : '';
                 const gradeLabel = grade !== undefined ? (grade >= 0 ? '+' : '') + grade.toFixed(1) + '%' : '';
 
-                const info = `${distLabel} &nbsp;|&nbsp; ${elevLabel} &nbsp;|&nbsp; ${gradeLabel}`;
+                const info = `${distLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${elevLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${gradeLabel}`;
                 showHoverMarker([lng, lat], info);
 
                 const statsDiv = document.getElementById('hover-stats');
@@ -1623,6 +1644,27 @@ function initChart() {
             }
         },
         plugins: [{
+            id: 'hoverLine',
+            afterDraw: (chart) => {
+                if (currentHoverDispDist !== null && chart.scales.x) {
+                    const x = chart.scales.x.getPixelForValue(currentHoverDispDist);
+                    const area = chart.chartArea;
+                    if (!area || x < area.left || x > area.right) return;
+                    const top = area.top;
+                    const bottom = area.bottom;
+                    const ctx = chart.ctx;
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.moveTo(x, top);
+                    ctx.lineTo(x, bottom);
+                    ctx.lineWidth = 1.5;
+                    ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)';
+                    ctx.setLineDash([5, 5]);
+                    ctx.stroke();
+                    ctx.restore();
+                }
+            }
+        }, {
             id: 'gradientRebuild',
             // After the chart lays out (including on resize), rebuild gradients so they
             // always span the correct pixel width. Does nothing if no data is loaded yet.
@@ -1636,7 +1678,7 @@ function initChart() {
 
                 const buildGrad = (alpha) => {
                     const grad = ctx.createLinearGradient(area.left, 0, area.right, 0);
-                    const STOPS = 50;
+                    const STOPS = 300; // Increased from 50 for ultra-high-def color/height sync
                     const data = ds.data;
                     const totalDist = data.length ? data[data.length - 1].x : 1;
                     for (let s = 0; s <= STOPS; s++) {
@@ -1699,7 +1741,7 @@ async function updateElevationProfile() {
         const medianElevations = elevations.map((v, i) => {
             if (v === null || v === undefined) return v;
             const window = [];
-            for (let j = Math.max(0, i - 4); j <= Math.min(elevations.length - 1, i + 4); j++) {
+            for (let j = Math.max(0, i - 1); j <= Math.min(elevations.length - 1, i + 1); j++) {
                 if (elevations[j] !== null && elevations[j] !== undefined) window.push(elevations[j]);
             }
             window.sort((a, b) => a - b);
@@ -1736,10 +1778,13 @@ async function updateElevationProfile() {
         // Step 3: Clamp physically impossible grades
         const clampedGrades = grades.map(g => Math.max(-40, Math.min(40, g)));
 
-        // Step 4: Wide rolling average to smooth out remaining noise
-        // windowSize=8 means a 17-point window — aggressive but still shows real terrain shape
+        // Step 4: Distance-based rolling average to smooth out grade noise without 'smearing' 
+        // We calculate windowSize to cover roughly 50m total (25m each side)
         const smoothedGrades = [];
-        const windowSize = 8;
+        const metersPerPoint = routeTotalDist / clampedGrades.length;
+        const targetWindowMeters = 25; 
+        const windowSize = Math.min(15, Math.max(1, Math.round(targetWindowMeters / metersPerPoint)));
+
         for (let i = 0; i < clampedGrades.length; i++) {
             let sum = 0, count = 0;
             for (let j = i - windowSize; j <= i + windowSize; j++) {
