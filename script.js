@@ -20,6 +20,43 @@ const RASTER_BASEMAPS = {
 
 let currentBasemap = localStorage.getItem('route_basemap') || 'dark';
 
+// Create a persistent cover that hides the map until the initial load and cycle hack is completely finished.
+// This perfectly answers the request to "only make it visually load on the second load".
+const initialCover = document.createElement('div');
+initialCover.id = 'initial-map-cover';
+initialCover.style.position = 'absolute';
+initialCover.style.inset = '0';
+initialCover.style.backgroundColor = '#111';
+initialCover.style.zIndex = '999999';
+initialCover.style.transition = 'opacity 0.5s ease-in-out';
+initialCover.style.pointerEvents = 'none';
+
+initialCover.innerHTML = `
+    <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; gap:18px; color:#94a3b8; font-family:'Inter', sans-serif;">
+        <svg class="initial-spinner" width="44" height="44" viewBox="0 0 16 16" fill="none">
+            <circle cx="8" cy="8" r="7" stroke="#1e293b" stroke-width="2"/>
+            <path d="M8 1a7 7 0 0 1 7 7" stroke="#34d399" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+        <div id="initial-loading-text" style="font-size: 0.9rem; font-weight: 500; letter-spacing: 0.02em;">Loading route...</div>
+    </div>
+    <style>
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+        .initial-spinner { animation: spin 0.8s linear infinite; }
+    </style>
+`;
+
+// Wait for DOM content to be ready
+document.addEventListener('DOMContentLoaded', () => {
+    // Append to #map so the top bar remains fully visible
+    document.getElementById('map').appendChild(initialCover);
+    
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('route')) {
+        document.getElementById('loading-indicator').style.display = 'flex';
+        document.getElementById('loading-phase').textContent = 'Initializing...';
+    }
+});
+
 const map = new maplibregl.Map({
     container: 'map',
     style: VECTOR_STYLES[currentBasemap] || buildRasterStyle(RASTER_BASEMAPS[currentBasemap]),
@@ -70,6 +107,38 @@ let routeScreenPts = null;
 const PERF_MAP_POINTS = 5000;
 const PERF_INTERACTION_POINTS = 1000; // Simplified hit-target for performance
 const BACKEND_ELEV_POINTS = 2000; // elevation sample density (increased for smoother hover)
+
+// --- Keybinding Customization ---
+const DEFAULT_KEYBINDINGS = {
+    toggleElevation: 'e',
+    toggleMode: 'b',
+    fitRoute: 'f',
+    toggleSettings: 't',
+    search: 's',
+    reverse: 'v',
+    deleteLast: 'backspace',
+};
+let currentKeybindings = { ...DEFAULT_KEYBINDINGS };
+let activeCaptureKey = null;
+
+function setCookie(name, value, days = 365) {
+    const expires = new Date(Date.now() + days * 864e5).toUTCString();
+    document.cookie = name + '=' + encodeURIComponent(value) + '; expires=' + expires + '; path=/; SameSite=Strict';
+}
+function getCookie(name) {
+    return document.cookie.split('; ').reduce((r, v) => {
+        const parts = v.split('=');
+        return parts[0] === name ? decodeURIComponent(parts[1]) : r
+    }, '');
+}
+function loadKeybindings() {
+    const saved = getCookie('route_keybindings');
+    if (saved) {
+        try { currentKeybindings = { ...DEFAULT_KEYBINDINGS, ...JSON.parse(saved) }; } catch (e) { }
+    }
+}
+loadKeybindings();
+
 
 // Chart and elevation update state — declared here to avoid TDZ errors when
 // map.on('load') fires and immediately triggers updateElevationProfile
@@ -142,26 +211,35 @@ function rebuildMapGradient() {
     if (!currentRouteGeoJSON) return;
     const coords = currentRouteGeoJSON.coordinates;
 
-    // Always update the geometry
+    // Always update the geometry using the decimated version for rendering stability
+    const mapCoords = decimateLine(coords, PERF_MAP_POINTS);
     const gradSrc = map.getSource('route-gradient');
     if (gradSrc) gradSrc.setData({
         type: 'Feature', properties: {},
-        geometry: { type: 'LineString', coordinates: coords }
+        geometry: { type: 'LineString', coordinates: mapCoords }
     });
 
     const grades = routeGrades;
     if (!grades || !routePathDistances || routeTotalDist <= 0) {
         // Elevation not loaded yet — flat green placeholder
+        // IMPORTANT: line-gradient MUST be a valid interpolate expression, otherwise the shader corrupts
         if (map.getLayer('route-gradient-layer'))
-            map.setPaintProperty('route-gradient-layer', 'line-gradient', 'rgb(34,197,94)');
+            map.setPaintProperty('route-gradient-layer', 'line-gradient',
+                ['interpolate', ['linear'], ['line-progress'], 0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)']);
         return;
     }
 
-    // One gradient stop per coordinate — maximum possible fidelity, zero interpolation artifacts.
+    // Downsample gradient stops to avoid shader overflow (max ~1000 stops)
+    const MAX_STOPS = 1000;
+    const skip = Math.max(1, Math.floor(routePathDistances.length / MAX_STOPS));
     const gradStops = [];
-    for (let i = 0; i < routePathDistances.length; i++) {
+    for (let i = 0; i < routePathDistances.length; i += skip) {
         const frac = Math.min(Math.max(routePathDistances[i] / routeTotalDist, 0), 1);
         gradStops.push(frac, getColorForGrade(grades[i] ?? 0));
+    }
+    // Ensure final point is included
+    if ((routePathDistances.length - 1) % skip !== 0) {
+        gradStops.push(1, getColorForGrade(grades[routePathDistances.length - 1] ?? 0));
     }
 
     if (map.getLayer('route-gradient-layer'))
@@ -369,14 +447,17 @@ function setupRouteLayers() {
         map.addSource('route-segments', { type: 'geojson', data: { type: 'FeatureCollection', features: [] }, buffer: 0, tolerance: 0 });
 
     // Single LineString with lineMetrics:true — required for line-gradient paint.
-    // Using one continuous feature eliminates all the corner-gap / overlap artifacts
-    // that appear when many short 2-point features are offset at bends.
+    let gradData = { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [] } };
+    if (currentRouteGeoJSON) {
+        gradData.geometry.coordinates = decimateLine(currentRouteGeoJSON.coordinates, PERF_MAP_POINTS);
+    }
+
     if (!map.getSource('route-gradient'))
         map.addSource('route-gradient', {
             type: 'geojson',
-            data: { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [] } },
+            data: gradData,
             lineMetrics: true,
-            buffer: 64, tolerance: 0.375
+            buffer: 8, tolerance: 0
         });
 
     if (!map.getLayer('route-gradient-layer'))
@@ -384,15 +465,12 @@ function setupRouteLayers() {
             id: 'route-gradient-layer',
             type: 'line',
             source: 'route-gradient',
-            // miter join is required when using line-offset:
-            // round joins generate overlapping triangles at inside corners
-            // which causes the visible "overlap" artifact at bends.
             layout: { 'line-join': 'round', 'line-cap': 'round' },
             paint: {
-                'line-color': 'rgb(34,197,94)', // placeholder until gradient is built
-                'line-width': 5,
+                'line-color': 'rgb(34,197,94)',
+                'line-width': 6,
                 'line-opacity': 0.97,
-                'line-gradient': 'rgb(34,197,94)', // overridden by rebuildMapGradient
+                'line-gradient': ['interpolate', ['linear'], ['line-progress'], 0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)'],
                 'line-offset': ['interpolate', ['linear'], ['zoom'],
                     8, 0,
                     12, 2,
@@ -517,6 +595,7 @@ function setupRouteLayers() {
     }
 }
 let isFirstLoad = true;
+let initialBasemapCycled = false;
 map.on('style.load', () => {
     setupRouteLayers();
     if (isFirstLoad) {
@@ -530,7 +609,6 @@ map.on('style.load', () => {
         updateTurnaroundJoins();
     };
     map.on('zoom', updateView);
-    map.on('move', updateView);
     map.on('moveend', updateView);
     map.on('zoomend', () => { isZooming = false; updateView(); });
     map.on('zoomstart', () => { isZooming = true; });
@@ -669,9 +747,12 @@ map.on('mousemove', 'route-hover-target', (e) => {
                     const segDist = endMeters - startMeters || 1;
 
                     for (let idx = startIndex; idx <= endIndex; idx++) {
-                        const frac = (routePathDistances[idx] - startMeters) / segDist;
-                        stops.push(Math.min(Math.max(frac, 0), 1), getColorForGrade(routeGrades[idx] ?? 0));
+                        const d = routePathDistances[idx] ?? (idx === 0 ? 0 : routePathDistances[startIndex]);
+                        const frac = Math.min(Math.max((d - startMeters) / segDist, 0), 1);
+                        if (!isNaN(frac)) stops.push(frac, getColorForGrade(routeGrades[idx] ?? 0));
                     }
+                    // Safety: ensure we always have at least 2 stops
+                    if (stops.length < 6) { stops.push(0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)'); }
                 } else {
                     stops.push(0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)');
                 }
@@ -906,6 +987,7 @@ map.on('mousedown', 'route-line', (e) => {
 map.on('click', (e) => {
     if (e.originalEvent.button !== 0) return; // Left click only
     if (wasDraggingLine) return;
+    saveHistory();
     createMarker(e.lngLat);
     updateRoute();
 });
@@ -928,17 +1010,49 @@ let _elevRetryScheduled = false;
 let forceMode = false; // straight-line mode — skips OSRM routing
 let segmentModes = []; // 'routed' | 'direct' for each segment between consecutive waypoints
 
-// Fetch a single routed segment from OSRM; returns coordinate array or null
-async function fetchRoutedSegment(from, to) {
-    const coordStr = `${from[0]},${from[1]};${to[0]},${to[1]}`;
+// --- Loading status indicator ---
+function setStatus(phase) {
+    const el = document.getElementById('loading-indicator');
+    const ph = document.getElementById('loading-phase');
+    if (el) el.style.display = 'flex';
+    if (ph) ph.textContent = phase;
+    
+    // Also update the initial cover text if visible
+    const initialText = document.getElementById('initial-loading-text');
+    if (initialText) initialText.textContent = phase;
+}
+function clearStatus() {
+    const el = document.getElementById('loading-indicator');
+    if (el) el.style.display = 'none';
+}
+
+// Fetch a single routed/direct segment; returns { coords, dist }
+async function fetchOneSegment(from, to, mode, avoidUnpaved, excludeParam) {
+    if (mode === 'direct') {
+        return { coords: [from, to], dist: turf_distance(from, to) };
+    }
     try {
-        const res = await fetch(`https://routing.openstreetmap.de/routed-bike/route/v1/driving/${coordStr}?overview=full&geometries=geojson`);
-        const data = await res.json();
-        if (data.code === 'Ok' && data.routes.length > 0) {
-            return { coords: data.routes[0].geometry.coordinates, dist: data.routes[0].distance };
+        const bProfile = avoidUnpaved ? 'fastbike' : 'trekking';
+        const endpoints = [
+            `https://brouter.de/brouter?lonlats=${from[0]},${from[1]}|${to[0]},${to[1]}&profile=${bProfile}&alternativeidx=0&format=geojson`,
+            `https://routing.openstreetmap.de/routed-bike/route/v1/bicycle/${from[0]},${from[1]};${to[0]},${to[1]}?overview=full&geometries=geojson`,
+            `https://router.project-osrm.org/route/v1/cycling/${from[0]},${from[1]};${to[0]},${to[1]}?overview=full&geometries=geojson`
+        ];
+        for (const url of endpoints) {
+            try {
+                const resp = await fetch(url);
+                if (!resp.ok) continue;
+                const data = await resp.json();
+                if (data.type === 'FeatureCollection' && data.features.length > 0) {
+                    return { coords: data.features[0].geometry.coordinates, dist: parseFloat(data.features[0].properties['track-length']) };
+                }
+                if (data.code === 'Ok' && data.routes.length > 0) {
+                    return { coords: data.routes[0].geometry.coordinates, dist: data.routes[0].distance };
+                }
+            } catch (e) { continue; }
         }
     } catch (e) { /* fall through */ }
-    return null;
+    return { coords: [from, to], dist: turf_distance(from, to) };
 }
 
 async function updateRoute() {
@@ -955,6 +1069,7 @@ async function updateRoute() {
         updateDistanceUI();
         updateElevationProfile();
         syncUrl();
+        clearStatus();
         return;
     }
 
@@ -965,76 +1080,30 @@ async function updateRoute() {
     let exclude = [];
     if (avoidMotorways) exclude.push('motorway');
     if (avoidTolls) exclude.push('toll');
-    // Note: 'unpaved' is not a standard OSRM exclusion but some custom profiles support it
     if (avoidUnpaved) exclude.push('unpaved');
-
     const excludeParam = exclude.length > 0 ? `&exclude=${exclude.join(',')}` : '';
 
-    // Build route segment by segment, respecting each segment's stored mode
+    // --- Routing phase: fetch ALL segments in parallel ---
+    const numSegs = waypoints.length - 1;
+    setStatus(numSegs === 1 ? 'Routing…' : `Routing ${numSegs} segments…`);
+
+    const segmentPromises = [];
+    for (let i = 0; i < numSegs; i++) {
+        const mode = segmentModes[i] || 'bike';
+        segmentPromises.push(fetchOneSegment(waypoints[i], waypoints[i + 1], mode, avoidUnpaved, excludeParam));
+    }
+    const segments = await Promise.all(segmentPromises);
+
+    // Stitch segments together, removing overlapping boundary points
     let allCoords = [];
     let totalDist = 0;
+    segments.forEach((seg, i) => {
+        const c = i > 0 ? seg.coords.slice(1) : seg.coords;
+        allCoords.push(...c);
+        totalDist += seg.dist;
+    });
 
-    for (let i = 0; i < waypoints.length - 1; i++) {
-        const from = waypoints[i];
-        const to = waypoints[i + 1];
-        const mode = segmentModes[i] || 'bike';
-
-        let segCoords, segDist;
-
-        if (mode === 'direct') {
-            segCoords = [from, to];
-            segDist = turf_distance(from, to);
-        } else {
-            try {
-                // Tiered Routing Fallback:
-                // 1. BRouter (Top-tier bike routing, respects surface/safety)
-                // 2. German OSRM (Reliable road-following)
-                // 3. Project OSRM Demo
-
-                const bProfile = avoidUnpaved ? 'fastbike' : 'trekking';
-                const endpoints = [
-                    `https://brouter.de/brouter?lonlats=${from[0]},${from[1]}|${to[0]},${to[1]}&profile=${bProfile}&alternativeidx=0&format=geojson`,
-                    `https://routing.openstreetmap.de/routed-bike/route/v1/bicycle/${from[0]},${from[1]};${to[0]},${to[1]}?overview=full&geometries=geojson`,
-                    `https://router.project-osrm.org/route/v1/cycling/${from[0]},${from[1]};${to[0]},${to[1]}?overview=full&geometries=geojson`
-                ];
-
-                let data = null;
-                for (const url of endpoints) {
-                    try {
-                        const resp = await fetch(url);
-                        if (!resp.ok) continue;
-                        data = await resp.json();
-                        // BRouter returns a FeatureCollection, OSRM returns a custom JSON
-                        if (data.type === 'FeatureCollection' && data.features.length > 0) break;
-                        if (data.code === 'Ok' && data.routes.length > 0) break;
-                    } catch (e) { continue; }
-                }
-
-                if (data) {
-                    if (data.type === 'FeatureCollection' && data.features.length > 0) {
-                        segCoords = data.features[0].geometry.coordinates;
-                        segDist = parseFloat(data.features[0].properties['track-length']); // Ensure numerical addition
-                    } else if (data.code === 'Ok' && data.routes.length > 0) {
-                        segCoords = data.routes[0].geometry.coordinates;
-                        segDist = data.routes[0].distance;
-                    } else {
-                        segCoords = [from, to];
-                        segDist = turf_distance(from, to);
-                    }
-                } else {
-                    segCoords = [from, to];
-                    segDist = turf_distance(from, to);
-                }
-            } catch (err) {
-                segCoords = [from, to];
-                segDist = turf_distance(from, to);
-            }
-        }
-        if (i > 0) segCoords.shift(); // remove overlapping waypoint
-        allCoords.push(...segCoords);
-        totalDist += segDist;
-    }
-
+    setStatus('Resampling…');
     currentDistanceMeters = totalDist;
     // Dynamic sampling: Target 1 point every 5 meters, min 2000, max 15000 points
     const targetPoints = Math.min(15000, Math.max(2000, Math.ceil(totalDist / 5)));
@@ -1042,7 +1111,6 @@ async function updateRoute() {
     currentRouteGeoJSON = { type: 'LineString', coordinates: rawCoords };
 
     // Track which indices in the final path correspond to our waypoints
-    // We search the resampled path for the closest points to our waypoints.
     waypointPathIndices = waypoints.map(wp => {
         let bestIdx = 0;
         let minDist = Infinity;
@@ -1056,6 +1124,7 @@ async function updateRoute() {
     });
 
     const mapCoords = decimateLine(currentRouteGeoJSON.coordinates, PERF_MAP_POINTS);
+
     if (map.getSource('route')) map.getSource('route').setData({ type: 'LineString', coordinates: mapCoords });
     rebuildMapGradient();
     if (typeof rebuildRouteScreenPts === 'function') rebuildRouteScreenPts();
@@ -1077,12 +1146,77 @@ async function updateRoute() {
 }
 
 
+// --- Undo / Redo ---
+// Each history entry is a snapshot of { waypoints, segmentModes }.
+// Markers are always derived from waypoints, so only coordinates need saving.
+const undoStack = [];
+const redoStack = [];
+
+function saveHistory() {
+    undoStack.push({ waypoints: waypoints.map(w => [...w]), modes: [...segmentModes] });
+    redoStack.length = 0; // clear redo on new action
+    updateUndoRedoBtns();
+}
+
+function updateUndoRedoBtns() {
+    const undoBtn = document.getElementById('undo-btn');
+    const redoBtn = document.getElementById('redo-btn');
+    if (undoBtn) undoBtn.disabled = undoStack.length === 0;
+    if (redoBtn) redoBtn.disabled = redoStack.length === 0;
+}
+
+function applyHistoryState(state) {
+    // Remove current markers
+    markers.forEach(m => m.remove());
+    markers = [];
+    waypoints = [];
+    segmentModes = [...state.modes];
+    // Rebuild markers from saved waypoints
+    state.waypoints.forEach(wp => {
+        waypoints.push([...wp]);
+        const el = document.createElement('div');
+        el.style.width = '24px'; el.style.height = '34px';
+        el.style.cursor = 'pointer';
+        el.style.filter = 'drop-shadow(0 2px 2px rgba(0,0,0,0.4))';
+        el.innerHTML = pinSvg('#4b5563');
+        const m = new maplibregl.Marker({ element: el, anchor: 'center', draggable: true }).setLngLat(wp).addTo(map);
+        m.on('dragend', () => {
+            const idx = markers.indexOf(m);
+            if (idx > -1) { waypoints[idx] = [m.getLngLat().lng, m.getLngLat().lat]; saveHistory(); updateRoute(); }
+        });
+        markers.push(m);
+    });
+    refreshMarkerIcons();
+    updateRoute();
+    updateUndoRedoBtns();
+}
+
+function undo() {
+    if (!undoStack.length) return;
+    redoStack.push({ waypoints: waypoints.map(w => [...w]), modes: [...segmentModes] });
+    applyHistoryState(undoStack.pop());
+}
+
+function redo() {
+    if (!redoStack.length) return;
+    undoStack.push({ waypoints: waypoints.map(w => [...w]), modes: [...segmentModes] });
+    applyHistoryState(redoStack.pop());
+}
+
+document.getElementById('undo-btn')?.addEventListener('click', undo);
+document.getElementById('redo-btn')?.addEventListener('click', redo);
+updateUndoRedoBtns();
+
 document.getElementById('clear-route').addEventListener('click', () => {
+    saveHistory();
     waypoints = [];
     markers.forEach(m => m.remove());
     markers = [];
     segmentModes = [];
+    const gainLossEl = document.getElementById('elev-gain-loss');
+    if (gainLossEl) gainLossEl.textContent = '';
     updateRoute();
+    updateUndoRedoBtns();
 });
 
 function fitRoute() {
@@ -1100,6 +1234,7 @@ function fitRoute() {
 }
 
 document.getElementById('fit-route-btn').addEventListener('click', fitRoute);
+document.getElementById('reverse-route-btn')?.addEventListener('click', reverseRoute);
 
 function toggleSettings(event) {
     const menu = document.getElementById('settings-menu');
@@ -1108,8 +1243,169 @@ function toggleSettings(event) {
     } else {
         menu.style.display = 'none';
     }
-    event.stopPropagation();
+    if (event) event.stopPropagation();
 }
+
+// --- Search and Shortcuts ---
+
+(function () {
+    const input = document.getElementById('map-search');
+    if (!input) return;
+
+    // Create dropdown container
+    const dropdown = document.createElement('div');
+    dropdown.id = 'search-dropdown';
+    input.parentElement.style.position = 'relative';
+    input.parentElement.appendChild(dropdown);
+
+    let debounceTimer = null;
+    let currentResults = [];
+
+    function closeDropdown() {
+        dropdown.innerHTML = '';
+        dropdown.style.display = 'none';
+    }
+
+    function selectResult(item) {
+        // Fly to location only — do NOT add a waypoint
+        map.flyTo({ center: [parseFloat(item.lon), parseFloat(item.lat)], zoom: 14 });
+        input.value = '';
+        closeDropdown();
+        input.blur();
+    }
+
+    function renderDropdown(results) {
+        dropdown.innerHTML = '';
+        currentResults = results;
+        if (!results.length) { closeDropdown(); return; }
+        results.forEach((item) => {
+            const row = document.createElement('div');
+            row.className = 'search-result-row';
+            row.textContent = item.display_name;
+            row.addEventListener('mousedown', (e) => {
+                e.preventDefault(); // prevent blur firing before click
+                selectResult(item);
+            });
+            dropdown.appendChild(row);
+        });
+        dropdown.style.display = 'block';
+    }
+
+    async function fetchSuggestions(query) {
+        try {
+            const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=5`);
+            const data = await res.json();
+            renderDropdown(data);
+        } catch (_) { }
+    }
+
+    input.addEventListener('input', () => {
+        clearTimeout(debounceTimer);
+        const q = input.value.trim();
+        if (q.length < 2) { closeDropdown(); return; }
+        debounceTimer = setTimeout(() => fetchSuggestions(q), 250);
+    });
+
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            if (currentResults.length > 0) selectResult(currentResults[0]);
+        } else if (e.key === 'Escape') {
+            closeDropdown();
+        }
+    });
+
+    input.addEventListener('blur', () => {
+        // Small delay so mousedown on result fires first
+        setTimeout(closeDropdown, 150);
+    });
+
+    document.addEventListener('click', (e) => {
+        if (!input.parentElement.contains(e.target)) closeDropdown();
+    });
+})();
+
+function reverseRoute() {
+    if (waypoints.length < 2) return;
+    saveHistory();
+    waypoints.reverse();
+    markers.reverse();
+    segmentModes.reverse();
+    markers.forEach(m => m.addTo(map));
+    refreshMarkerIcons();
+    updateRoute();
+}
+
+function deleteLastWaypoint() {
+    if (waypoints.length === 0) return;
+    saveHistory();
+    const idx = waypoints.length - 1;
+    const marker = markers[idx];
+    markers.splice(idx, 1);
+    waypoints.splice(idx, 1);
+    if (idx > 0) segmentModes.splice(idx - 1, 1);
+    if (marker) marker.remove();
+    updateRoute();
+    refreshMarkerIcons();
+}
+
+window.addEventListener('keydown', (e) => {
+    const activeEl = document.activeElement;
+    const isInput = activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.isContentEditable;
+    
+    // If we are currently capturing a new key for the modal, handle it here
+    if (activeCaptureKey && !isInput) {
+        e.preventDefault();
+        let key = e.key.toLowerCase();
+        if (key !== 'escape') {
+            currentKeybindings[activeCaptureKey] = key;
+        }
+        activeCaptureKey = null;
+        renderKeybindings();
+        return;
+    }
+
+    if (isInput) return;
+
+    // Undo / Redo — fixed shortcuts
+    if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault(); undo(); return;
+    }
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'Z' || (e.key === 'z' && e.shiftKey))) {
+        e.preventDefault(); redo(); return;
+    }
+
+    const key = e.key.toLowerCase();
+    
+    if (key === currentKeybindings.toggleElevation) {
+        e.preventDefault();
+        document.getElementById('elevation-toggle-btn')?.click();
+    } else if (key === currentKeybindings.toggleMode) {
+        e.preventDefault();
+        const nextMode = currentRoutingMode === 'bike' ? 'direct' : 'bike';
+        setRoutingMode(nextMode);
+    } else if (key === currentKeybindings.fitRoute) {
+        e.preventDefault();
+        fitRoute();
+    } else if (key === currentKeybindings.toggleSettings) {
+        e.preventDefault();
+        toggleSettings();
+    } else if (key === currentKeybindings.search) {
+        e.preventDefault();
+        const searchInput = document.getElementById('map-search');
+        if (searchInput) { searchInput.focus(); searchInput.select(); }
+    } else if (key === currentKeybindings.reverse) {
+        e.preventDefault();
+        reverseRoute();
+    } else if (key === currentKeybindings.deleteLast || key === 'delete' || key === 'backspace') {
+        // Special case: Delete/Backspace always available as defaults for deletion
+        e.preventDefault();
+        if (e.ctrlKey || e.metaKey) {
+            document.getElementById('clear-route')?.click();
+        } else {
+            deleteLastWaypoint();
+        }
+    }
+});
 
 // Settings Handlers
 document.getElementById('theme').addEventListener('change', (e) => {
@@ -1320,7 +1616,7 @@ document.getElementById('hillshade-check').addEventListener('change', applyTerra
 document.getElementById('terrain-exaggeration').addEventListener('change', applyTerrain);
 
 function toggleSettings(event) {
-    event.stopPropagation();
+    if (event) event.stopPropagation();
     document.getElementById('settings-menu').classList.toggle('show');
 }
 
@@ -1759,7 +2055,9 @@ async function updateElevationProfile() {
         let minElev = Infinity;
 
         // Fetch highest-res Mapzen Terrarium elevation data
+        setStatus('Fetching elevation…');
         const elevations = await getHighResElevation(coords);
+        setStatus('Processing…');
 
         // Null check: if >5% of samples are null, tiles didn't load fully.
         // Schedule a retry in 2s (worker tile cache will be warm by then).
@@ -1775,17 +2073,9 @@ async function updateElevationProfile() {
             pathDistances.push(distMeters);
         }
 
-        // Despiker: Eliminate isolated DEM glitches without blurring real terrain.
-        //
-        // Key insight: A spike is an ISOLATED outlier. Its neighbors agree with each other
-        // (their mutual elevation difference is small), but the spike disagrees with both.
-        // On REAL steep terrain, consecutive points also differ from each other (sustained
-        // rise/fall), so neighborsAgree is false and real climbs are never modified.
-        //
-        // Threshold: grade > 20% each side (rise > d * 0.2). With 5m sampling this catches
-        // glitches as small as 1m. The neighborsAgree guard prevents flagging real 30% ramps.
-        // Run 3 passes to handle clusters of 2-3 adjacent glitch points.
-        for (let pass = 0; pass < 3; pass++) {
+        // Pass 1: Isolation despiker — eliminates single-point glitches.
+        // 6 passes ensure multi-point clusters are progressively collapsed.
+        for (let pass = 0; pass < 6; pass++) {
             const readElevs = [...elevations];
             for (let i = 1; i < elevations.length - 1; i++) {
                 const v = readElevs[i];
@@ -1798,14 +2088,17 @@ async function updateElevationProfile() {
                 const rise1 = Math.abs(v - prev);
                 const rise2 = Math.abs(v - next);
                 const neighborDiff = Math.abs(prev - next);
+                const mean = (prev + next) / 2;
 
-                // Both sides must show >20% grade (catches 1m spike over 5m spacing)
+                // Condition A: classic spike — both sides >20% grade AND neighbors agree
                 const isOutlier = rise1 > d1 * 0.2 && rise2 > d2 * 0.2;
-                // Neighbors must agree with each other (not just both be on a real climb)
                 const neighborsAgree = neighborDiff < Math.min(rise1, rise2) * 0.5;
 
-                if (isOutlier && neighborsAgree) {
-                    elevations[i] = (prev + next) / 2;
+                // Condition B: small noise — both rises >0.5m and point is far from window mean
+                const isNoise = rise1 > 0.5 && rise2 > 0.5 && Math.abs(v - mean) > 0.4;
+
+                if ((isOutlier && neighborsAgree) || isNoise) {
+                    elevations[i] = mean;
                 }
             }
         }
@@ -1842,41 +2135,21 @@ async function updateElevationProfile() {
             }
         }
 
-        // Pass 3: Water-crossing interpolation.
-        // The Terrarium DEM includes bathymetry. Any sub-zero elevation section is
-        // interpolated between the nearest positive-elevation anchors on each side.
-        // Scans OUTWARD to find anchors, not just the immediately adjacent point.
-        {
-            let i = 0;
-            while (i < elevations.length) {
-                if (elevations[i] != null && elevations[i] < 0) {
-                    const runStart = i;
-                    while (i < elevations.length && (elevations[i] == null || elevations[i] < 0)) i++;
-                    const runEnd = i - 1;
-
-                    // Scan outward to find nearest positive anchor on each side
-                    let leftIdx = runStart - 1;
-                    while (leftIdx >= 0 && (elevations[leftIdx] == null || elevations[leftIdx] < 0)) leftIdx--;
-                    let rightIdx = runEnd + 1;
-                    while (rightIdx < elevations.length && (elevations[rightIdx] == null || elevations[rightIdx] < 0)) rightIdx++;
-
-                    if (leftIdx >= 0 && rightIdx < elevations.length) {
-                        // Interpolate across entire negative span between the two anchors
-                        const lv = elevations[leftIdx], rv = elevations[rightIdx];
-                        for (let j = leftIdx + 1; j < rightIdx; j++) {
-                            const t = (j - leftIdx) / (rightIdx - leftIdx);
-                            elevations[j] = lv + t * (rv - lv);
-                        }
-                    } else if (leftIdx >= 0) {
-                        for (let j = leftIdx + 1; j <= runEnd; j++) elevations[j] = elevations[leftIdx];
-                    } else if (rightIdx < elevations.length) {
-                        for (let j = runStart; j < rightIdx; j++) elevations[j] = elevations[rightIdx];
-                    }
-                } else {
-                    i++;
-                }
+        // Gaussian display smoothing: reduces DEM pixel noise from ~5-10ft to ~1-2ft.
+        // Uses a symmetric 15-point kernel to handle the longer-wavelength open-water
+        // bathymetric noise (which a 5-point kernel can't reach).
+        // Applied only to the chart display array; grade calculation still uses raw elevations.
+        const GAUSS = [0.04, 0.06, 0.08, 0.09, 0.10, 0.11, 0.12, 0.11, 0.10, 0.09, 0.08, 0.06, 0.04, 0.03, 0.03];
+        const WIN_HALF = 7; // 15-point window (indices -7 to +7)
+        const displayElevs = elevations.map((v, i) => {
+            if (v == null) return null;
+            let sum = 0, weight = 0;
+            for (let k = -WIN_HALF; k <= WIN_HALF; k++) {
+                const e = elevations[i + k];
+                if (e != null) { sum += e * GAUSS[k + WIN_HALF]; weight += GAUSS[k + WIN_HALF]; }
             }
-        }
+            return weight > 0 ? sum / weight : v;
+        });
 
         // Step 2: Calculate raw segment grades (N-1 segments for N coordinates)
         const filteredChartData = [];
@@ -1884,7 +2157,8 @@ async function updateElevationProfile() {
         let filteredDist = 0;
         let filteredMax = -Infinity, filteredMin = Infinity;
         for (let i = 0; i < coords.length; i++) {
-            const val = elevations[i];
+            const val = elevations[i];       // raw despiked — used for grade calc
+            const dval = displayElevs[i];    // Gaussian-smoothed — used for chart
             if (i > 0) {
                 const prevVal = elevations[i - 1];
                 const d = haversineDistance(coords[i - 1], coords[i]);
@@ -1895,7 +2169,7 @@ async function updateElevationProfile() {
                     segmentGrades.push(0);
                 }
             }
-            const displayElev = val != null ? (currentUnits === 'metric' ? val : val * 3.28084) : null;
+            const displayElev = dval != null ? (currentUnits === 'metric' ? dval : dval * 3.28084) : null;
             filteredChartData.push({ x: getDisplayDistance(filteredDist), y: displayElev ?? null });
             if (displayElev != null) {
                 filteredMax = Math.max(filteredMax, displayElev);
@@ -1954,39 +2228,12 @@ async function updateElevationProfile() {
             }
             smoothedSegmentGrades.push(sum / count);
         }
-        // smoothedSegmentGrades[i] = grade of segment i to (i+1), length = N-1
-
-        // Reconstruct elevation from smoothed grades.
-        // smoothedSegmentGrades[i] = grade of segment i to (i+1).
-        // Integrate with that directly (no index shift) so forward and reverse
-        // routes produce exactly inverse grades from the same DEM data.
-        const baseElev = elevations.find(v => v != null) ?? 0;
-        const reconElevations = [baseElev];
-        for (let i = 1; i < coords.length; i++) {
-            const run = haversineDistance(coords[i - 1], coords[i]);
-            const g = smoothedSegmentGrades[i - 1] / 100; // segment (i-1) to i
-            reconElevations.push(reconElevations[i - 1] + g * run);
-        }
-
         // Build smoothedGrades for map/chart coloring: length N.
         // Index 0 has no incoming segment, so use the first outgoing grade.
         const smoothedGrades = [smoothedSegmentGrades[0] ?? 0, ...smoothedSegmentGrades];
 
-        // Rebuild chartData from reconstructed (spike-free) elevations
-        chartData.length = 0;
-        let reconDist = 0;
-        let reconMax = -Infinity, reconMin = Infinity;
-        for (let i = 0; i < coords.length; i++) {
-            if (i > 0) reconDist += haversineDistance(coords[i - 1], coords[i]);
-            const rv = reconElevations[i];
-            const displayRv = rv != null ? (currentUnits === 'metric' ? rv : rv * 3.28084) : null;
-            chartData.push({ x: getDisplayDistance(reconDist), y: displayRv ?? null });
-            if (displayRv != null) {
-                if (displayRv > reconMax) reconMax = displayRv;
-                if (displayRv < reconMin) reconMin = displayRv;
-            }
-        }
-        maxElev = reconMax; minElev = reconMin;
+        // chartData was already set from despiked elevations above — don't overwrite it.
+        // maxElev/minElev already correct from filteredChartData pass.
 
         // Clear icon cache to ensure new text centering is applied
         for (let key in wpIcons) delete wpIcons[key];
@@ -2037,6 +2284,36 @@ async function updateElevationProfile() {
         rebuildMapGradient();
         rebuildRouteScreenPts();
 
+        // If this is the very first full load, literally cycle the basemap to force a hard WebGL rebuild.
+        // MapLibre's style diffing ignores identical styles, so we must actually switch to a different style and back.
+        if (!initialBasemapCycled && currentRouteGeoJSON) {
+            initialBasemapCycled = true;
+            setStatus('Finalizing...');
+            const basemapSelect = document.getElementById('basemap');
+            const originalValue = basemapSelect.value;
+            const options = Array.from(basemapSelect.options);
+            const alternateOption = options.find(o => o.value !== originalValue) || options[0];
+
+            // Switch to a different basemap (the visual flash is hidden by the persistent #initial-map-cover)
+            basemapSelect.value = alternateOption.value;
+            basemapSelect.dispatchEvent(new Event('change'));
+
+            // Wait for it to finish tearing down, then swap back to the user's preference
+            setTimeout(() => {
+                basemapSelect.value = originalValue;
+                basemapSelect.dispatchEvent(new Event('change'));
+                
+                // Wait for the final map to render, then remove the persistent cover
+                setTimeout(() => {
+                    removeInitialCover();
+                }, 300);
+            }, 300);
+        } else if (!initialBasemapCycled) {
+            initialBasemapCycled = true;
+            removeInitialCover();
+        }
+
+        elevationChart.update('none');
         elevationChart.options.scales.x.max = getDisplayDistance(distMeters);
         elevationChart.options.scales.x.title.text = `Distance (${currentUnits === 'metric' ? 'km' : 'mi'})`;
         elevationChart.options.scales.y.title.text = `Elevation (${currentUnits === 'metric' ? 'm' : 'ft'})`;
@@ -2071,6 +2348,7 @@ async function updateElevationProfile() {
         }
     } finally {
         isUpdatingElevation = false;
+        clearStatus();
     }
 }
 
@@ -2123,8 +2401,20 @@ function loadUrlState() {
             map.jumpTo({ center: waypoints[0], zoom: 13 });
         }
     } else {
-        // No route — try geolocation automatically
+        // No route — remove the initial cover and try geolocation automatically
+        removeInitialCover();
         requestLocation();
+    }
+}
+
+function removeInitialCover() {
+    const cover = document.getElementById('initial-map-cover');
+    if (cover) {
+        cover.style.opacity = '0';
+        setTimeout(() => {
+            if (cover.parentNode) cover.remove();
+        }, 500);
+        clearStatus();
     }
 }
 
@@ -2145,8 +2435,6 @@ function requestLocation() {
     );
 }
 
-// Wire up the manual locate button
-document.getElementById('locate-btn')?.addEventListener('click', requestLocation);
 
 const elPanel = document.getElementById('elevation-panel');
 const elHeader = document.getElementById('elevation-header');
@@ -2205,13 +2493,24 @@ document.querySelectorAll('.resizer').forEach(resizer => {
 
 let isResizing = false;
 let currentResizer = null;
-let startW, startH, startLeft, startTop;
+let resizeStartX, resizeStartY, startW, startH, startLeft, startTop;
 
 function initResize(e) {
     if (elPanel.classList.contains('minimized')) return;
+
+    // Determine which resizer was clicked by checking classes
+    const cl = e.target.classList;
+    let resizer = '';
+    if (cl.contains('n')) resizer += 'n';
+    if (cl.contains('s')) resizer += 's';
+    if (cl.contains('e')) resizer += 'e';
+    if (cl.contains('w')) resizer += 'w';
+
+    if (!resizer) return;
+
     isResizing = true;
-    currentResizer = e.target.className.replace('resizer ', '');
-    startX = e.clientX; startY = e.clientY;
+    currentResizer = resizer;
+    resizeStartX = e.clientX; resizeStartY = e.clientY;
     startW = elPanel.offsetWidth; startH = elPanel.offsetHeight;
 
     if (!elPanel.style.left) elPanel.style.left = elPanel.offsetLeft + 'px';
@@ -2227,10 +2526,10 @@ function initResize(e) {
 
 function resizeWindow(e) {
     if (!isResizing) return;
-    const dx = e.clientX - startX;
-    const dy = e.clientY - startY;
+    const dx = e.clientX - resizeStartX;
+    const dy = e.clientY - resizeStartY;
     const container = document.getElementById('map').getBoundingClientRect();
-    const MIN_W = 200, MIN_H = 100;
+    const MIN_W = 400, MIN_H = 150;
 
     if (currentResizer.includes('e')) {
         // right edge: clamp so panel doesn't extend past the container's right
@@ -2329,3 +2628,72 @@ if (savedVisible === 'false') {
     elPanel.style.display = 'none';
 }
 updateElevationToggleBtn();
+
+// --- Keybinding UI Management ---
+const ACTION_NAMES = {
+    toggleElevation: 'Toggle Elevation Chart',
+    toggleMode: 'Toggle Routing Mode (Bike/Direct)',
+    fitRoute: 'Fit Map to Route',
+    toggleSettings: 'Open/Close Settings',
+    search: 'Focus Search Bar',
+    reverse: 'Reverse Entire Route',
+    deleteLast: 'Delete Last Point / Clear Route (Ctrl)'
+};
+
+function renderKeybindings() {
+    const list = document.getElementById('keybinding-list');
+    if (!list) return;
+    list.innerHTML = '';
+    Object.keys(currentKeybindings).forEach(action => {
+        const row = document.createElement('div');
+        row.style.cssText = 'padding:12px 20px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(255,255,255,0.05);';
+        
+        const name = document.createElement('span');
+        name.textContent = ACTION_NAMES[action];
+        name.style.fontSize = '0.85rem';
+        name.style.color = 'var(--text-muted)';
+
+        const keyBtn = document.createElement('button');
+        let displayKey = currentKeybindings[action].toUpperCase();
+        if (displayKey === ' ') displayKey = 'SPACE';
+        keyBtn.textContent = displayKey;
+        keyBtn.style.cssText = 'min-width:85px; background:var(--btn-bg); border:1px solid var(--border); color:var(--primary); padding:8px 12px; border-radius:8px; font-size:0.75rem; font-family:monospace; font-weight:600; cursor:pointer; transition: all 0.2s;';
+        
+        if (activeCaptureKey === action) {
+            keyBtn.textContent = '...';
+            keyBtn.style.borderColor = 'var(--primary)';
+            keyBtn.style.background = 'rgba(52, 211, 153, 0.1)';
+        }
+
+        keyBtn.onclick = () => {
+            activeCaptureKey = action;
+            renderKeybindings();
+        };
+
+        row.appendChild(name);
+        row.appendChild(keyBtn);
+        list.appendChild(row);
+    });
+}
+
+document.getElementById('open-keybindings').onclick = () => {
+    loadKeybindings();
+    document.getElementById('keybindings-modal').style.display = 'flex';
+    renderKeybindings();
+};
+
+document.getElementById('close-keybindings').onclick = () => {
+    document.getElementById('keybindings-modal').style.display = 'none';
+    activeCaptureKey = null;
+};
+
+document.getElementById('save-keybindings').onclick = () => {
+    setCookie('route_keybindings', JSON.stringify(currentKeybindings));
+    document.getElementById('keybindings-modal').style.display = 'none';
+    activeCaptureKey = null;
+};
+
+document.getElementById('reset-keybindings').onclick = () => {
+    currentKeybindings = { ...DEFAULT_KEYBINDINGS };
+    renderKeybindings();
+};

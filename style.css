@@ -11,6 +11,9 @@
     --btn-bg: #252525;
 }
 
+@keyframes spin { to { transform: rotate(360deg); } }
+#loading-spinner { animation: spin 0.8s linear infinite; transform-origin: center; }
+
 body.light-mode {
     --bg-dark: #f5f5f5;
     --bg-panel: #ffffff;
@@ -85,6 +88,36 @@ body {
     transform: translateY(1px);
 }
 
+.btn-primary {
+    background-color: var(--primary);
+    color: white;
+}
+.btn-primary:hover {
+    background-color: var(--primary-hover);
+    transform: translateY(-1px);
+}
+
+.btn-secondary {
+    background-color: var(--btn-bg);
+    color: var(--text-main);
+    border: 1px solid var(--border);
+}
+.btn-secondary:hover {
+    background-color: var(--border);
+    transform: translateY(-1px);
+}
+
+.modal-overlay {
+    display:none; 
+    position:fixed; 
+    inset:0; 
+    z-index:1000000; 
+    background:rgba(0,0,0,0.85); 
+    backdrop-filter: blur(4px);
+    align-items:center; 
+    justify-content:center;
+}
+
 #map-container {
     flex-grow: 1;
     position: relative;
@@ -127,6 +160,104 @@ body {
 /* Hide Leaflet Routing Machine text instructions to keep it clean */
 .leaflet-routing-container {
     display: none !important;
+}
+
+/* Search bar */
+.search-container {
+    flex: 0 1 180px;
+    position: relative;
+}
+
+#map-search {
+    width: 100%;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    color: var(--text-main);
+    padding: 8px 14px;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+#map-search:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 2px rgba(77, 148, 255, 0.2);
+}
+
+/* Icon-only button group (undo, redo, fit, reverse) */
+.icon-btn-group {
+    display: flex;
+    align-items: center;
+    background: var(--btn-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 2px;
+    gap: 0;
+}
+
+.icon-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    padding: 6px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s, color 0.15s;
+}
+
+.icon-btn:hover {
+    background: var(--bg-panel);
+    color: var(--text-main);
+}
+
+.icon-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+}
+
+.icon-btn-divider {
+    width: 1px;
+    height: 18px;
+    background: var(--border);
+    margin: 0 2px;
+}
+
+#search-dropdown {
+    display: none;
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    min-width: 340px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    z-index: 9999;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.5);
+    overflow: hidden; /* no scrollbar — results capped at 5 */
+}
+
+.search-result-row {
+    padding: 9px 14px;
+    font-size: 0.82rem;
+    color: var(--text-main);
+    cursor: pointer;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.search-result-row:last-child {
+    border-bottom: none;
+}
+
+.search-result-row:hover {
+    background: var(--btn-bg);
+    color: var(--primary);
 }
 
 /* Customize map markers if needed */
@@ -178,11 +309,23 @@ body {
     top: 40px;
     background-color: var(--bg-panel);
     min-width: 240px;
+    max-height: 80vh;
+    overflow-y: auto;
     box-shadow: 0px 8px 16px rgba(0,0,0,0.5);
     z-index: 3000;
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 12px;
+    display: none;
+}
+
+.settings-content, .dropdown-content, #keybinding-list {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+}
+.settings-content::-webkit-scrollbar, 
+.dropdown-content::-webkit-scrollbar,
+#keybinding-list::-webkit-scrollbar {
     display: none;
 }
 
@@ -272,8 +415,10 @@ input:checked + .slider:before {
     position: absolute;
     bottom: 20px;
     left: 20px;
-    width: 400px;
-    height: 200px;
+    width: 450px;
+    height: 220px;
+    min-width: 400px;
+    min-height: 150px;
     background: var(--bg-panel);
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -281,18 +426,28 @@ input:checked + .slider:before {
     z-index: 2000;
     display: flex;
     flex-direction: column;
+    overflow: visible;
+}
+
+.window-content {
+    flex-grow: 1;
+    position: relative;
+    padding: 0px;
+    background: var(--bg-panel);
+    min-height: 0;
+    min-width: 0;
     overflow: hidden;
 }
 
-.resizer { position: absolute; z-index: 2001; }
-.resizer.n { top: -2px; left: 0; right: 0; height: 6px; cursor: n-resize; }
-.resizer.s { bottom: -2px; left: 0; right: 0; height: 6px; cursor: s-resize; }
-.resizer.e { right: -2px; top: 0; bottom: 0; width: 6px; cursor: e-resize; }
-.resizer.w { left: -2px; top: 0; bottom: 0; width: 6px; cursor: w-resize; }
-.resizer.ne { top: -2px; right: -2px; width: 10px; height: 10px; cursor: ne-resize; }
-.resizer.nw { top: -2px; left: -2px; width: 10px; height: 10px; cursor: nw-resize; }
-.resizer.se { bottom: -2px; right: -2px; width: 10px; height: 10px; cursor: se-resize; }
-.resizer.sw { bottom: -2px; left: -2px; width: 10px; height: 10px; cursor: sw-resize; }
+.resizer { position: absolute; z-index: 2001; background: transparent; }
+.resizer.n { top: -6px; left: 0; right: 0; height: 12px; cursor: n-resize; }
+.resizer.s { bottom: -6px; left: 0; right: 0; height: 12px; cursor: s-resize; }
+.resizer.e { right: -6px; top: 0; bottom: 0; width: 12px; cursor: e-resize; }
+.resizer.w { left: -6px; top: 0; bottom: 0; width: 12px; cursor: w-resize; }
+.resizer.ne { top: -8px; right: -8px; width: 16px; height: 16px; cursor: ne-resize; }
+.resizer.nw { top: -8px; left: -8px; width: 16px; height: 16px; cursor: nw-resize; }
+.resizer.se { bottom: -8px; right: -8px; width: 16px; height: 16px; cursor: se-resize; }
+.resizer.sw { bottom: -8px; left: -8px; width: 16px; height: 16px; cursor: sw-resize; }
 
 .floating-window.minimized {
     height: 40px !important;
@@ -335,11 +490,3 @@ input:checked + .slider:before {
     color: var(--text-main);
 }
 
-.window-content {
-    flex-grow: 1;
-    position: relative;
-    padding: 0px;
-    background: var(--bg-panel);
-    min-height: 0;
-    min-width: 0;
-}
