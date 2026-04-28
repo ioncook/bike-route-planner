@@ -39,13 +39,13 @@ function buildRasterStyle(tileUrl) {
     const tiles = Array.isArray(tileUrl) ? tileUrl : [tileUrl];
     return {
         version: 8,
-        sources: { 
-            basemap: { 
-                type: 'raster', 
-                tiles: tiles, 
-                tileSize: 256, 
+        sources: {
+            basemap: {
+                type: 'raster',
+                tiles: tiles,
+                tileSize: 256,
                 maxzoom: 20
-            } 
+            }
         },
         layers: [
             { id: 'bg', type: 'background', paint: { 'background-color': '#111' } },
@@ -665,7 +665,7 @@ map.on('mousemove', 'route-hover-target', (e) => {
                 // One stop per coordinate in the highlighted segment — matches main gradient exactly
                 if (routeGrades && routePathDistances) {
                     const startMeters = routePathDistances[startIndex];
-                    const endMeters   = routePathDistances[endIndex];
+                    const endMeters = routePathDistances[endIndex];
                     const segDist = endMeters - startMeters || 1;
 
                     for (let idx = startIndex; idx <= endIndex; idx++) {
@@ -990,7 +990,7 @@ async function updateRoute() {
                 // 1. BRouter (Top-tier bike routing, respects surface/safety)
                 // 2. German OSRM (Reliable road-following)
                 // 3. Project OSRM Demo
-                
+
                 const bProfile = avoidUnpaved ? 'fastbike' : 'trekking';
                 const endpoints = [
                     `https://brouter.de/brouter?lonlats=${from[0]},${from[1]}|${to[0]},${to[1]}&profile=${bProfile}&alternativeidx=0&format=geojson`,
@@ -1865,7 +1865,7 @@ async function updateElevationProfile() {
                         const lv = elevations[leftIdx], rv = elevations[rightIdx];
                         for (let j = leftIdx + 1; j < rightIdx; j++) {
                             const t = (j - leftIdx) / (rightIdx - leftIdx);
-                    elevations[j] = lv + t * (rv - lv);
+                            elevations[j] = lv + t * (rv - lv);
                         }
                     } else if (leftIdx >= 0) {
                         for (let j = leftIdx + 1; j <= runEnd; j++) elevations[j] = elevations[leftIdx];
@@ -1886,8 +1886,8 @@ async function updateElevationProfile() {
         for (let i = 0; i < coords.length; i++) {
             const val = elevations[i];
             if (i > 0) {
-                const prevVal = elevations[i-1];
-                const d = haversineDistance(coords[i-1], coords[i]);
+                const prevVal = elevations[i - 1];
+                const d = haversineDistance(coords[i - 1], coords[i]);
                 filteredDist += d;
                 if (val != null && prevVal != null && d > 0) {
                     segmentGrades.push((val - prevVal) / d * 100);
@@ -1934,7 +1934,7 @@ async function updateElevationProfile() {
         for (let i = 0; i < clampedGrades.length; i++) {
             let sum = 0, count = 0;
             let distBack = 0, distFwd = 0;
-            
+
             // Average current point
             sum += clampedGrades[i]; count++;
 
