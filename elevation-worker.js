@@ -56,7 +56,7 @@ self.onmessage = async (e) => {
         let imgData = tilePixelCache.get(key);
         if (!imgData) {
             try {
-                const res = await fetch(`https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${key}.png`);
+                const res = await fetch(`https://elevation-tiles-prod.s3.amazonaws.com/terrarium/${key}.png`);
                 if (!res.ok) return;
                 const blob = await res.blob();
                 const img = await createImageBitmap(blob);

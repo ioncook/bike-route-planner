@@ -22,11 +22,6 @@
             <div id="top-bar">
 
                 <span class="stat-value" id="total-distance">0.0 mi</span>
-                <div id="hover-stats" style="display: flex; gap: 16px; margin-left: 20px; color: var(--text-muted); font-size: 0.9rem; font-weight: 500; opacity: 0; transition: opacity 0.2s;">
-                    <span id="hover-dist">--</span>
-                    <span id="hover-elev">--</span>
-                    <span id="hover-grade">--</span>
-                </div>
 
                 <div style="flex-grow: 1;"></div>
 
@@ -42,53 +37,13 @@
                     style="width: auto; padding: 6px 12px; border-radius: 6px; font-size: 0.9rem; background: var(--bg-panel); border: 1px solid var(--border); color: var(--text-muted);">⬇
                     GPX</button>
                 <input type="file" id="gpx-file-input" accept=".gpx" style="display:none;">
-                <div class="settings-dropdown" style="position: relative;">
-                    <!-- 
-                    <button id="routing-settings-btn" class="btn"
-                        style="width: auto; padding: 6px 12px; border-radius: 6px; font-size: 0.9rem; background: var(--bg-panel); border: 1px solid var(--border); color: var(--text-muted); display:flex; align-items:center;">
-                        Routing <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                            stroke-width="2" style="margin-left:5px;">
-                            <path d="M6 9l6 6 6-6" />
-                        </svg>
+                <div class="mode-toggle">
+                    <button id="mode-bike" class="mode-btn active" title="Follow Roads (Routed)">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18.5" cy="17.5" r="3.5"></circle><circle cx="5.5" cy="17.5" r="3.5"></circle><circle cx="15" cy="5" r="1"></circle><path d="M12 17.5V14l-3-3 4-3 2 3h2"></path></svg>
                     </button>
-                    -->
-                    <!-- 
-                    <div id="routing-menu" class="dropdown-content" style="right: 0; width: 220px;">
-                        <div class="setting-row">
-                            <span
-                                style="font-size:0.75rem; color: var(--text-muted); font-weight:600; text-transform:uppercase; letter-spacing:0.05em;">Routing
-                                Options</span>
-                        </div>
-                        <div class="setting-row">
-                            <span>Direct Mode</span>
-                            <label class="switch">
-                                <input type="checkbox" id="direct-mode-check">
-                                <span class="slider"></span>
-                            </label>
-                        </div>
-                        <div class="setting-row">
-                            <span>Avoid Motorways</span>
-                            <label class="switch">
-                                <input type="checkbox" id="avoid-motorways-check">
-                                <span class="slider"></span>
-                            </label>
-                        </div>
-                        <div class="setting-row">
-                            <span>Avoid Tolls</span>
-                            <label class="switch">
-                                <input type="checkbox" id="avoid-tolls-check">
-                                <span class="slider"></span>
-                            </label>
-                        </div>
-                        <div class="setting-row">
-                            <span>Avoid Unpaved</span>
-                            <label class="switch">
-                                <input type="checkbox" id="avoid-unpaved-check">
-                                <span class="slider"></span>
-                            </label>
-                        </div>
-                    </div>
-                    -->
+                    <button id="mode-direct" class="mode-btn" title="Direct Line (Beeline)">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"></path><circle cx="5" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle></svg>
+                    </button>
                 </div>
                 <button id="elevation-toggle-btn" class="btn"
                     style="width: auto; padding: 6px 12px; border-radius: 6px; font-size: 0.9rem; background: var(--bg-panel); border: 1px solid var(--border); color: var(--text-muted);">Elevation
@@ -152,6 +107,28 @@
                             <input type="number" id="terrain-exaggeration" step="0.1" min="0" max="20" value="2.0"
                                 style="width: 60px; background:var(--bg-panel); color:var(--text-main); border:1px solid var(--border); border-radius:4px; padding:2px 5px;">
                         </div>
+                        <hr style="border:0; border-top: 1px solid var(--border); margin: 8px 0;">
+                        <div class="setting-row">
+                            <span>Avoid Motorways</span>
+                            <label class="switch">
+                                <input type="checkbox" id="avoid-motorways-check">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                        <div class="setting-row">
+                            <span>Avoid Tolls</span>
+                            <label class="switch">
+                                <input type="checkbox" id="avoid-tolls-check">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                        <div class="setting-row">
+                            <span>Avoid Unpaved</span>
+                            <label class="switch">
+                                <input type="checkbox" id="avoid-unpaved-check">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -167,6 +144,11 @@
                 <div class="resizer sw"></div>
                 <div class="window-header" id="elevation-header">
                     <span class="title">Elevation Profile</span>
+                    <div id="hover-stats" style="display: flex; gap: 12px; margin-left: 16px; color: var(--text-muted); font-size: 0.8rem; font-weight: 500; opacity: 0; transition: opacity 0.2s;">
+                        <span id="hover-dist">--</span>
+                        <span id="hover-elev">--</span>
+                        <span id="hover-grade">--</span>
+                    </div>
                     <button class="minimize-btn" id="elevation-min-btn">−</button>
                 </div>
                 <div class="window-content" id="elevation-content">

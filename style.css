@@ -135,6 +135,38 @@ body {
 }
 
 /* Settings Menu Styles */
+/* Mode Switch */
+.mode-toggle {
+    display: flex;
+    background: var(--btn-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 2px;
+}
+
+.mode-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+}
+
+.mode-btn.active {
+    background: var(--bg-panel);
+    color: var(--primary);
+    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+}
+
+.mode-btn:hover:not(.active) {
+    color: var(--text-main);
+}
+
 .settings-dropdown {
     position: relative;
     display: inline-block;
