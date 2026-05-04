@@ -47,13 +47,15 @@ initialCover.innerHTML = `
 
 // Wait for DOM content to be ready
 document.addEventListener('DOMContentLoaded', () => {
-    // Append to #map so the top bar remains fully visible
-    document.getElementById('map').appendChild(initialCover);
-    
     const params = new URLSearchParams(window.location.search);
-    if (params.get('route')) {
+    const routeStr = params.get('route');
+    // Only show the loading cover when there are 2+ waypoints (a real route to fetch).
+    if (routeStr && routeStr.includes(';')) {
+        document.getElementById('map').appendChild(initialCover);
         document.getElementById('loading-indicator').style.display = 'flex';
         document.getElementById('loading-phase').textContent = 'Initializing...';
+    } else {
+        initialBasemapCycled = true; // nothing to load, skip cover logic
     }
 });
 
@@ -100,12 +102,22 @@ let waypointDistances = [];
 // Module-level state for viewport-aware gradient (needs to be accessible from updateElevationProfile)
 let routeGrades = null;
 let routePathDistances = null;
+let routeMercatorDistances = null;
 let routeTotalDist = 0;
+let routeMercTotalDist = 0;
+
+function getMercatorDistance(c1, c2) {
+    const x1 = c1[0] * Math.PI / 180;
+    const y1 = Math.log(Math.tan(Math.PI / 4 + c1[1] * Math.PI / 360));
+    const x2 = c2[0] * Math.PI / 180;
+    const y2 = Math.log(Math.tan(Math.PI / 4 + c2[1] * Math.PI / 360));
+    return Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2);
+}
 let routeScreenPts = null;
 
 // Performance settings — display only. Backend elevation always uses max resolution.
-const PERF_MAP_POINTS = 5000;
-const PERF_INTERACTION_POINTS = 1000; // Simplified hit-target for performance
+const PERF_MAP_POINTS = 8000;
+const PERF_INTERACTION_POINTS = 10000; // Unused for decimation now, keeping as logic reference
 const BACKEND_ELEV_POINTS = 2000; // elevation sample density (increased for smoother hover)
 
 // --- Keybinding Customization ---
@@ -120,6 +132,7 @@ const DEFAULT_KEYBINDINGS = {
 };
 let currentKeybindings = { ...DEFAULT_KEYBINDINGS };
 let activeCaptureKey = null;
+let mapboxToken = 'pk.eyJ1IjoiaW9uY29vayIsImEiOiJjbW9yZ2MyczQwNGd4MnFvZmFsa3g4aHluIn0.NFfUzmhf6KGk0OGwDHC-Fg';
 
 function setCookie(name, value, days = 365) {
     const expires = new Date(Date.now() + days * 864e5).toUTCString();
@@ -207,46 +220,66 @@ function rebuildRouteScreenPts() {
 // Rebuild the route colour gradient using MapLibre's native line-gradient.
 // We set a single LineString source (lineMetrics:true) and drive colour via
 // ['line-progress'] — one continuous gradient, zero segment-boundary artifacts.
+let _routeGradStops = null;
 function rebuildMapGradient() {
     if (!currentRouteGeoJSON) return;
     const coords = currentRouteGeoJSON.coordinates;
-
-    // Always update the geometry using the decimated version for rendering stability
-    const mapCoords = decimateLine(coords, PERF_MAP_POINTS);
     const gradSrc = map.getSource('route-gradient');
-    if (gradSrc) gradSrc.setData({
-        type: 'Feature', properties: {},
-        geometry: { type: 'LineString', coordinates: mapCoords }
-    });
+    if (gradSrc) gradSrc.setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } });
 
     const grades = routeGrades;
-    if (!grades || !routePathDistances || routeTotalDist <= 0) {
-        // Elevation not loaded yet — flat green placeholder
-        // IMPORTANT: line-gradient MUST be a valid interpolate expression, otherwise the shader corrupts
+    if (!grades || !routeMercatorDistances || routeMercTotalDist <= 0) {
         if (map.getLayer('route-gradient-layer'))
             map.setPaintProperty('route-gradient-layer', 'line-gradient',
                 ['interpolate', ['linear'], ['line-progress'], 0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)']);
         return;
     }
-
-    // Downsample gradient stops to avoid shader overflow (max ~1000 stops)
-    const MAX_STOPS = 1000;
-    const skip = Math.max(1, Math.floor(routePathDistances.length / MAX_STOPS));
     const gradStops = [];
-    for (let i = 0; i < routePathDistances.length; i += skip) {
-        const frac = Math.min(Math.max(routePathDistances[i] / routeTotalDist, 0), 1);
-        gradStops.push(frac, getColorForGrade(grades[i] ?? 0));
+    let lastFrac = -1;
+    for (let i = 0; i < routeMercatorDistances.length; i++) {
+        const frac = Math.min(Math.max(routeMercatorDistances[i] / routeMercTotalDist, 0), 1);
+        if (frac <= lastFrac) continue;
+        lastFrac = frac;
+        gradStops.push(frac, getColorForGrade(grades[Math.min(i + 1, grades.length - 1)] ?? 0));
     }
-    // Ensure final point is included
-    if ((routePathDistances.length - 1) % skip !== 0) {
-        gradStops.push(1, getColorForGrade(grades[routePathDistances.length - 1] ?? 0));
-    }
-
     if (map.getLayer('route-gradient-layer'))
         map.setPaintProperty('route-gradient-layer', 'line-gradient',
             ['interpolate', ['linear'], ['line-progress'], ...gradStops]);
-
     updateTurnaroundJoins();
+}
+
+// Show the bold gradient hover highlight for the waypoint segment containing route index ci.
+function showHoverSegment(ci) {
+    if (!currentRouteGeoJSON || !waypointPathIndices || waypointPathIndices.length < 2) return;
+    let segIdx = -1;
+    for (let j = 0; j < waypointPathIndices.length - 1; j++) {
+        if (ci >= waypointPathIndices[j] && ci < waypointPathIndices[j + 1]) { segIdx = j; break; }
+    }
+    if (segIdx === -1 || segIdx === lastSegIdx) return;
+    lastSegIdx = segIdx;
+    const startIndex = waypointPathIndices[segIdx];
+    const endIndex = waypointPathIndices[segIdx + 1];
+    const subCoords = currentRouteGeoJSON.coordinates.slice(startIndex, endIndex + 1);
+
+    const stops = ['interpolate', ['linear'], ['line-progress']];
+    if (routeGrades && routeMercatorDistances) {
+        const startMerc = routeMercatorDistances[startIndex];
+        const segMercDist = (routeMercatorDistances[endIndex] - startMerc) || 1;
+        let lastFrac = -1;
+        for (let k = 0; k < subCoords.length; k++) {
+            const idx = startIndex + k;
+            const frac = Math.min(Math.max((routeMercatorDistances[idx] - startMerc) / segMercDist, 0), 1);
+            if (frac <= lastFrac) continue;
+            lastFrac = frac;
+            stops.push(frac, getColorForGrade(routeGrades[Math.min(idx + 1, routeGrades.length - 1)] ?? 0));
+        }
+        if (lastFrac < 1) stops.push(1, getColorForGrade(routeGrades[Math.min(endIndex + 1, routeGrades.length - 1)] ?? 0));
+    } else {
+        stops.push(0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)');
+    }
+    map.getSource('hover-segment')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: subCoords } });
+    map.setPaintProperty('hover-segment-layer', 'line-gradient', stops);
+    map.setFilter('turnaround-highlight-layer', ['all', ['>=', ['get', 'idx'], startIndex], ['<=', ['get', 'idx'], endIndex]]);
 }
 
 function updateTurnaroundJoins() {
@@ -296,7 +329,7 @@ function updateTurnaroundJoins() {
                 type: 'Feature',
                 properties: {
                     idx: i,
-                    color: routeGrades ? getColorForGrade(routeGrades[i] ?? 0) : 'rgb(34,197,94)'
+                    color: routeGrades ? getColorForGrade(routeGrades[Math.min(i + 1, routeGrades.length - 1)] ?? 0) : 'rgb(34,197,94)'
                 },
                 geometry: { type: 'LineString', coordinates: [[p1.lng, p1.lat], [p2.lng, p2.lat]] }
             });
@@ -376,10 +409,13 @@ function hideHoverMarker() {
     if (src) src.setData({ type: 'FeatureCollection', features: [] });
     currentHoverDispDist = null;
     if (elevationChart) {
+        elevationChart.setActiveElements([]);
+        if (elevationChart.tooltip) elevationChart.tooltip.setActiveElements([]);
         elevationChart.update('none');
     }
     lastSegIdx = -1;
     map.getSource('hover-segment')?.setData({ type: 'FeatureCollection', features: [] });
+    map.setFilter('turnaround-highlight-layer', ['==', ['get', 'idx'], -1]);
     hoverInfoEl.style.display = 'none';
 }
 
@@ -424,7 +460,7 @@ function getHighResElevation(coords) {
     return new Promise(resolve => {
         const id = _nextWorkerId++;
         _workerCallbacks.set(id, resolve);
-        elevationWorker.postMessage({ id, coords });
+        elevationWorker.postMessage({ id, coords, mapboxToken });
     });
 }
 
@@ -433,10 +469,15 @@ function getHighResElevation(coords) {
 // with any one of these names won't silently skip the rest of the block.
 function setupRouteLayers() {
     // Terrain / hillshade (elevation data)
+    const terrainTiles = mapboxToken
+        ? [`https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw?access_token=${mapboxToken}`]
+        : ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'];
+    const terrainEncoding = mapboxToken ? 'mapbox' : 'terrarium';
+
     if (!map.getSource('terrain-source'))
-        map.addSource('terrain-source', { type: 'raster-dem', tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'], tileSize: 256, encoding: 'terrarium', maxzoom: 14 });
+        map.addSource('terrain-source', { type: 'raster-dem', tiles: terrainTiles, tileSize: 256, encoding: terrainEncoding, maxzoom: 14 });
     if (!map.getSource('hillshade-source'))
-        map.addSource('hillshade-source', { type: 'raster-dem', tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'], tileSize: 256, encoding: 'terrarium', maxzoom: 14 });
+        map.addSource('hillshade-source', { type: 'raster-dem', tiles: terrainTiles, tileSize: 256, encoding: terrainEncoding, maxzoom: 14 });
     if (!map.getLayer('hillshade-layer'))
         map.addLayer({ id: 'hillshade-layer', type: 'hillshade', source: 'hillshade-source', paint: { 'hillshade-exaggeration': 0.4, 'hillshade-shadow-color': 'rgba(0,0,0,0.5)', 'hillshade-highlight-color': 'rgba(255,255,255,0.1)' }, layout: { visibility: 'none' } });
 
@@ -468,15 +509,10 @@ function setupRouteLayers() {
             layout: { 'line-join': 'round', 'line-cap': 'round' },
             paint: {
                 'line-color': 'rgb(34,197,94)',
-                'line-width': 6,
+                'line-width': 5,
                 'line-opacity': 0.97,
                 'line-gradient': ['interpolate', ['linear'], ['line-progress'], 0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)'],
-                'line-offset': ['interpolate', ['linear'], ['zoom'],
-                    8, 0,
-                    12, 2,
-                    15, 4,
-                    18, 6
-                ]
+                'line-offset': ['interpolate', ['linear'], ['zoom'], 8, 0, 12, 2, 15, 4, 18, 6]
             }
         });
 
@@ -517,7 +553,7 @@ function setupRouteLayers() {
             filter: ['==', ['get', 'idx'], -1] // Initially hide
         });
 
-    // Highlight for the active segment being hovered (Wider version of the same line, behind it)
+    // Highlight for the active segment being hovered
     if (!map.getSource('hover-segment'))
         map.addSource('hover-segment', { type: 'geojson', data: { type: 'FeatureCollection', features: [] }, lineMetrics: true });
     if (!map.getLayer('hover-segment-layer'))
@@ -529,12 +565,7 @@ function setupRouteLayers() {
             paint: {
                 'line-width': 10,
                 'line-opacity': 1.0,
-                'line-offset': ['interpolate', ['linear'], ['zoom'],
-                    8, 0,
-                    12, 2,
-                    15, 4,
-                    18, 6
-                ]
+                'line-offset': ['interpolate', ['linear'], ['zoom'], 8, 0, 12, 2, 15, 4, 18, 6]
             }
         });
 
@@ -583,14 +614,9 @@ function setupRouteLayers() {
     // Re-upload route data if already computed (e.g. after a style swap)
     if (currentRouteGeoJSON && map.getSource('route')) {
         const coords = currentRouteGeoJSON.coordinates;
-        // Interaction layer uses a simplified version of the line for faster R-tree lookups
-        const interactCoords = decimateLine(coords, PERF_INTERACTION_POINTS);
-        map.getSource('route').setData({ type: 'LineString', coordinates: interactCoords });
-
-        // Visual layer uses higher resolution
-        const mapCoords = decimateLine(coords, PERF_MAP_POINTS);
-        map.getSource('route-gradient').setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: mapCoords } });
-
+        map.getSource('route').setData({ type: 'LineString', coordinates: coords });
+        // Gradient source uses decimated coords to avoid WebGL vertex limit (65535)
+        map.getSource('route-gradient').setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: decimateLine(coords, PERF_MAP_POINTS) } });
         rebuildMapGradient();
     }
 }
@@ -619,9 +645,12 @@ map.on('load', () => {
     // Basic setup already done in style.load
 });
 
-// Hide hover label when the user is actively panning (not zooming).
-// During zoom we want the hover to stay visible and track the cursor.
-map.on('movestart', () => { if (!isZooming) hoverInfoEl.style.display = 'none'; });
+// Clear all hover states (marker, label, chart) as soon as the map starts moving or zooming.
+// This prevents stale data from being displayed while the route geometry is shifting.
+map.on('movestart', () => {
+    hideHoverMarker();
+    clearHoverHighlight();
+});
 
 // Change cursor when hovering the route
 map.on('mouseenter', 'route-line', () => { map.getCanvas().style.cursor = 'pointer'; });
@@ -733,37 +762,7 @@ map.on('mousemove', 'route-hover-target', (e) => {
                 }
             }
             if (segIdx !== -1 && segIdx !== lastSegIdx) {
-                lastSegIdx = segIdx;
-                const startIndex = waypointPathIndices[segIdx];
-                const endIndex = waypointPathIndices[segIdx + 1];
-                const subCoords = currentRouteGeoJSON.coordinates.slice(startIndex, endIndex + 1);
-
-                // Build a high-res gradient for the highlight to match the main route perfectly
-                const stops = ['interpolate', ['linear'], ['line-progress']];
-                // One stop per coordinate in the highlighted segment — matches main gradient exactly
-                if (routeGrades && routePathDistances) {
-                    const startMeters = routePathDistances[startIndex];
-                    const endMeters = routePathDistances[endIndex];
-                    const segDist = endMeters - startMeters || 1;
-
-                    for (let idx = startIndex; idx <= endIndex; idx++) {
-                        const d = routePathDistances[idx] ?? (idx === 0 ? 0 : routePathDistances[startIndex]);
-                        const frac = Math.min(Math.max((d - startMeters) / segDist, 0), 1);
-                        if (!isNaN(frac)) stops.push(frac, getColorForGrade(routeGrades[idx] ?? 0));
-                    }
-                    // Safety: ensure we always have at least 2 stops
-                    if (stops.length < 6) { stops.push(0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)'); }
-                } else {
-                    stops.push(0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)');
-                }
-
-                map.setPaintProperty('hover-segment-layer', 'line-gradient', stops);
-
-                map.getSource('hover-segment')?.setData({
-                    type: 'Feature',
-                    geometry: { type: 'LineString', coordinates: subCoords }
-                });
-                map.setFilter('turnaround-highlight-layer', ['all', ['>=', ['get', 'idx'], startIndex], ['<=', ['get', 'idx'], endIndex]]);
+                showHoverSegment(ci);
             }
         } else if (lastSegIdx !== -1) {
             lastSegIdx = -1;
@@ -840,6 +839,7 @@ function createMarker(lngLat, index) {
             evt.stopPropagation();
             const idx = markers.indexOf(marker);
             if (idx > -1) {
+                saveHistory();
                 markers.splice(idx, 1);
                 waypoints.splice(idx, 1);
                 if (idx > 0) segmentModes.splice(idx - 1, 1);
@@ -851,6 +851,10 @@ function createMarker(lngLat, index) {
     marker.getElement().addEventListener('mousedown', onMiddleClick);
     marker.getElement().addEventListener('auxclick', onMiddleClick);
 
+    marker.on('dragstart', () => {
+        saveHistory();
+    });
+
     marker.on('dragend', () => {
         const idx = markers.indexOf(marker);
         if (idx > -1) {
@@ -860,15 +864,18 @@ function createMarker(lngLat, index) {
         }
     });
 
+    const pos = marker.getLngLat();
+    const lngLatArr = [pos.lng, pos.lat];
+
     if (index !== undefined) {
         markers.splice(index, 0, marker);
-        waypoints.splice(index, 0, [lngLat.lng, lngLat.lat]);
+        waypoints.splice(index, 0, lngLatArr);
         // Inherit the mode of the segment being split
         const oldMode = segmentModes[index - 1] || 'bike';
         segmentModes.splice(index, 0, oldMode);
     } else {
         markers.push(marker);
-        waypoints.push([lngLat.lng, lngLat.lat]);
+        waypoints.push(lngLatArr);
         if (waypoints.length > 1) {
             segmentModes.push(currentRoutingMode);
         }
@@ -931,6 +938,7 @@ map.on('mousedown', 'route-line', (e) => {
         if (dist < 25) return; // 25px dead zone to avoid double-drag
     }
 
+    saveHistory();
     isDraggingLine = true;
     wasDraggingLine = true;
     map.dragPan.disable();
@@ -1016,7 +1024,7 @@ function setStatus(phase) {
     const ph = document.getElementById('loading-phase');
     if (el) el.style.display = 'flex';
     if (ph) ph.textContent = phase;
-    
+
     // Also update the initial cover text if visible
     const initialText = document.getElementById('initial-loading-text');
     if (initialText) initialText.textContent = phase;
@@ -1064,7 +1072,7 @@ async function updateRoute() {
         hideHoverMarker();
         currentDistanceMeters = 0;
         currentRouteGeoJSON = null;
-        routeGrades = null; routePathDistances = null; routeTotalDist = 0;
+        routeGrades = null; routePathDistances = null; routeMercatorDistances = null; routeTotalDist = 0; routeMercTotalDist = 0;
         waypointDistances = [];
         updateDistanceUI();
         updateElevationProfile();
@@ -1105,8 +1113,9 @@ async function updateRoute() {
 
     setStatus('Resampling…');
     currentDistanceMeters = totalDist;
-    // Dynamic sampling: Target 1 point every 5 meters, min 2000, max 15000 points
-    const targetPoints = Math.min(15000, Math.max(2000, Math.ceil(totalDist / 5)));
+    // Dynamic sampling: Target 1 point every 5 meters, min 2000, max 10000 points
+    // (10k max keeps us safely below MapLibre's 65k vertex-per-bucket limit for line-gradients)
+    const targetPoints = Math.min(10000, Math.max(2000, Math.ceil(totalDist / 5)));
     const rawCoords = resampleLine(allCoords, targetPoints);
     currentRouteGeoJSON = { type: 'LineString', coordinates: rawCoords };
 
@@ -1123,9 +1132,7 @@ async function updateRoute() {
         return bestIdx;
     });
 
-    const mapCoords = decimateLine(currentRouteGeoJSON.coordinates, PERF_MAP_POINTS);
-
-    if (map.getSource('route')) map.getSource('route').setData({ type: 'LineString', coordinates: mapCoords });
+    if (map.getSource('route')) map.getSource('route').setData(currentRouteGeoJSON);
     rebuildMapGradient();
     if (typeof rebuildRouteScreenPts === 'function') rebuildRouteScreenPts();
     updateDistanceUI();
@@ -1170,22 +1177,17 @@ function applyHistoryState(state) {
     markers.forEach(m => m.remove());
     markers = [];
     waypoints = [];
-    segmentModes = [...state.modes];
-    // Rebuild markers from saved waypoints
-    state.waypoints.forEach(wp => {
-        waypoints.push([...wp]);
-        const el = document.createElement('div');
-        el.style.width = '24px'; el.style.height = '34px';
-        el.style.cursor = 'pointer';
-        el.style.filter = 'drop-shadow(0 2px 2px rgba(0,0,0,0.4))';
-        el.innerHTML = pinSvg('#4b5563');
-        const m = new maplibregl.Marker({ element: el, anchor: 'center', draggable: true }).setLngLat(wp).addTo(map);
-        m.on('dragend', () => {
-            const idx = markers.indexOf(m);
-            if (idx > -1) { waypoints[idx] = [m.getLngLat().lng, m.getLngLat().lat]; saveHistory(); updateRoute(); }
-        });
-        markers.push(m);
+    segmentModes = [];
+
+    // Rebuild waypoints and markers via createMarker to ensure all listeners (drag, delete) are attached
+    state.waypoints.forEach((wp, i) => {
+        // createMarker pushes to waypoints/markers/segmentModes internally
+        createMarker(wp);
     });
+
+    // Restore the exact modes from history (overwriting the defaults pushed by createMarker)
+    segmentModes = [...state.modes];
+
     refreshMarkerIcons();
     updateRoute();
     updateUndoRedoBtns();
@@ -1351,7 +1353,7 @@ function deleteLastWaypoint() {
 window.addEventListener('keydown', (e) => {
     const activeEl = document.activeElement;
     const isInput = activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.isContentEditable;
-    
+
     // If we are currently capturing a new key for the modal, handle it here
     if (activeCaptureKey && !isInput) {
         e.preventDefault();
@@ -1375,7 +1377,7 @@ window.addEventListener('keydown', (e) => {
     }
 
     const key = e.key.toLowerCase();
-    
+
     if (key === currentKeybindings.toggleElevation) {
         e.preventDefault();
         document.getElementById('elevation-toggle-btn')?.click();
@@ -1935,6 +1937,7 @@ function initChart() {
 
                 const info = `${distLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${elevLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${gradeLabel}`;
                 showHoverMarker([lng, lat], info);
+                showHoverSegment(ci);
 
                 const statsDiv = document.getElementById('hover-stats');
                 if (statsDiv) {
@@ -2027,6 +2030,16 @@ function initChart() {
             }
         }]
     });
+
+    // Native mouseout guarantees hover state clears even if Chart.js onLeave drops the event
+    ctx.canvas.addEventListener('mouseout', () => {
+        if (elevationChart) {
+            elevationChart.setActiveElements([]);
+            if (elevationChart.tooltip) elevationChart.tooltip.setActiveElements([]);
+            elevationChart.update('none');
+        }
+        hideHoverMarker();
+    });
 }
 
 
@@ -2050,7 +2063,9 @@ async function updateElevationProfile() {
         const coords = currentRouteGeoJSON.coordinates;
         const chartData = [];
         const pathDistances = [0];
+        const mercDistances = [0];
         let distMeters = 0;
+        let mercDist = 0;
         let maxElev = -Infinity;
         let minElev = Infinity;
 
@@ -2059,18 +2074,19 @@ async function updateElevationProfile() {
         const elevations = await getHighResElevation(coords);
         setStatus('Processing…');
 
-        // Null check: if >5% of samples are null, tiles didn't load fully.
-        // Schedule a retry in 2s (worker tile cache will be warm by then).
+        // Null check: if samples are null, tiles might still be loading.
+        // We log it but don't retry automatically to avoid infinite loops in 'no-data' zones.
         const nullCount = elevations.filter(v => v == null).length;
-        if (nullCount > elevations.length * 0.05) {
-            console.warn(`[elev] ${nullCount}/${elevations.length} nulls — scheduling retry`);
-            setTimeout(() => { needsElevationUpdate = true; updateElevationProfile(); }, 2000);
+        if (nullCount > 0) {
+            console.warn(`[elev] ${nullCount}/${elevations.length} points have no data (tiles still loading or out of bounds)`);
         }
 
-        // Build pathDistances for map gradient (elevation/grade rebuilt below via median filter)
+        // Build pathDistances and mercDistances for map gradient
         for (let i = 1; i < coords.length; i++) {
             distMeters += haversineDistance(coords[i - 1], coords[i]);
             pathDistances.push(distMeters);
+            mercDist += getMercatorDistance(coords[i - 1], coords[i]);
+            mercDistances.push(mercDist);
         }
 
         // Pass 1: Isolation despiker — eliminates single-point glitches.
@@ -2136,10 +2152,8 @@ async function updateElevationProfile() {
         }
 
         // Gaussian display smoothing: reduces DEM pixel noise from ~5-10ft to ~1-2ft.
-        // Uses a symmetric 15-point kernel to handle the longer-wavelength open-water
-        // bathymetric noise (which a 5-point kernel can't reach).
-        // Applied only to the chart display array; grade calculation still uses raw elevations.
-        const GAUSS = [0.04, 0.06, 0.08, 0.09, 0.10, 0.11, 0.12, 0.11, 0.10, 0.09, 0.08, 0.06, 0.04, 0.03, 0.03];
+        // Uses a perfectly symmetric 15-point kernel to eliminate phase shift when routes are reversed.
+        const GAUSS = [0.03, 0.04, 0.06, 0.08, 0.10, 0.11, 0.12, 0.13, 0.12, 0.11, 0.10, 0.08, 0.06, 0.04, 0.03];
         const WIN_HALF = 7; // 15-point window (indices -7 to +7)
         const displayElevs = elevations.map((v, i) => {
             if (v == null) return null;
@@ -2153,21 +2167,24 @@ async function updateElevationProfile() {
 
         // Step 2: Calculate raw segment grades (N-1 segments for N coordinates)
         const filteredChartData = [];
-        const segmentGrades = [];
+        const pointGrades = elevations.map((v, i) => {
+            if (v == null) return 0;
+            const prev = elevations[i - 1];
+            const next = elevations[i + 1];
+            const d1 = i > 0 ? haversineDistance(coords[i - 1], coords[i]) : 0;
+            const d2 = i < coords.length - 1 ? haversineDistance(coords[i], coords[i + 1]) : 0;
+            if (i === 0) return d2 > 0 ? (next - v) / d2 * 100 : 0;
+            if (i === coords.length - 1) return d1 > 0 ? (v - prev) / d1 * 100 : 0;
+            return (d1 + d2 > 0) ? (next - prev) / (d1 + d2) * 100 : 0;
+        });
+
         let filteredDist = 0;
         let filteredMax = -Infinity, filteredMin = Infinity;
         for (let i = 0; i < coords.length; i++) {
-            const val = elevations[i];       // raw despiked — used for grade calc
             const dval = displayElevs[i];    // Gaussian-smoothed — used for chart
             if (i > 0) {
-                const prevVal = elevations[i - 1];
                 const d = haversineDistance(coords[i - 1], coords[i]);
                 filteredDist += d;
-                if (val != null && prevVal != null && d > 0) {
-                    segmentGrades.push((val - prevVal) / d * 100);
-                } else {
-                    segmentGrades.push(0);
-                }
             }
             const displayElev = dval != null ? (currentUnits === 'metric' ? dval : dval * 3.28084) : null;
             filteredChartData.push({ x: getDisplayDistance(filteredDist), y: displayElev ?? null });
@@ -2200,8 +2217,8 @@ async function updateElevationProfile() {
         if (gainLossEl) gainLossEl.textContent = `${gainLabel}  ${lossLabel}`;
 
         // Step 3: Clamp physically impossible grades and apply distance-aware smoothing.
-        // This ensures the smoothing window covers the same physical distance regardless of point density.
-        const clampedGrades = segmentGrades.map(g => Math.max(-40, Math.min(40, g)));
+        // We now use point-centered grades which are mathematically symmetric.
+        const clampedGrades = pointGrades.map(g => Math.max(-40, Math.min(40, g)));
         const smoothedSegmentGrades = [];
         const targetWindowMeters = 10; // 10m smoothing window
 
@@ -2220,17 +2237,16 @@ async function updateElevationProfile() {
                 sum += clampedGrades[j]; count++;
             }
             // Scan forward up to targetWindowMeters / 2
-            for (let j = i + 1; j < clampedGrades.length; j++) {
+            for (let j = i; j < clampedGrades.length - 1; j++) {
                 const d = haversineDistance(coords[j], coords[j + 1]);
                 distFwd += d;
                 if (distFwd > targetWindowMeters / 2) break;
-                sum += clampedGrades[j]; count++;
+                sum += clampedGrades[j + 1]; count++;
             }
             smoothedSegmentGrades.push(sum / count);
         }
         // Build smoothedGrades for map/chart coloring: length N.
-        // Index 0 has no incoming segment, so use the first outgoing grade.
-        const smoothedGrades = [smoothedSegmentGrades[0] ?? 0, ...smoothedSegmentGrades];
+        const smoothedGrades = smoothedSegmentGrades;
 
         // chartData was already set from despiked elevations above — don't overwrite it.
         // maxElev/minElev already correct from filteredChartData pass.
@@ -2278,37 +2294,14 @@ async function updateElevationProfile() {
         // Store grades/distances for viewport-aware map gradient rebuilds
         routeGrades = smoothedGrades;
         routePathDistances = pathDistances;
+        routeMercatorDistances = mercDistances;
         routeTotalDist = distMeters;
+        routeMercTotalDist = mercDist;
 
-        // Trigger map gradient build — map outline shows until segments are ready
         rebuildMapGradient();
         rebuildRouteScreenPts();
 
-        // If this is the very first full load, literally cycle the basemap to force a hard WebGL rebuild.
-        // MapLibre's style diffing ignores identical styles, so we must actually switch to a different style and back.
-        if (!initialBasemapCycled && currentRouteGeoJSON) {
-            initialBasemapCycled = true;
-            setStatus('Finalizing...');
-            const basemapSelect = document.getElementById('basemap');
-            const originalValue = basemapSelect.value;
-            const options = Array.from(basemapSelect.options);
-            const alternateOption = options.find(o => o.value !== originalValue) || options[0];
-
-            // Switch to a different basemap (the visual flash is hidden by the persistent #initial-map-cover)
-            basemapSelect.value = alternateOption.value;
-            basemapSelect.dispatchEvent(new Event('change'));
-
-            // Wait for it to finish tearing down, then swap back to the user's preference
-            setTimeout(() => {
-                basemapSelect.value = originalValue;
-                basemapSelect.dispatchEvent(new Event('change'));
-                
-                // Wait for the final map to render, then remove the persistent cover
-                setTimeout(() => {
-                    removeInitialCover();
-                }, 300);
-            }, 300);
-        } else if (!initialBasemapCycled) {
+        if (!initialBasemapCycled) {
             initialBasemapCycled = true;
             removeInitialCover();
         }
@@ -2333,19 +2326,6 @@ async function updateElevationProfile() {
         rebuildMapGradient(); // update line colors on map
         updateTurnaroundJoins(); // update turn colors
         needsElevationUpdate = false;
-        // Schedule a warm-cache refresh pass 3s after the first load.
-        // Tiles that were slow on the first fetch will be fully cached by then,
-        // ensuring grades are correct without requiring a manual waypoint move.
-        if (!_elevRetryScheduled) {
-            _elevRetryScheduled = true;
-            setTimeout(() => {
-                _elevRetryScheduled = false;
-                if (currentRouteGeoJSON) {
-                    needsElevationUpdate = true;
-                    updateElevationProfile();
-                }
-            }, 3000);
-        }
     } finally {
         isUpdatingElevation = false;
         clearStatus();
@@ -2399,6 +2379,7 @@ function loadUrlState() {
             });
         } else if (waypoints.length === 1) {
             map.jumpTo({ center: waypoints[0], zoom: 13 });
+            removeInitialCover();
         }
     } else {
         // No route — remove the initial cover and try geolocation automatically
@@ -2647,7 +2628,7 @@ function renderKeybindings() {
     Object.keys(currentKeybindings).forEach(action => {
         const row = document.createElement('div');
         row.style.cssText = 'padding:12px 20px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(255,255,255,0.05);';
-        
+
         const name = document.createElement('span');
         name.textContent = ACTION_NAMES[action];
         name.style.fontSize = '0.85rem';
@@ -2658,7 +2639,7 @@ function renderKeybindings() {
         if (displayKey === ' ') displayKey = 'SPACE';
         keyBtn.textContent = displayKey;
         keyBtn.style.cssText = 'min-width:85px; background:var(--btn-bg); border:1px solid var(--border); color:var(--primary); padding:8px 12px; border-radius:8px; font-size:0.75rem; font-family:monospace; font-weight:600; cursor:pointer; transition: all 0.2s;';
-        
+
         if (activeCaptureKey === action) {
             keyBtn.textContent = '...';
             keyBtn.style.borderColor = 'var(--primary)';
@@ -2697,3 +2678,40 @@ document.getElementById('reset-keybindings').onclick = () => {
     currentKeybindings = { ...DEFAULT_KEYBINDINGS };
     renderKeybindings();
 };
+
+function initCustomTooltips() {
+    const tooltip = document.createElement('div');
+    tooltip.className = 'custom-tooltip';
+    document.body.appendChild(tooltip);
+
+    let activeEl = null;
+
+    document.addEventListener('mouseover', (e) => {
+        const el = e.target.closest('[title]');
+        if (!el) return;
+
+        activeEl = el;
+        const text = el.getAttribute('title');
+        if (!text) return;
+
+        el.setAttribute('data-tooltip', text);
+        el.removeAttribute('title');
+
+        tooltip.textContent = text;
+        tooltip.classList.add('show');
+
+        const rect = el.getBoundingClientRect();
+        tooltip.style.left = Math.max(8, Math.min(window.innerWidth - tooltip.offsetWidth - 8, rect.left + rect.width / 2 - tooltip.offsetWidth / 2)) + 'px';
+        tooltip.style.top = (rect.bottom + 8) + 'px';
+    });
+
+    document.addEventListener('mouseout', (e) => {
+        if (activeEl && !activeEl.contains(e.relatedTarget)) {
+            tooltip.classList.remove('show');
+            activeEl.setAttribute('title', activeEl.getAttribute('data-tooltip'));
+            activeEl.removeAttribute('data-tooltip');
+            activeEl = null;
+        }
+    });
+}
+initCustomTooltips();

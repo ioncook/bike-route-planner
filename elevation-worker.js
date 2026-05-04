@@ -1,10 +1,7 @@
 // elevation-worker.js
-// Runs entirely off the main thread. Fetches Mapzen Terrarium tiles,
+// Runs entirely off the main thread. Fetches elevation tiles,
 // decodes elevation from pixel data, and returns results via postMessage.
-//
-// Strategy: batch all unique tiles needed (including neighbors for boundary
-// cross-interpolation) into a single parallel fetch pass, then sample
-// synchronously. This avoids spawning per-point async work.
+// Supports Mapbox Terrain-RGB (high-res) and Mapzen Terrarium (fallback).
 
 const tilePixelCache = new Map();
 
@@ -18,15 +15,25 @@ function lngLatToTilePixel(lng, lat, zoom) {
     return { tileX, tileY, pxX: (tx - tileX) * 256, pxY: (ty - tileY) * 256 };
 }
 
-function decodePixel(imgData, ix, iy) {
-    if (!imgData) return null;
+function decodePixel(tile, ix, iy) {
+    if (!tile || !tile.data) return null;
+    const { data, format } = tile;
     const x = Math.min(Math.max(Math.round(ix), 0), 255);
     const y = Math.min(Math.max(Math.round(iy), 0), 255);
     const p = (y * 256 + x) * 4;
-    const r = imgData[p], g = imgData[p+1], b = imgData[p+2], a = imgData[p+3];
+    const r = data[p], g = data[p+1], b = data[p+2], a = data[p+3];
     if (a < 128) return null;
-    const v = (r * 256 + g + b / 256) - 32768;
-    return (v < -500 || v > 9000) ? null : v;
+
+    if (format === 'mapbox') {
+        // Mapbox Terrain-RGB: (R * 65536 + G * 256 + B) * 0.1 - 10000
+        const v = (r * 65536 + g * 256 + b) * 0.1 - 10000;
+        // Filter out extreme outliers, specifically the -10,000m no-data value
+        return (v < -1000 || v > 9000) ? null : v;
+    } else {
+        // Mapzen Terrarium: (R * 256 + G + B / 256) - 32768
+        const v = (r * 256 + g + b / 256) - 32768;
+        return (v < -1000 || v > 9000) ? null : v;
+    }
 }
 
 // Cross-tile bilinear interpolation — fully synchronous, all tiles pre-fetched.
@@ -35,21 +42,20 @@ function sampleElevationSync(tileCache, zoom, tileX, tileY, pxX, pxY) {
     const x1 = x0 + 1, y1 = y0 + 1;
     const fx = pxX - x0, fy = pxY - y0;
 
-    // Resolve each corner to the correct tile + local pixel coords
     function resolve(px, py) {
         const dtx = px >= 256 ? 1 : 0;
         const dty = py >= 256 ? 1 : 0;
         const key = `${zoom}/${tileX + dtx}/${tileY + dty}`;
-        return { data: tileCache.get(key) ?? null, ix: px % 256, iy: py % 256 };
+        return { tile: tileCache.get(key) ?? null, ix: px % 256, iy: py % 256 };
     }
 
     const c00 = resolve(x0, y0), c10 = resolve(x1, y0);
     const c01 = resolve(x0, y1), c11 = resolve(x1, y1);
 
-    const v00 = decodePixel(c00.data, c00.ix, c00.iy);
-    const v10 = decodePixel(c10.data, c10.ix, c10.iy);
-    const v01 = decodePixel(c01.data, c01.ix, c01.iy);
-    const v11 = decodePixel(c11.data, c11.ix, c11.iy);
+    const v00 = decodePixel(c00.tile, c00.ix, c00.iy);
+    const v10 = decodePixel(c10.tile, c10.ix, c10.iy);
+    const v01 = decodePixel(c01.tile, c01.ix, c01.iy);
+    const v11 = decodePixel(c11.tile, c11.ix, c11.iy);
 
     const anyValid = v00 ?? v10 ?? v01 ?? v11;
     if (anyValid === null || anyValid === undefined) return null;
@@ -59,45 +65,68 @@ function sampleElevationSync(tileCache, zoom, tileX, tileY, pxX, pxY) {
 }
 
 self.onmessage = async (e) => {
-    const { id, coords } = e.data;
+    const { id, coords, mapboxToken } = e.data;
     const zoom = 15;
     const results = new Array(coords.length).fill(null);
 
-    // Pass 1: collect every unique tile key needed (including +1 neighbors for
-    // cross-tile interpolation at boundaries — costs at most ~4x more tiles but
-    // these are unique keys so typically adds only a small fringe set).
     const tilesNeeded = new Set();
     for (const coord of coords) {
         const { tileX, tileY, pxX, pxY } = lngLatToTilePixel(coord[0], coord[1], zoom);
         tilesNeeded.add(`${zoom}/${tileX}/${tileY}`);
-        // Neighbor tiles for boundary interpolation
         if (pxX > 254) tilesNeeded.add(`${zoom}/${tileX + 1}/${tileY}`);
         if (pxY > 254) tilesNeeded.add(`${zoom}/${tileX}/${tileY + 1}`);
         if (pxX > 254 && pxY > 254) tilesNeeded.add(`${zoom}/${tileX + 1}/${tileY + 1}`);
     }
 
-    // Pass 2: fetch all unique tiles in parallel (already-cached tiles skip fetch)
     const localCache = new Map();
     await Promise.all([...tilesNeeded].map(async (key) => {
         if (tilePixelCache.has(key)) {
             localCache.set(key, tilePixelCache.get(key));
             return;
         }
-        try {
-            const res = await fetch(`https://elevation-tiles-prod.s3.amazonaws.com/terrarium/${key}.png`);
-            if (!res.ok) return;
-            const blob = await res.blob();
-            const img = await createImageBitmap(blob);
-            const canvas = new OffscreenCanvas(256, 256);
-            const ctx = canvas.getContext('2d', { willReadFrequently: true });
-            ctx.drawImage(img, 0, 0);
-            const data = ctx.getImageData(0, 0, 256, 256).data;
-            tilePixelCache.set(key, data);
-            localCache.set(key, data);
-        } catch (_) { /* tile unavailable */ }
+
+        // Strategy: Try Mapbox first if token exists, fallback to Mapzen
+        let data = null;
+        let format = 'terrarium';
+
+        if (mapboxToken) {
+            try {
+                const mbRes = await fetch(`https://api.mapbox.com/v4/mapbox.terrain-rgb/${key}.pngraw?access_token=${mapboxToken}`);
+                if (mbRes.ok) {
+                    const blob = await mbRes.blob();
+                    const img = await createImageBitmap(blob);
+                    const canvas = new OffscreenCanvas(256, 256);
+                    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+                    ctx.drawImage(img, 0, 0);
+                    data = ctx.getImageData(0, 0, 256, 256).data;
+                    format = 'mapbox';
+                }
+            } catch (_) {}
+        }
+
+        // Fallback to Mapzen Terrarium
+        if (!data) {
+            try {
+                const mzRes = await fetch(`https://elevation-tiles-prod.s3.amazonaws.com/terrarium/${key}.png`);
+                if (mzRes.ok) {
+                    const blob = await mzRes.blob();
+                    const img = await createImageBitmap(blob);
+                    const canvas = new OffscreenCanvas(256, 256);
+                    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+                    ctx.drawImage(img, 0, 0);
+                    data = ctx.getImageData(0, 0, 256, 256).data;
+                    format = 'terrarium';
+                }
+            } catch (_) {}
+        }
+
+        if (data) {
+            const entry = { data, format };
+            tilePixelCache.set(key, entry);
+            localCache.set(key, entry);
+        }
     }));
 
-    // Pass 3: sample all coordinates synchronously from pre-fetched tiles
     for (let i = 0; i < coords.length; i++) {
         const { tileX, tileY, pxX, pxY } = lngLatToTilePixel(coords[i][0], coords[i][1], zoom);
         results[i] = sampleElevationSync(localCache, zoom, tileX, tileY, pxX, pxY);

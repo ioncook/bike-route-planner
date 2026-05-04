@@ -490,3 +490,34 @@ input:checked + .slider:before {
     color: var(--text-main);
 }
 
+/* Custom Fast Tooltips */
+.custom-tooltip {
+    position: fixed;
+    background: rgba(18, 18, 18, 0.95);
+    color: white;
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 0.75rem;
+    font-weight: 500;
+    pointer-events: none;
+    z-index: 100000;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    white-space: nowrap;
+    opacity: 0;
+    transform: translateY(-4px);
+    transition: opacity 0.1s ease, transform 0.1s ease;
+    backdrop-filter: blur(4px);
+}
+
+.custom-tooltip.show {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+body.light-mode .custom-tooltip {
+    background: rgba(255, 255, 255, 0.95);
+    color: #111;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    border: 1px solid #ddd;
+}
