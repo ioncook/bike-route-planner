@@ -521,3 +521,39 @@ body.light-mode .custom-tooltip {
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
     border: 1px solid #ddd;
 }
+/* Weather and Location Popup */
+.weather-popup .maplibregl-popup-content {
+    background: var(--bg-panel) !important;
+    color: var(--text-main) !important;
+    border-radius: 12px !important;
+    padding: 8px 12px 12px !important;
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4) !important;
+    border: 1px solid var(--border) !important;
+}
+
+.weather-popup .maplibregl-popup-tip {
+    border-top-color: var(--bg-panel) !important;
+    margin-top: -1px !important;
+    position: relative;
+    z-index: 2;
+}
+
+.maplibregl-popup.weather-popup .maplibregl-popup-close-button {
+    color: var(--text-muted) !important;
+    font-size: 16px !important;
+    padding: 0 !important;
+    top: -2px !important;
+    right: 2px !important;
+    width: 24px !important;
+    height: 24px !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    background: none !important;
+    border: none !important;
+}
+
+.weather-popup .maplibregl-popup-close-button:hover {
+    background-color: transparent;
+    color: var(--text-main);
+}

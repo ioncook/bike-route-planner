@@ -74,6 +74,51 @@ const map = new maplibregl.Map({
     }
 });
 
+// Custom Middle-Click Rotation & Tilt Handler
+let isMCRotating = false;
+let mcStartX, mcStartY, mcStartBearing, mcStartPitch;
+let lastMCTime = 0;
+
+map.getCanvasContainer().addEventListener('mousedown', (e) => {
+    if (e.button === 1) { // Middle mouse button
+        const now = Date.now();
+        if (now - lastMCTime < 400) {
+            map.flyTo({ pitch: 0, bearing: 0 });
+            isMCRotating = false;
+            lastMCTime = 0;
+            return;
+        }
+        lastMCTime = now;
+
+        isMCRotating = true;
+        mcStartX = e.clientX;
+        mcStartY = e.clientY;
+        mcStartBearing = map.getBearing();
+        mcStartPitch = map.getPitch();
+        map.getCanvas().style.cursor = 'grabbing';
+        e.preventDefault(); // Prevent auto-scroll
+    }
+}, true);
+
+window.addEventListener('mousemove', (e) => {
+    if (!isMCRotating) return;
+    const dx = e.clientX - mcStartX;
+    const dy = e.clientY - mcStartY;
+    map.setBearing(mcStartBearing + (dx * 0.4));
+    map.setPitch(Math.min(85, Math.max(0, mcStartPitch - (dy * 0.4))));
+});
+
+window.addEventListener('mouseup', (e) => {
+    if (isMCRotating && e.button === 1) {
+        isMCRotating = false;
+        map.getCanvas().style.cursor = '';
+    }
+});
+
+// Disable default right-click rotation to fully transition to middle-click
+map.dragRotate.disable();
+map.touchZoomRotate.enable({ around: 'center' });
+
 function buildRasterStyle(tileUrl) {
     const tiles = Array.isArray(tileUrl) ? tileUrl : [tileUrl];
     return {
@@ -1000,13 +1045,89 @@ map.on('click', (e) => {
     updateRoute();
 });
 
-let lastRightClickTime = 0;
-map.on('contextmenu', (e) => {
-    const now = Date.now();
-    if (now - lastRightClickTime < 500) {
-        map.flyTo({ pitch: 0, bearing: 0 });
+function getWeatherIcon(code) {
+    const sunny = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>`;
+    const cloudy = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>`;
+    const rain = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="16" y1="13" x2="14" y2="21"/><line x1="8" y1="13" x2="6" y2="21"/><line x1="12" y1="15" x2="10" y2="23"/><path d="M20 16.58A5 5 0 0 0 18 10h-1.26A8 8 0 1 0 4 15.25"/></svg>`;
+    const snow = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/><line x1="4.93" y1="19.07" x2="19.07" y2="4.93"/></svg>`;
+    const fog = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="10" x2="20" y2="10"/><line x1="4" y1="14" x2="20" y2="14"/><line x1="4" y1="18" x2="20" y2="18"/><line x1="4" y1="6" x2="20" y2="6"/></svg>`;
+
+    if (code === 0) return sunny;
+    if (code <= 3) return cloudy;
+    if (code <= 48) return fog;
+    if (code <= 67) return rain;
+    if (code <= 77) return snow;
+    if (code <= 82) return rain;
+    if (code <= 99) return rain;
+    return sunny;
+}
+
+let currentInfoPopup = null;
+map.on('mouseup', (e) => {
+    if (e.originalEvent.button !== 2) return; // Only right click
+
+    if (currentInfoPopup) currentInfoPopup.remove();
+
+    const { lat, lng } = e.lngLat;
+    const units = currentUnits === 'imperial' ? 'fahrenheit' : 'celsius';
+    const windUnits = currentUnits === 'imperial' ? 'mph' : 'kmh';
+    const tempLabel = currentUnits === 'imperial' ? '°F' : '°C';
+    const windLabel = currentUnits === 'imperial' ? 'mph' : 'km/h';
+
+    currentInfoPopup = new maplibregl.Popup({ closeButton: true, className: 'weather-popup', anchor: 'bottom' })
+        .setLngLat(e.lngLat)
+        .setHTML(`
+            <div style="font-family: 'Inter', sans-serif; min-width: 160px; padding: 4px;">
+                <div style="margin-top: 6px;">
+                    <a href="https://www.google.com/maps/search/?api=1&query=${lat},${lng}" target="_blank" 
+                       style="display: block; color: #3b82f6; text-decoration: underline; text-underline-offset: 2px; font-size: 14px; font-weight: 600; margin-bottom: 8px;">
+                       ${lat.toFixed(6)}, ${lng.toFixed(6)}
+                    </a>
+                </div>
+                <div id="weather-info">
+                    <a href="https://www.windy.com/${lat}/${lng}?${lat},${lng},11" target="_blank" style="text-decoration: none; color: inherit; display: block;">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <span id="weather-icon" style="display: flex; align-items: center; color: #888;"></span>
+                                <span id="weather-temp" style="font-weight: 700; font-size: 16px; text-decoration: underline; text-underline-offset: 2px;">...</span>
+                            </div>
+                            <div style="display: flex; align-items: center; gap: 5px; color: #666; font-size: 12px; font-weight: 500;">
+                                <span id="weather-wind">...</span>
+                                <span id="wind-arrow" style="display: none; font-size: 14px; transition: transform 0.6s cubic-bezier(0.4, 0, 0.2, 1);">↑</span>
+                            </div>
+                        </div>
+                    </a>
+                </div>
+            </div>
+        `)
+        .addTo(map);
+
+    fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,wind_speed_10m,weather_code,wind_direction_10m&temperature_unit=${units}&wind_speed_unit=${windUnits}`)
+        .then(r => r.json())
+        .then(data => {
+            const tempEl = document.getElementById('weather-temp');
+            const windEl = document.getElementById('weather-wind');
+            const iconEl = document.getElementById('weather-icon');
+            const arrowEl = document.getElementById('wind-arrow');
+            if (tempEl) tempEl.innerText = `${Math.round(data.current.temperature_2m)}${tempLabel}`;
+            if (windEl) windEl.innerText = `${Math.round(data.current.wind_speed_10m)}${windLabel}`;
+            if (iconEl) iconEl.innerHTML = getWeatherIcon(data.current.weather_code);
+            if (arrowEl && data.current.wind_direction_10m !== undefined) {
+                arrowEl.style.display = 'inline-block';
+                // wind_direction is "from", we rotate 180 to show where it's "going"
+                arrowEl.style.transform = `rotate(${data.current.wind_direction_10m + 180}deg)`;
+            }
+        })
+        .catch(() => {
+            const info = document.getElementById('weather-info');
+            if (info) info.innerHTML = '<div style="color: #ef4444; font-size: 11px; text-align: center; margin-top: 4px;">Weather data unavailable</div>';
+        });
+});
+
+window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && currentInfoPopup) {
+        currentInfoPopup.remove();
     }
-    lastRightClickTime = now;
 });
 
 // Disable default browser context menu
