@@ -5,8 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Bike Route Planner</title>
-    <link rel="icon"
-        href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%234b5563'/><path d='M8 20 Q12 10 16 16 Q20 22 24 12' stroke='%2334d399' stroke-width='2.5' fill='none' stroke-linecap='round'/></svg>">
+    <link rel="icon" href="favicon.png">
     <link rel="stylesheet" href="style.css">
     <!-- MapLibre CSS -->
     <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@^5.0.0/dist/maplibre-gl.css" />
@@ -20,60 +19,103 @@
     <div id="app">
         <main id="map-container">
             <div id="top-bar">
+                <div class="header-brand">
+                    <a href="https://github.com/ioncook/bike-route-planner" target="_blank" style="display: flex; align-items: center; gap: 10px; text-decoration: none; color: inherit;">
+                        <img src="logo.png" alt="Logo" id="logo">
+                        <h1 id="app-title">Bike Route Planner</h1>
+                    </a>
+                </div>
+
+                <div class="icon-btn-divider" style="height: 20px; opacity: 0.5; margin: 0 4px;"></div>
 
                 <span class="stat-value" id="total-distance">0.0 mi</span>
 
-                <div class="search-container" style="margin-left: 8px;">
-                    <input type="text" id="map-search" placeholder="Search locations..." autocomplete="off">
-                </div>
-
-                <div id="loading-indicator" style="display:none; align-items:center; gap:7px; color:var(--text-muted); font-size:0.82rem; margin-left: 12px;">
+                <div id="loading-indicator"
+                    style="display:none; align-items:center; gap:7px; color:var(--text-muted); font-size:0.82rem; margin-left: 12px;">
                     <svg id="loading-spinner" width="16" height="16" viewBox="0 0 16 16" fill="none">
-                        <circle cx="8" cy="8" r="6" stroke="var(--border)" stroke-width="2"/>
-                        <path d="M8 2a6 6 0 0 1 6 6" stroke="var(--primary)" stroke-width="2" stroke-linecap="round"/>
+                        <circle cx="8" cy="8" r="6" stroke="var(--border)" stroke-width="2" />
+                        <path d="M8 2a6 6 0 0 1 6 6" stroke="var(--primary)" stroke-width="2" stroke-linecap="round" />
                     </svg>
                     <span id="loading-phase">Routing…</span>
                 </div>
 
                 <div style="flex-grow: 1;"></div>
 
-                <button id="clear-route" class="btn btn-danger" title="Delete entire route (Ctrl+Backspace)"
-                    style="width: auto; padding: 6px 12px; border-radius: 6px; font-size: 0.9rem;">Clear Route</button>
+                <div class="icon-btn-group icon-btn-group-danger">
+                    <button id="clear-route" class="icon-btn" title="Delete entire route (Ctrl+Backspace)">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="18" y1="6" x2="6" y2="18"></line>
+                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                        </svg>
+                    </button>
+                </div>
+
+                <div class="icon-btn-group">
+                    <div class="search-wrapper">
+                        <button id="search-toggle" class="icon-btn" title="Search locations (S)">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                <circle cx="10.5" cy="10.5" r="7.5"></circle>
+                                <line x1="21" y1="21" x2="15.8" y2="15.8"></line>
+                            </svg>
+                        </button>
+                        <div class="search-container">
+                            <input type="text" id="map-search" placeholder="Search locations..." autocomplete="off">
+                            <div id="search-dropdown"></div>
+                        </div>
+                    </div>
+                </div>
 
                 <!-- Icon-only action group: undo, redo, fit, reverse -->
                 <div class="icon-btn-group">
                     <button id="undo-btn" class="icon-btn" title="Undo (Ctrl+Z)" aria-label="Undo">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="9 14 4 9 9 4" />
+                            <path d="M20 20v-7a4 4 0 0 0-4-4H4" />
                         </svg>
                     </button>
                     <button id="redo-btn" class="icon-btn" title="Redo (Ctrl+Shift+Z)" aria-label="Redo">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <polyline points="15 14 20 9 15 4"/><path d="M4 20v-7a4 4 0 0 1 4-4h12"/>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="15 14 20 9 15 4" />
+                            <path d="M4 20v-7a4 4 0 0 1 4-4h12" />
                         </svg>
                     </button>
                     <div class="icon-btn-divider"></div>
                     <button id="fit-route-btn" class="icon-btn" title="Fit route (F)" aria-label="Fit route">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/>
-                            <line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="15 3 21 3 21 9" />
+                            <polyline points="9 21 3 21 3 15" />
+                            <line x1="21" y1="3" x2="14" y2="10" />
+                            <line x1="3" y1="21" x2="10" y2="14" />
                         </svg>
                     </button>
-                    <button id="reverse-route-btn" class="icon-btn" title="Reverse route (V)" aria-label="Reverse route">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/>
-                            <polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
+                    <button id="reverse-route-btn" class="icon-btn" title="Reverse route (V)"
+                        aria-label="Reverse route">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="17 1 21 5 17 9" />
+                            <path d="M3 11V9a4 4 0 0 1 4-4h14" />
+                            <polyline points="7 23 3 19 7 15" />
+                            <path d="M21 13v2a4 4 0 0 1-4 4H3" />
                         </svg>
                     </button>
                     <div class="icon-btn-divider"></div>
                     <button id="gpx-import-btn" class="icon-btn" title="Import GPX" aria-label="Import GPX">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                            <polyline points="17 8 12 3 7 8" />
+                            <line x1="12" y1="3" x2="12" y2="15" />
                         </svg>
                     </button>
                     <button id="gpx-download-btn" class="icon-btn" title="Download GPX" aria-label="Download GPX">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                            <polyline points="7 10 12 15 17 10" />
+                            <line x1="12" y1="15" x2="12" y2="3" />
                         </svg>
                     </button>
                 </div>
@@ -81,15 +123,30 @@
                 <input type="file" id="gpx-file-input" accept=".gpx" style="display:none;">
                 <div class="mode-toggle">
                     <button id="mode-bike" class="mode-btn active" title="Follow Roads (Routed)">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18.5" cy="17.5" r="3.5"></circle><circle cx="5.5" cy="17.5" r="3.5"></circle><circle cx="15" cy="5" r="1"></circle><path d="M12 17.5V14l-3-3 4-3 2 3h2"></path></svg>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="18.5" cy="17.5" r="3.5"></circle>
+                            <circle cx="5.5" cy="17.5" r="3.5"></circle>
+                            <circle cx="15" cy="5" r="1"></circle>
+                            <path d="M12 17.5V14l-3-3 4-3 2 3h2"></path>
+                        </svg>
                     </button>
                     <button id="mode-direct" class="mode-btn" title="Direct Line (Beeline)">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"></path><circle cx="5" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle></svg>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M5 12h14"></path>
+                            <circle cx="5" cy="12" r="1"></circle>
+                            <circle cx="19" cy="12" r="1"></circle>
+                        </svg>
                     </button>
                 </div>
-                <button id="elevation-toggle-btn" class="btn" title="Toggle elevation profile (E)"
-                    style="width: auto; padding: 6px 12px; border-radius: 6px; font-size: 0.9rem; background: var(--bg-panel); border: 1px solid var(--border); color: var(--text-muted);">Elevation
-                    ↑</button>
+                <div class="icon-btn-group" id="elevation-toggle-group">
+                    <button id="elevation-toggle-btn" class="icon-btn" title="Toggle elevation profile (E)">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="4 18 9 12 13 16 18 6 22 14"></polyline>
+                        </svg>
+                    </button>
+                </div>
 
                 <div class="settings-dropdown" style="position: relative;">
                     <button id="settings-btn" title="Open settings (T)"
@@ -172,7 +229,8 @@
                             </label>
                         </div>
                         <hr style="border:0; border-top: 1px solid var(--border); margin: 8px 0;">
-                        <button id="open-keybindings" class="btn btn-secondary" style="width: 100%; font-size: 0.85rem; padding: 8px; margin-top: 5px;">
+                        <button id="open-keybindings" class="btn btn-secondary"
+                            style="width: 100%; font-size: 0.85rem; padding: 8px; margin-top: 5px;">
                             Customize Hotkeys
                         </button>
                     </div>
@@ -188,36 +246,50 @@
                 <div class="resizer nw"></div>
                 <div class="resizer se"></div>
                 <div class="resizer sw"></div>
-                <div class="window-header" id="elevation-header">
-                    <span class="title">Elevation Profile</span>
-                    <span id="elev-gain-loss" style="margin-left: 10px; font-size: 0.78rem; font-weight: 500; color: var(--text-muted); letter-spacing: 0.02em; white-space: nowrap;"></span>
-                    <div style="flex: 1;"></div>
-                    <div id="hover-stats" style="display: flex; gap: 10px; margin-right: 10px; color: var(--text-muted); font-size: 0.8rem; font-weight: 500; opacity: 0; transition: opacity 0.2s; white-space: nowrap;">
-                        <span id="hover-dist">--</span>
-                        <span id="hover-elev">--</span>
-                        <span id="hover-grade">--</span>
+                <div class="window-inner">
+                    <div class="window-header" id="elevation-header">
+                        <span class="title">Elevation Profile</span>
+                        <span id="elev-gain-loss"
+                            style="margin-left: 10px; font-size: 0.78rem; font-weight: 500; color: var(--text-muted); letter-spacing: 0.02em; white-space: nowrap;"></span>
+                        <div style="flex: 1;"></div>
+                        <div id="hover-stats"
+                            style="display: flex; gap: 10px; margin-right: 10px; color: var(--text-muted); font-size: 0.8rem; font-weight: 500; opacity: 0; transition: opacity 0.2s; white-space: nowrap;">
+                            <span id="hover-dist">--</span>
+                            <span id="hover-elev">--</span>
+                            <span id="hover-grade">--</span>
+                        </div>
+                        <button class="minimize-btn" id="elevation-min-btn">×</button>
                     </div>
-                    <button class="minimize-btn" id="elevation-min-btn">×</button>
-                </div>
-                <div class="window-content" id="elevation-content">
-                    <canvas id="elevation-chart"></canvas>
+                    <div class="window-content" id="elevation-content">
+                        <canvas id="elevation-chart"></canvas>
+                    </div>
                 </div>
             </div>
         </main>
 
         <!-- Keybindings Modal -->
         <div id="keybindings-modal" class="modal-overlay">
-            <div style="background:var(--bg-panel); width:min(90vw, 400px); border-radius:12px; border:1px solid var(--border); box-shadow:0 15px 35px rgba(0,0,0,0.6); overflow:hidden; font-family:'Inter', sans-serif;">
-                <div style="padding:18px 24px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center;">
-                    <h3 style="margin:0; font-size:1.15rem; color:var(--text-main); font-weight:600;">Custom Hotkeys</h3>
-                    <button id="close-keybindings" style="background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:1.6rem; line-height:1; transition:color 0.2s;" onmouseover="this.style.color='var(--text-main)'" onmouseout="this.style.color='var(--text-muted)'">&times;</button>
+            <div
+                style="background:var(--bg-panel); width:min(90vw, 400px); border-radius:12px; border:1px solid var(--border); box-shadow:0 15px 35px rgba(0,0,0,0.6); overflow:hidden; font-family:'Inter', sans-serif;">
+                <div
+                    style="padding:18px 24px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center;">
+                    <h3 style="margin:0; font-size:1.15rem; color:var(--text-main); font-weight:600;">Custom Hotkeys
+                    </h3>
+                    <button id="close-keybindings"
+                        style="background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:1.6rem; line-height:1; transition:color 0.2s;"
+                        onmouseover="this.style.color='var(--text-main)'"
+                        onmouseout="this.style.color='var(--text-muted)'">&times;</button>
                 </div>
-                <div id="keybinding-list" style="padding:5px 0; max-height:60vh; overflow-y:auto; background:rgba(0,0,0,0.1);">
+                <div id="keybinding-list"
+                    style="padding:5px 0; max-height:60vh; overflow-y:auto; background:rgba(0,0,0,0.1);">
                     <!-- Keybinding rows will be injected here -->
                 </div>
-                <div style="padding:20px 24px; background:var(--header-bg); border-top:1px solid var(--border); display:flex; gap:12px;">
-                    <button id="reset-keybindings" class="btn btn-secondary" style="flex:1; padding: 12px; font-weight: 500;">Reset</button>
-                    <button id="save-keybindings" class="btn btn-primary" style="flex:1; padding: 12px; font-weight: 500;">Save</button>
+                <div
+                    style="padding:20px 24px; background:var(--header-bg); border-top:1px solid var(--border); display:flex; gap:12px;">
+                    <button id="reset-keybindings" class="btn btn-secondary"
+                        style="flex:1; padding: 12px; font-weight: 500;">Reset</button>
+                    <button id="save-keybindings" class="btn btn-primary"
+                        style="flex:1; padding: 12px; font-weight: 500;">Save</button>
                 </div>
             </div>
         </div>

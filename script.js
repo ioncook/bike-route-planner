@@ -1458,14 +1458,16 @@ function toggleSettings(event) {
 // --- Search and Shortcuts ---
 
 (function () {
+    const wrapper = document.querySelector('.search-wrapper');
     const input = document.getElementById('map-search');
-    if (!input) return;
+    const toggleBtn = document.getElementById('search-toggle');
+    if (!input || !wrapper || !toggleBtn) return;
 
-    // Create dropdown container
-    const dropdown = document.createElement('div');
-    dropdown.id = 'search-dropdown';
-    input.parentElement.style.position = 'relative';
-    input.parentElement.appendChild(dropdown);
+    const dropdown = document.getElementById('search-dropdown') || document.createElement('div');
+    if (!dropdown.id) {
+        dropdown.id = 'search-dropdown';
+        wrapper.appendChild(dropdown);
+    }
 
     let debounceTimer = null;
     let currentResults = [];
@@ -1475,12 +1477,32 @@ function toggleSettings(event) {
         dropdown.style.display = 'none';
     }
 
+    function toggleSearch() {
+        const isExpanded = wrapper.classList.toggle('expanded');
+        const group = wrapper.closest('.icon-btn-group');
+        if (group) group.classList.toggle('active', isExpanded);
+
+        if (isExpanded) {
+            setTimeout(() => input.focus(), 300);
+        } else {
+            input.value = '';
+            closeDropdown();
+            input.blur();
+        }
+    }
+
+    toggleBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleSearch();
+    });
+
     function selectResult(item) {
         // Fly to location only — do NOT add a waypoint
         map.flyTo({ center: [parseFloat(item.lon), parseFloat(item.lat)], zoom: 14 });
         input.value = '';
         closeDropdown();
         input.blur();
+        wrapper.classList.remove('expanded'); // Auto-close after selection
     }
 
     function renderDropdown(results) {
@@ -1520,6 +1542,8 @@ function toggleSettings(event) {
             if (currentResults.length > 0) selectResult(currentResults[0]);
         } else if (e.key === 'Escape') {
             closeDropdown();
+            wrapper.classList.remove('expanded');
+            input.blur();
         }
     });
 
@@ -1529,8 +1553,14 @@ function toggleSettings(event) {
     });
 
     document.addEventListener('click', (e) => {
-        if (!input.parentElement.contains(e.target)) closeDropdown();
+        if (!wrapper.contains(e.target)) {
+            wrapper.classList.remove('expanded');
+            closeDropdown();
+        }
     });
+
+    // Make toggleSearch available globally for hotkey
+    window._toggleSearch = toggleSearch;
 })();
 
 function reverseRoute() {
@@ -1600,8 +1630,14 @@ window.addEventListener('keydown', (e) => {
         toggleSettings();
     } else if (key === currentKeybindings.search) {
         e.preventDefault();
-        const searchInput = document.getElementById('map-search');
-        if (searchInput) { searchInput.focus(); searchInput.select(); }
+        const wrapper = document.querySelector('.search-wrapper');
+        const input = document.getElementById('map-search');
+        if (wrapper && !wrapper.classList.contains('expanded')) {
+            window._toggleSearch?.();
+        } else if (input) {
+            input.focus();
+            input.select();
+        }
     } else if (key === currentKeybindings.reverse) {
         e.preventDefault();
         reverseRoute();
@@ -2699,26 +2735,36 @@ let resizeStartX, resizeStartY, startW, startH, startLeft, startTop;
 function initResize(e) {
     if (elPanel.classList.contains('minimized')) return;
 
-    // Determine which resizer was clicked by checking classes
     const cl = e.target.classList;
     let resizer = '';
-    if (cl.contains('n')) resizer += 'n';
-    if (cl.contains('s')) resizer += 's';
-    if (cl.contains('e')) resizer += 'e';
-    if (cl.contains('w')) resizer += 'w';
+    if (cl.contains('ne')) resizer = 'ne';
+    else if (cl.contains('nw')) resizer = 'nw';
+    else if (cl.contains('se')) resizer = 'se';
+    else if (cl.contains('sw')) resizer = 'sw';
+    else if (cl.contains('n')) resizer = 'n';
+    else if (cl.contains('s')) resizer = 's';
+    else if (cl.contains('e')) resizer = 'e';
+    else if (cl.contains('w')) resizer = 'w';
 
     if (!resizer) return;
 
     isResizing = true;
     currentResizer = resizer;
-    resizeStartX = e.clientX; resizeStartY = e.clientY;
-    startW = elPanel.offsetWidth; startH = elPanel.offsetHeight;
+    resizeStartX = e.clientX;
+    resizeStartY = e.clientY;
+    startW = elPanel.offsetWidth;
+    startH = elPanel.offsetHeight;
 
-    if (!elPanel.style.left) elPanel.style.left = elPanel.offsetLeft + 'px';
-    if (!elPanel.style.top) elPanel.style.top = elPanel.offsetTop + 'px';
+    // Use getBoundingClientRect so coords are in the same space as container.getBoundingClientRect()
+    const rect = elPanel.getBoundingClientRect();
+    startLeft = rect.left;
+    startTop = rect.top;
 
-    startLeft = parseFloat(elPanel.style.left);
-    startTop = parseFloat(elPanel.style.top);
+    // Lock position using viewport coords so resize math is consistent
+    elPanel.style.left = rect.left + 'px';
+    elPanel.style.top = rect.top + 'px';
+    elPanel.style.bottom = 'auto';
+    elPanel.style.right = 'auto';
 
     document.addEventListener('mousemove', resizeWindow);
     document.addEventListener('mouseup', stopResize);
@@ -2778,10 +2824,14 @@ elMinBtn.addEventListener('click', () => {
 });
 
 const elToggleBtn = document.getElementById('elevation-toggle-btn');
+const elToggleGroup = document.getElementById('elevation-toggle-group');
 function updateElevationToggleBtn() {
     const visible = elPanel.style.display !== 'none';
-    elToggleBtn.textContent = visible ? 'Elevation ↓' : 'Elevation ↑';
-    elToggleBtn.style.color = visible ? 'var(--accent)' : 'var(--text-muted)';
+    if (visible) {
+        elToggleGroup.classList.add('active');
+    } else {
+        elToggleGroup.classList.remove('active');
+    }
 }
 
 elToggleBtn.addEventListener('click', () => {
