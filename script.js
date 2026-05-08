@@ -177,7 +177,8 @@ const DEFAULT_KEYBINDINGS = {
 };
 let currentKeybindings = { ...DEFAULT_KEYBINDINGS };
 let activeCaptureKey = null;
-let mapboxToken = 'pk.eyJ1IjoiaW9uY29vayIsImEiOiJjbW9yZ2MyczQwNGd4MnFvZmFsa3g4aHluIn0.NFfUzmhf6KGk0OGwDHC-Fg';
+// Mapbox is no longer used to save on data/quota. Elevation uses free Terrarium tiles.
+const mapboxToken = '';
 
 function setCookie(name, value, days = 365) {
     const expires = new Date(Date.now() + days * 864e5).toUTCString();
@@ -245,19 +246,87 @@ function syncRoutingUI() {
 // Only rebuild routeScreenPts (for hover hit-testing) when map view changes.
 function rebuildRouteScreenPts() {
     if (!currentRouteGeoJSON) { routeScreenPts = null; return; }
-    const coords = currentRouteGeoJSON.coordinates;
+    // Use miter-corrected display coords if available — they're the actual visible line.
+    // Indices are 1:1 with currentRouteGeoJSON so elevation/grade lookups stay valid.
+    const coords = currentDisplayCoords ?? currentRouteGeoJSON.coordinates;
     const bounds = map.getBounds();
-    // Use a small buffer around bounds to ensure smooth transitions
     const west = bounds.getWest(), east = bounds.getEast();
     const south = bounds.getSouth(), north = bounds.getNorth();
 
     routeScreenPts = coords.map(c => {
-        // Strict viewport check to minimize projection overhead
         if (c[0] < west || c[0] > east || c[1] < south || c[1] > north) {
             return null;
         }
         return map.project(c);
     });
+}
+
+let currentDisplayCoords = null; // Miter-corrected display coords, updated by rebuildMapGradient
+
+// Fixes the line-offset inside-corner overlap at sharp right turns ONLY.
+// For positive line-offset (right side), a right turn puts the offset on the
+// inside — the two adjacent offset segments cross. Fix: replace the vertex with
+// the exact intersection of the two offset lines (the "miter point"), shortening
+// both segments so they meet cleanly. Left turns (outside gap) are untouched.
+// Only modifies the display source — currentRouteGeoJSON is never changed.
+function miterInsideCorners(coords) {
+    if (coords.length < 3) return coords;
+    const pxOffset = getPixelOffset(map.getZoom());
+    if (pxOffset < 1) return coords; // No visible offset at low zooms
+
+    const result = [coords[0]];
+    for (let i = 1; i < coords.length - 1; i++) {
+        const p1 = coords[i - 1], p2 = coords[i], p3 = coords[i + 1];
+
+        // Signed deflection angle. Positive = right turn.
+        let d = getBearing(p2, p3) - getBearing(p1, p2);
+        while (d > 180) d -= 360;
+        while (d < -180) d += 360;
+
+        // Only fix right turns > 30° — these are inside corners for positive offset.
+        // Left turns produce a gap (not overlap), already handled by turnaround staples.
+        if (d < 30) { result.push(p2); continue; }
+
+        const sc = map.project(p2);
+        const s1 = map.project(p1);
+        const s3 = map.project(p3);
+
+        const ivX = sc.x - s1.x, ivY = sc.y - s1.y;
+        const iLen = Math.sqrt(ivX * ivX + ivY * ivY);
+        if (iLen < 1) { result.push(p2); continue; }
+        const idX = ivX / iLen, idY = ivY / iLen;
+
+        const ovX = s3.x - sc.x, ovY = s3.y - sc.y;
+        const oLen = Math.sqrt(ovX * ovX + ovY * ovY);
+        if (oLen < 1) { result.push(p2); continue; }
+        const odX = ovX / oLen, odY = ovY / oLen;
+
+        // Right-hand normals for incoming and outgoing directions
+        const niX = -idY, niY = idX;
+        const noX = -odY, noY = odX;
+
+        // The two offset line anchor points (at the corner vertex, shifted to the right)
+        const ax = sc.x + niX * pxOffset, ay = sc.y + niY * pxOffset;
+        const bx = sc.x + noX * pxOffset, by = sc.y + noY * pxOffset;
+
+        // Intersect: line through (ax,ay) dir (idX,idY) vs line through (bx,by) dir (odX,odY)
+        const cross = idX * odY - idY * odX;
+        if (Math.abs(cross) < 1e-10) { result.push(p2); continue; }
+        const t = ((bx - ax) * odY - (by - ay) * odX) / cross;
+
+        // Sanity: intersection must be within segment bounds and not absurdly far
+        if (t < -pxOffset * 2 || t > iLen) { result.push(p2); continue; }
+
+        const mx = ax + t * idX, my = ay + t * idY;
+        if (Math.sqrt((mx - sc.x) ** 2 + (my - sc.y) ** 2) > pxOffset * 8) {
+            result.push(p2); continue;
+        }
+
+        const mPt = map.unproject([mx, my]);
+        result.push([mPt.lng, mPt.lat]);
+    }
+    result.push(coords[coords.length - 1]);
+    return result;
 }
 
 // Build colored GeoJSON segments and upload to the map.
@@ -269,8 +338,14 @@ let _routeGradStops = null;
 function rebuildMapGradient() {
     if (!currentRouteGeoJSON) return;
     const coords = currentRouteGeoJSON.coordinates;
+    // Display uses miter-corrected coords so inside corners don't overlap.
+    // currentRouteGeoJSON is unchanged — hover/elevation logic uses raw coords.
+    const displayCoords = miterInsideCorners(coords);
+    currentDisplayCoords = displayCoords; // Store for hover snap engine
     const gradSrc = map.getSource('route-gradient');
-    if (gradSrc) gradSrc.setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } });
+    if (gradSrc) gradSrc.setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: displayCoords } });
+    rebuildRouteScreenPts(); // Snap engine must reflect the new display line
+
 
     const grades = routeGrades;
     if (!grades || !routeMercatorDistances || routeMercTotalDist <= 0) {
@@ -304,7 +379,7 @@ function showHoverSegment(ci) {
     lastSegIdx = segIdx;
     const startIndex = waypointPathIndices[segIdx];
     const endIndex = waypointPathIndices[segIdx + 1];
-    const subCoords = currentRouteGeoJSON.coordinates.slice(startIndex, endIndex + 1);
+    const subCoords = miterInsideCorners(currentRouteGeoJSON.coordinates.slice(startIndex, endIndex + 1));
 
     const stops = ['interpolate', ['linear'], ['line-progress']];
     if (routeGrades && routeMercatorDistances) {
@@ -324,7 +399,10 @@ function showHoverSegment(ci) {
     }
     map.getSource('hover-segment')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: subCoords } });
     map.setPaintProperty('hover-segment-layer', 'line-gradient', stops);
-    map.setFilter('turnaround-highlight-layer', ['all', ['>=', ['get', 'idx'], startIndex], ['<=', ['get', 'idx'], endIndex]]);
+    // Exclusive-start range: corner at a waypoint boundary (idx==endIndex) is included in the
+    // approach segment but excluded from the departure segment — avoids double-bolding.
+    map.setFilter('turnaround-highlight-layer', ['all', ['>', ['get', 'idx'], startIndex], ['<=', ['get', 'idx'], endIndex]]);
+    map.setFilter('turnaround-layer', ['any', ['<=', ['get', 'idx'], startIndex], ['>', ['get', 'idx'], endIndex]]);
 }
 
 function updateTurnaroundJoins() {
@@ -342,15 +420,21 @@ function updateTurnaroundJoins() {
     for (let i = 1; i < coords.length - 1; i++) {
         const bIn = getBearing(coords[i - 1], coords[i]);
         const bOut = getBearing(coords[i], coords[i + 1]);
-        let delta = Math.abs(bOut - bIn);
-        if (delta > 180) delta = 360 - delta;
 
-        if (delta > 130) {
+        // Signed deflection: positive = right turn, negative = left turn
+        let d = bOut - bIn;
+        while (d > 180) d -= 360;
+        while (d < -180) d += 360;
+
+        // With positive line-offset (right side), only LEFT turns (d < 0) create an outside gap.
+        // Right turns (d > 0) cross on the inside and are handled by miterInsideCorners.
+        // So we only need staples for sharp left turns.
+        if (d < -100) {
             const pCenter = map.project(coords[i]);
             const pIn = map.project(coords[i - 1]);
             const pOut = map.project(coords[i + 1]);
 
-            // Normal vectors for in/out segments
+            // Right-hand normal vectors for in/out segments
             const vInX = pCenter.x - pIn.x, vInY = pCenter.y - pIn.y;
             const lIn = Math.sqrt(vInX * vInX + vInY * vInY);
             if (lIn < 0.1) continue;
@@ -361,7 +445,7 @@ function updateTurnaroundJoins() {
             if (lOut < 0.1) continue;
             const nOutX = -vOutY / lOut, nOutY = vOutX / lOut;
 
-            // Shift points to where the parallel lines end/start
+            // Offset points are on the right side (positive normal)
             const p1xy = [pCenter.x + nInX * pxOffset, pCenter.y + nInY * pxOffset];
             const p2xy = [pCenter.x + nOutX * pxOffset, pCenter.y + nOutY * pxOffset];
 
@@ -461,6 +545,7 @@ function hideHoverMarker() {
     lastSegIdx = -1;
     map.getSource('hover-segment')?.setData({ type: 'FeatureCollection', features: [] });
     map.setFilter('turnaround-highlight-layer', ['==', ['get', 'idx'], -1]);
+    map.setFilter('turnaround-layer', null);
     hoverInfoEl.style.display = 'none';
 }
 
@@ -513,11 +598,9 @@ function getHighResElevation(coords) {
 // Each source and layer has its OWN independent guard so a pre-existing source
 // with any one of these names won't silently skip the rest of the block.
 function setupRouteLayers() {
-    // Terrain / hillshade (elevation data)
-    const terrainTiles = mapboxToken
-        ? [`https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw?access_token=${mapboxToken}`]
-        : ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'];
-    const terrainEncoding = mapboxToken ? 'mapbox' : 'terrarium';
+    // Terrain / hillshade (using free Terrarium elevation data)
+    const terrainTiles = ['https://elevation-tiles-prod.s3.amazonaws.com/terrarium/{z}/{x}/{y}.png'];
+    const terrainEncoding = 'terrarium';
 
     if (!map.getSource('terrain-source'))
         map.addSource('terrain-source', { type: 'raster-dem', tiles: terrainTiles, tileSize: 256, encoding: terrainEncoding, maxzoom: 14 });
@@ -678,6 +761,7 @@ map.on('style.load', () => {
     const updateView = () => {
         rebuildRouteScreenPts();
         updateTurnaroundJoins();
+        rebuildMapGradient(); // Miter point depends on zoom — refresh display coords
     };
     map.on('zoom', updateView);
     map.on('moveend', updateView);
@@ -813,6 +897,7 @@ map.on('mousemove', 'route-hover-target', (e) => {
             lastSegIdx = -1;
             map.getSource('hover-segment')?.setData({ type: 'FeatureCollection', features: [] });
             map.setFilter('turnaround-highlight-layer', ['==', ['get', 'idx'], -1]);
+            map.setFilter('turnaround-layer', null);
         }
 
         if (ci !== lastHoverIdx) {
@@ -841,6 +926,7 @@ function clearHoverHighlight() {
         hideHoverMarker();
         map.getSource('hover-segment')?.setData({ type: 'FeatureCollection', features: [] });
         map.setFilter('turnaround-highlight-layer', ['==', ['get', 'idx'], -1]);
+        map.setFilter('turnaround-layer', null);
         if (elevationChart) {
             try {
                 elevationChart.setActiveElements([]);
@@ -2272,21 +2358,34 @@ async function updateElevationProfile() {
             }
         }
 
-        // Gaussian display smoothing: reduces DEM pixel noise from ~5-10ft to ~1-2ft.
-        // Uses a perfectly symmetric 15-point kernel to eliminate phase shift when routes are reversed.
-        const GAUSS = [0.03, 0.04, 0.06, 0.08, 0.10, 0.11, 0.12, 0.13, 0.12, 0.11, 0.10, 0.08, 0.06, 0.04, 0.03];
-        const WIN_HALF = 7; // 15-point window (indices -7 to +7)
-        const displayElevs = elevations.map((v, i) => {
+        // Aggressive Gaussian smoothing: eliminates the 1-meter 'stepping' artifacts
+        // common in free Terrarium data. Using a 31-point symmetric kernel (sigma ~ 8).
+        // This is applied directly to the source elevations so that gain/loss 
+        // calculations are performed on the cleaned data, preventing noise-induced inflation.
+        const GAUSS = [
+            0.005, 0.007, 0.010, 0.014, 0.018, 0.024, 0.030, 0.037,
+            0.044, 0.052, 0.059, 0.066, 0.073, 0.078, 0.082, 0.084,
+            0.082, 0.078, 0.073, 0.066, 0.059, 0.052, 0.044, 0.037,
+            0.030, 0.024, 0.018, 0.014, 0.010, 0.007, 0.005
+        ];
+        const WIN_HALF = 15;
+        const smoothedElevs = elevations.map((v, i) => {
             if (v == null) return null;
             let sum = 0, weight = 0;
             for (let k = -WIN_HALF; k <= WIN_HALF; k++) {
                 const e = elevations[i + k];
-                if (e != null) { sum += e * GAUSS[k + WIN_HALF]; weight += GAUSS[k + WIN_HALF]; }
+                if (e != null) {
+                    const w = GAUSS[k + WIN_HALF];
+                    sum += e * w;
+                    weight += w;
+                }
             }
             return weight > 0 ? sum / weight : v;
         });
+        // Replace raw elevations with smoothed ones for all subsequent logic
+        for (let i = 0; i < elevations.length; i++) elevations[i] = smoothedElevs[i];
 
-        // Step 2: Calculate raw segment grades (N-1 segments for N coordinates)
+        // Step 2: Prepare chart data and calculate grades
         const filteredChartData = [];
         const pointGrades = elevations.map((v, i) => {
             if (v == null) return 0;
@@ -2302,7 +2401,7 @@ async function updateElevationProfile() {
         let filteredDist = 0;
         let filteredMax = -Infinity, filteredMin = Infinity;
         for (let i = 0; i < coords.length; i++) {
-            const dval = displayElevs[i];    // Gaussian-smoothed — used for chart
+            const dval = elevations[i];
             if (i > 0) {
                 const d = haversineDistance(coords[i - 1], coords[i]);
                 filteredDist += d;
@@ -2319,7 +2418,7 @@ async function updateElevationProfile() {
         chartData.length = 0; filteredChartData.forEach(p => chartData.push(p));
         maxElev = filteredMax; minElev = filteredMin;
 
-        // Calculate total elevation gain and loss from despiked elevations
+        // Calculate total elevation gain and loss from cleaned elevations
         let totalGainM = 0, totalLossM = 0;
         for (let i = 1; i < elevations.length; i++) {
             if (elevations[i] != null && elevations[i - 1] != null) {

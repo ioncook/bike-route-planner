@@ -85,40 +85,22 @@ self.onmessage = async (e) => {
             return;
         }
 
-        // Strategy: Try Mapbox first if token exists, fallback to Mapzen
+        // Use Mapzen Terrarium (free elevation tiles)
         let data = null;
         let format = 'terrarium';
 
-        if (mapboxToken) {
-            try {
-                const mbRes = await fetch(`https://api.mapbox.com/v4/mapbox.terrain-rgb/${key}.pngraw?access_token=${mapboxToken}`);
-                if (mbRes.ok) {
-                    const blob = await mbRes.blob();
-                    const img = await createImageBitmap(blob);
-                    const canvas = new OffscreenCanvas(256, 256);
-                    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-                    ctx.drawImage(img, 0, 0);
-                    data = ctx.getImageData(0, 0, 256, 256).data;
-                    format = 'mapbox';
-                }
-            } catch (_) {}
-        }
-
-        // Fallback to Mapzen Terrarium
-        if (!data) {
-            try {
-                const mzRes = await fetch(`https://elevation-tiles-prod.s3.amazonaws.com/terrarium/${key}.png`);
-                if (mzRes.ok) {
-                    const blob = await mzRes.blob();
-                    const img = await createImageBitmap(blob);
-                    const canvas = new OffscreenCanvas(256, 256);
-                    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-                    ctx.drawImage(img, 0, 0);
-                    data = ctx.getImageData(0, 0, 256, 256).data;
-                    format = 'terrarium';
-                }
-            } catch (_) {}
-        }
+        try {
+            const mzRes = await fetch(`https://elevation-tiles-prod.s3.amazonaws.com/terrarium/${key}.png`);
+            if (mzRes.ok) {
+                const blob = await mzRes.blob();
+                const img = await createImageBitmap(blob);
+                const canvas = new OffscreenCanvas(256, 256);
+                const ctx = canvas.getContext('2d', { willReadFrequently: true });
+                ctx.drawImage(img, 0, 0);
+                data = ctx.getImageData(0, 0, 256, 256).data;
+                format = 'terrarium';
+            }
+        } catch (_) {}
 
         if (data) {
             const entry = { data, format };
