@@ -3,7 +3,7 @@
 
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>Bike Route Planner</title>
     <link rel="icon" href="favicon.png">
     <link rel="stylesheet" href="style.css">
@@ -19,9 +19,12 @@
     <div id="app">
         <main id="map-container">
             <div id="top-bar">
-                <div class="header-brand">
-                    <a href="https://github.com/ioncook/bike-route-planner" target="_blank" style="display: flex; align-items: center; gap: 10px; text-decoration: none; color: inherit;">
-                        <img src="logo.png" alt="Logo" id="logo">
+                <div class="header-brand" style="display: flex; align-items: center; gap: 10px;">
+                    <a href="https://github.com/ioncook" target="_blank" style="display: flex; align-items: center; text-decoration: none; color: inherit;">
+                        <img src="logo.png" id="logo" alt="Logo">
+                        <img src="favicon.png" id="favicon-mobile" alt="Favicon" style="display: none;">
+                    </a>
+                    <a href="https://github.com/ioncook/bike-route-planner" target="_blank" style="text-decoration: none; color: inherit;">
                         <h1 id="app-title">Bike Route Planner</h1>
                     </a>
                 </div>
@@ -66,7 +69,7 @@
                 </div>
 
                 <!-- Icon-only action group: undo, redo, fit, reverse -->
-                <div class="icon-btn-group">
+                <div class="icon-btn-group" id="main-actions">
                     <button id="undo-btn" class="icon-btn" title="Undo (Ctrl+Z)" aria-label="Undo">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

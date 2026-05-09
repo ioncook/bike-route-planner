@@ -18,7 +18,7 @@ const RASTER_BASEMAPS = {
     osm: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
 };
 
-let currentBasemap = localStorage.getItem('route_basemap') || 'dark';
+let currentBasemap = localStorage.getItem('route_basemap') || 'cyclosm';
 
 // Create a persistent cover that hides the map until the initial load and cycle hack is completely finished.
 // This perfectly answers the request to "only make it visually load on the second load".
@@ -74,13 +74,18 @@ const map = new maplibregl.Map({
     }
 });
 
-// Custom Middle-Click Rotation & Tilt Handler
+// Custom Right-Click Rotation & Tilt Handler
 let isMCRotating = false;
 let mcStartX, mcStartY, mcStartBearing, mcStartPitch;
 let lastMCTime = 0;
 
+// Middle-click zoom & popup
+let isMCZooming = false;
+let mcStartZoom = 0;
+let middleClickStartX = null, middleClickStartY = null;
+
 map.getCanvasContainer().addEventListener('mousedown', (e) => {
-    if (e.button === 1) { // Middle mouse button
+    if (e.button === 2) { // Right mouse button — rotate & tilt
         const now = Date.now();
         if (now - lastMCTime < 400) {
             map.flyTo({ pitch: 0, bearing: 0 });
@@ -96,28 +101,38 @@ map.getCanvasContainer().addEventListener('mousedown', (e) => {
         mcStartBearing = map.getBearing();
         mcStartPitch = map.getPitch();
         map.getCanvas().style.cursor = 'grabbing';
-        e.preventDefault(); // Prevent auto-scroll
+        e.preventDefault(); // Prevent context menu
     }
 }, true);
 
 window.addEventListener('mousemove', (e) => {
-    if (!isMCRotating) return;
-    const dx = e.clientX - mcStartX;
-    const dy = e.clientY - mcStartY;
-    map.setBearing(mcStartBearing + (dx * 0.4));
-    map.setPitch(Math.min(85, Math.max(0, mcStartPitch - (dy * 0.4))));
+    if (isMCRotating) {
+        const dx = e.clientX - mcStartX;
+        const dy = e.clientY - mcStartY;
+        map.setBearing(mcStartBearing + (dx * 0.4));
+        map.setPitch(Math.min(85, Math.max(0, mcStartPitch - (dy * 0.4))));
+    } else if (isMCZooming) {
+        const dy = e.clientY - middleClickStartY;
+        // Drag up (negative dy) to zoom in, down (positive dy) to zoom out
+        const zoomDelta = -dy * 0.01;
+        map.setZoom(Math.min(20, Math.max(0, mcStartZoom + zoomDelta)));
+    }
 });
 
 window.addEventListener('mouseup', (e) => {
-    if (isMCRotating && e.button === 1) {
+    if (isMCRotating && e.button === 2) {
         isMCRotating = false;
+        map.getCanvas().style.cursor = '';
+    }
+    if (isMCZooming && e.button === 1) {
+        isMCZooming = false;
         map.getCanvas().style.cursor = '';
     }
 });
 
-// Disable default right-click rotation to fully transition to middle-click
+// Disable default right-click context menu rotation; we handle it ourselves
 map.dragRotate.disable();
-map.touchZoomRotate.enable({ around: 'center' });
+map.touchZoomRotate.enable(); // No 'around: center' — use finger midpoint for pinch zoom/rotate
 
 function buildRasterStyle(tileUrl) {
     const tiles = Array.isArray(tileUrl) ? tileUrl : [tileUrl];
@@ -787,7 +802,46 @@ map.on('mouseleave', 'route-line', () => { if (!isDraggingLine) map.getCanvas().
 
 // Throttled Hover Logic: Only runs when mouse is near the route
 let lastHoverTime = 0;
+function findClosestPointOnLine(mousePt) {
+    if (!currentRouteGeoJSON || !routeScreenPts) return { bestCi: -1 };
+    const currentOffset = getPixelOffset(map.getZoom());
+    let bestDistSq = Infinity;
+    let bestCi = -1;
+    let bestT = 0;
+    let bestProj = { x: 0, y: 0 };
+
+    for (let i = 0; i < routeScreenPts.length - 1; i++) {
+        const a = routeScreenPts[i];
+        const b = routeScreenPts[i + 1];
+        if (!a || !b) continue;
+        const abx = b.x - a.x, aby = b.y - a.y;
+        const abLenSq = abx * abx + aby * aby;
+        if (abLenSq === 0) continue;
+
+        const nx = -aby / Math.sqrt(abLenSq);
+        const ny = abx / Math.sqrt(abLenSq);
+        const aoX = a.x + nx * currentOffset, aoY = a.y + ny * currentOffset;
+        const boX = b.x + nx * currentOffset, boY = b.y + ny * currentOffset;
+        const abox = boX - aoX, aboy = boY - aoY;
+
+        let t = ((mousePt.x - aoX) * abox + (mousePt.y - aoY) * aboy) / abLenSq;
+        t = Math.max(0, Math.min(1, t));
+
+        const pProjX = aoX + t * abox, pProjY = aoY + t * aboy;
+        const dx = pProjX - mousePt.x, dy = pProjY - mousePt.y;
+        const dSq = dx * dx + dy * dy;
+        if (dSq < bestDistSq) {
+            bestDistSq = dSq;
+            bestCi = i;
+            bestT = t;
+            bestProj = { x: pProjX, y: pProjY };
+        }
+    }
+    return { bestCi, bestT, bestDistSq, bestProj };
+}
+
 map.on('mousemove', 'route-hover-target', (e) => {
+    if (window.innerWidth <= 768) return; // Disable hover interaction on mobile
     const now = performance.now();
     if (now - lastHoverTime < 16) return; // 60fps throttle
     lastHoverTime = now;
@@ -795,7 +849,6 @@ map.on('mousemove', 'route-hover-target', (e) => {
     if (!currentRouteGeoJSON || !routeScreenPts) return;
     const coords = currentRouteGeoJSON.coordinates;
     const mousePt = e.point;
-    const threshold = 10000; // 100px radius squared for broad snapping
     const highlightThreshold = 225; // 15px radius squared for the visual widening
 
     // Get current line-offset for projection
@@ -840,82 +893,68 @@ map.on('mousemove', 'route-hover-target', (e) => {
 
     if (bestCi !== -1 && bestDistSq < highlightThreshold) {
         bestCiGlobal = bestCi;
-
-        // Unproject the best screen-space point on the offset line to get geographic coords
         const shiftedLngLat = map.unproject([bestProj.x, bestProj.y]);
-        const lng = shiftedLngLat.lng;
-        const lat = shiftedLngLat.lat;
-
-        // Map interpolated distance → chart index via routePathDistances
-        const ds = elevationChart?.data?.datasets?.[0];
-        const ci = bestCi;
-        let chartIdx = ci;
-        if (routePathDistances && ds?.data?.length) {
-            const meters = routePathDistances[ci] + bestT *
-                (routePathDistances[Math.min(ci + 1, routePathDistances.length - 1)] - routePathDistances[ci]);
-            const dispDist = currentUnits === 'imperial' ? meters / 1609.344 : meters / 1000;
-            let lo = 0, hi = ds.data.length - 1;
-            while (lo < hi) {
-                const mid = (lo + hi) >> 1;
-                if (ds.data[mid].x < dispDist) lo = mid + 1; else hi = mid;
-            }
-            chartIdx = lo;
-        }
-        chartIdx = Math.min(chartIdx, (ds?.data?.length ?? 1) - 1);
-
-        const pt = ds?.data?.[chartIdx];
-        const grade = ds?.grades?.[ci];
-        const distMeters = routePathDistances?.[ci] ?? 0;
-        const dispDist = currentUnits === 'imperial' ? distMeters / 1609.344 : distMeters / 1000;
-        const distLabel = dispDist.toFixed(2) + (currentUnits === 'metric' ? ' km' : ' mi');
-        const elevVal = pt?.y;
-        const elevLabel = elevVal != null ? elevVal.toFixed(1) + (currentUnits === 'metric' ? ' m' : ' ft') : '';
-        const gradeLabel = grade !== undefined ? (grade >= 0 ? '+' : '') + grade.toFixed(2) + '%' : '';
-        const info = `${distLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${elevLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${gradeLabel}`;
-        showHoverMarker([lng, lat], info);
-
-        const statsDiv = document.getElementById('hover-stats');
-        if (statsDiv) {
-            statsDiv.style.opacity = '1';
-            document.getElementById('hover-dist').textContent = distLabel;
-            document.getElementById('hover-elev').textContent = elevLabel;
-            document.getElementById('hover-grade').textContent = gradeLabel;
-        }
-
-        // Update segment highlight ONLY if the segment has changed
-        if (waypointPathIndices.length >= 2 && bestDistSq < highlightThreshold) {
-            let segIdx = -1;
-            for (let j = 0; j < waypointPathIndices.length - 1; j++) {
-                if (ci >= waypointPathIndices[j] && ci < waypointPathIndices[j + 1]) {
-                    segIdx = j; break;
-                }
-            }
-            if (segIdx !== -1 && segIdx !== lastSegIdx) {
-                showHoverSegment(ci);
-            }
-        } else if (lastSegIdx !== -1) {
-            lastSegIdx = -1;
-            map.getSource('hover-segment')?.setData({ type: 'FeatureCollection', features: [] });
-            map.setFilter('turnaround-highlight-layer', ['==', ['get', 'idx'], -1]);
-            map.setFilter('turnaround-layer', null);
-        }
-
-        if (ci !== lastHoverIdx) {
-            lastHoverIdx = ci;
-            const ds = elevationChart?.data?.datasets?.[0];
-            if (elevationChart && routePathDistances && ds?.data?.length) {
-                try {
-                    const meters = routePathDistances[ci] + bestT *
-                        (routePathDistances[Math.min(ci + 1, routePathDistances.length - 1)] - routePathDistances[ci]);
-                    currentHoverDispDist = getDisplayDistance(meters);
-                    elevationChart.update('none');
-                } catch (err) { console.error(err); }
-            }
-        }
+        updateHoverHighlight(bestCi, bestT, [shiftedLngLat.lng, shiftedLngLat.lat]);
     } else {
         clearHoverHighlight();
     }
 });
+
+function updateHoverHighlight(ci, t, lngLat) {
+    const ds = elevationChart?.data?.datasets?.[0];
+    let chartIdx = ci;
+    if (routePathDistances && ds?.data?.length) {
+        const meters = routePathDistances[ci] + t *
+            (routePathDistances[Math.min(ci + 1, routePathDistances.length - 1)] - routePathDistances[ci]);
+        const dispDist = currentUnits === 'imperial' ? meters / 1609.344 : meters / 1000;
+        let lo = 0, hi = ds.data.length - 1;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (ds.data[mid].x < dispDist) lo = mid + 1; else hi = mid;
+        }
+        chartIdx = lo;
+    }
+    chartIdx = Math.min(chartIdx, (ds?.data?.length ?? 1) - 1);
+
+    const pt = ds?.data?.[chartIdx];
+    const grade = ds?.grades?.[ci];
+    const distMeters = routePathDistances?.[ci] ?? 0;
+    const dispDist = currentUnits === 'imperial' ? distMeters / 1609.344 : distMeters / 1000;
+    const distLabel = dispDist.toFixed(2) + (currentUnits === 'metric' ? ' km' : ' mi');
+    const elevVal = pt?.y;
+    const elevLabel = elevVal != null ? elevVal.toFixed(1) + (currentUnits === 'metric' ? ' m' : ' ft') : '';
+    const gradeLabel = grade !== undefined ? (grade >= 0 ? '+' : '') + grade.toFixed(2) + '%' : '';
+    const info = `${distLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${elevLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${gradeLabel}`;
+    showHoverMarker(lngLat, info);
+
+    const statsDiv = document.getElementById('hover-stats');
+    if (statsDiv) {
+        statsDiv.style.opacity = '1';
+        document.getElementById('hover-dist').textContent = distLabel;
+        document.getElementById('hover-elev').textContent = elevLabel;
+        document.getElementById('hover-grade').textContent = gradeLabel;
+    }
+
+    if (waypointPathIndices.length >= 2) {
+        let segIdx = -1;
+        for (let j = 0; j < waypointPathIndices.length - 1; j++) {
+            if (ci >= waypointPathIndices[j] && ci < waypointPathIndices[j + 1]) {
+                segIdx = j; break;
+            }
+        }
+        if (segIdx !== -1 && segIdx !== lastSegIdx) {
+            showHoverSegment(ci);
+        }
+    }
+
+    if (ci !== lastHoverIdx) {
+        lastHoverIdx = ci;
+        currentHoverDispDist = dispDist; // Sync with chart hover line
+        if (elevationChart) {
+            elevationChart.update('none');
+        }
+    }
+}
 
 function clearHoverHighlight() {
     const statsDiv = document.getElementById('hover-stats');
@@ -923,6 +962,7 @@ function clearHoverHighlight() {
     if (lastHoverIdx !== -1) {
         lastHoverIdx = -1;
         lastSegIdx = -1;
+        currentHoverDispDist = null; // Clear chart hover line
         hideHoverMarker();
         map.getSource('hover-segment')?.setData({ type: 'FeatureCollection', features: [] });
         map.setFilter('turnaround-highlight-layer', ['==', ['get', 'idx'], -1]);
@@ -982,11 +1022,35 @@ function createMarker(lngLat, index) {
     marker.getElement().addEventListener('mousedown', onMiddleClick);
     marker.getElement().addEventListener('auxclick', onMiddleClick);
 
+    // Mobile Long-Press Deletion
+    let markerTouchStart = null;
+    let markerLongPressTimer = null;
+    marker.getElement().addEventListener('touchstart', (e) => {
+        window._isMarkerTouch = true;
+        markerTouchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        markerLongPressTimer = setTimeout(() => {
+            handleLongPress(marker.getLngLat(), marker);
+            markerLongPressTimer = null;
+        }, 600);
+    }, { passive: true });
+    marker.getElement().addEventListener('touchend', () => {
+        setTimeout(() => { window._isMarkerTouch = false; }, 100);
+        if (markerLongPressTimer) { clearTimeout(markerLongPressTimer); markerLongPressTimer = null; }
+    }, { passive: true });
+    marker.getElement().addEventListener('touchmove', (e) => {
+        if (markerLongPressTimer && markerTouchStart) {
+            const dist = Math.hypot(e.touches[0].clientX - markerTouchStart.x, e.touches[0].clientY - markerTouchStart.y);
+            if (dist > 10) { clearTimeout(markerLongPressTimer); markerLongPressTimer = null; }
+        }
+    }, { passive: true });
+
     marker.on('dragstart', () => {
+        isDraggingMarker = true;
         saveHistory();
     });
 
     marker.on('dragend', () => {
+        isDraggingMarker = false;
         const idx = markers.indexOf(marker);
         if (idx > -1) {
             const ll = marker.getLngLat();
@@ -1030,6 +1094,7 @@ function refreshMarkerIcons() {
 
 let wasDraggingLine = false;
 let isDraggingLine = false;
+let isDraggingMarker = false;
 let draggedWaypointIndex = -1;
 
 function distance(p1, p2) {
@@ -1057,16 +1122,30 @@ function getInsertIndex(clickedLngLat) {
     return bestIndex;
 }
 
-map.on('mousedown', 'route-line', (e) => {
-    if (e.originalEvent.button !== 0) return; // Left click only
-    if (!currentRouteGeoJSON || bestCiGlobal === -1) return;
+map.on('mousedown', 'route-line', onLineDown);
+map.on('touchstart', 'route-line', (e) => {
+    if (e.points && e.points.length > 1) return; // ignore pinch — don't interfere with MapLibre gesture tracking
+    // Do NOT call preventDefault() here — it breaks MapLibre's pinch-zoom origin tracking
+    onLineDown(e);
+});
 
-    // 1. DEAD ZONE CHECK: Don't create new waypoint if clicking very close to an existing one
+function onLineDown(e) {
+    if (e.type === 'mousedown' && e.originalEvent.button !== 0) return;
+    e.originalEvent?.stopPropagation();
+
+    // Ensure we have a valid snapping point, especially for mobile touchstart
+    const { bestCi, bestT, bestDistSq, bestProj } = findClosestPointOnLine(e.point);
+    const highlightThreshold = 100 * 100; // More generous for touch
+    if (bestCi === -1 || bestDistSq > highlightThreshold) return;
+
+    // Sync global state for the up/move handlers
+    bestCiGlobal = bestCi;
+
     const clickPt = e.point;
     for (const wp of waypoints) {
         const wpPt = map.project(wp);
         const dist = Math.hypot(wpPt.x - clickPt.x, wpPt.y - clickPt.y);
-        if (dist < 25) return; // 25px dead zone to avoid double-drag
+        if (dist < 25) return;
     }
 
     saveHistory();
@@ -1075,7 +1154,6 @@ map.on('mousedown', 'route-line', (e) => {
     map.dragPan.disable();
     map.getCanvas().style.cursor = 'grabbing';
 
-    // Which two waypoints bound this segment?
     let insertIdx = waypoints.length;
     for (let j = 0; j < waypointPathIndices.length - 1; j++) {
         if (bestCiGlobal >= waypointPathIndices[j] && bestCiGlobal < waypointPathIndices[j + 1]) {
@@ -1084,17 +1162,14 @@ map.on('mousedown', 'route-line', (e) => {
         }
     }
 
-    // Store neighboring waypoints for rubber-banding
     const prevWp = waypoints[insertIdx - 1];
     const nextWp = waypoints[insertIdx];
 
     const onMove = (moveEvent) => {
         const lngLat = moveEvent.lngLat;
-        // Update rubber-band guide lines
         const guideCoords = [prevWp, [lngLat.lng, lngLat.lat]];
         if (nextWp) guideCoords.push(nextWp);
         map.getSource('drag-guide')?.setData({ type: 'LineString', coordinates: guideCoords });
-        // Move and show the ghost pin
         const pm = window._dragPreviewMarker;
         if (pm) {
             pm.setLngLat(lngLat);
@@ -1107,9 +1182,10 @@ map.on('mousedown', 'route-line', (e) => {
         map.dragPan.enable();
         map.getCanvas().style.cursor = 'pointer';
         map.off('mousemove', onMove);
+        map.off('touchmove', onMove);
         map.off('mouseup', onUp);
+        map.off('touchend', onUp);
 
-        // Clear guides and hide ghost pin
         map.getSource('drag-guide')?.setData({ type: 'LineString', coordinates: [] });
         const pm = window._dragPreviewMarker;
         if (pm && pm._added) { pm.remove(); pm._added = false; }
@@ -1120,8 +1196,10 @@ map.on('mousedown', 'route-line', (e) => {
     };
 
     map.on('mousemove', onMove);
+    map.on('touchmove', onMove);
     map.on('mouseup', onUp);
-});
+    map.on('touchend', onUp);
+}
 
 map.on('click', (e) => {
     if (e.originalEvent.button !== 0) return; // Left click only
@@ -1148,20 +1226,17 @@ function getWeatherIcon(code) {
     return sunny;
 }
 
-let currentInfoPopup = null;
-map.on('mouseup', (e) => {
-    if (e.originalEvent.button !== 2) return; // Only right click
-
+function showWeatherPopup(lngLat) {
     if (currentInfoPopup) currentInfoPopup.remove();
 
-    const { lat, lng } = e.lngLat;
+    const { lat, lng } = lngLat;
     const units = currentUnits === 'imperial' ? 'fahrenheit' : 'celsius';
     const windUnits = currentUnits === 'imperial' ? 'mph' : 'kmh';
     const tempLabel = currentUnits === 'imperial' ? '°F' : '°C';
     const windLabel = currentUnits === 'imperial' ? 'mph' : 'km/h';
 
     currentInfoPopup = new maplibregl.Popup({ closeButton: true, className: 'weather-popup', anchor: 'bottom' })
-        .setLngLat(e.lngLat)
+        .setLngLat(lngLat)
         .setHTML(`
             <div style="font-family: 'Inter', sans-serif; min-width: 160px; padding: 4px;">
                 <div style="margin-top: 6px;">
@@ -1200,14 +1275,81 @@ map.on('mouseup', (e) => {
             if (iconEl) iconEl.innerHTML = getWeatherIcon(data.current.weather_code);
             if (arrowEl && data.current.wind_direction_10m !== undefined) {
                 arrowEl.style.display = 'inline-block';
-                // wind_direction is "from", we rotate 180 to show where it's "going"
-                arrowEl.style.transform = `rotate(${data.current.wind_direction_10m + 180}deg)`;
+                arrowEl.style.transform = `rotate(${data.current.wind_direction_10m}deg)`;
             }
-        })
-        .catch(() => {
-            const info = document.getElementById('weather-info');
-            if (info) info.innerHTML = '<div style="color: #ef4444; font-size: 11px; text-align: center; margin-top: 4px;">Weather data unavailable</div>';
-        });
+        }).catch(err => console.error('Weather fetch error:', err));
+}
+
+let currentInfoPopup = null;
+map.getCanvasContainer().addEventListener('mousedown', (e) => {
+    if (e.button === 1) { // Middle mouse button
+        middleClickStartX = e.clientX;
+        middleClickStartY = e.clientY;
+        mcStartZoom = map.getZoom();
+        isMCZooming = true;
+        map.getCanvas().style.cursor = 'ns-resize';
+        e.preventDefault(); // Prevent auto-scroll
+    }
+});
+map.on('mouseup', (e) => {
+    if (e.originalEvent.button !== 1) return;
+    // Only show popup if cursor barely moved (i.e. it was a click, not a pan)
+    const dx = e.originalEvent.clientX - middleClickStartX;
+    const dy = e.originalEvent.clientY - middleClickStartY;
+    if (Math.hypot(dx, dy) < 6) showWeatherPopup(e.lngLat);
+});
+
+// Prevent browser context menu on right-click so rotate works cleanly
+map.getCanvasContainer().addEventListener('contextmenu', (e) => e.preventDefault());
+
+// Long Press Handler for Mobile
+let touchStartPos = null;
+let longPressTimer = null;
+
+function handleLongPress(lngLat, targetMarker = null) {
+    if (targetMarker) {
+        window._isMarkerTouch = false;
+        // Delete pin logic
+        const idx = markers.indexOf(targetMarker);
+        if (idx > -1) {
+            saveHistory();
+            markers.splice(idx, 1);
+            waypoints.splice(idx, 1);
+            if (idx > 0) segmentModes.splice(idx - 1, 1);
+            targetMarker.remove();
+            updateRoute();
+        }
+    } else {
+        // Show weather popup on map
+        showWeatherPopup(lngLat);
+    }
+}
+
+map.on('touchstart', (e) => {
+    if (e.points && e.points.length > 1) return; // Ignore multi-touch
+    if (window._isMarkerTouch) return; // Ignore if marker was touched
+    touchStartPos = e.point;
+    longPressTimer = setTimeout(() => {
+        handleLongPress(e.lngLat);
+        longPressTimer = null;
+    }, 600);
+});
+
+map.on('touchend', () => {
+    if (longPressTimer) {
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+    }
+});
+
+map.on('touchmove', (e) => {
+    if (longPressTimer && touchStartPos) {
+        const dist = Math.hypot(e.point.x - touchStartPos.x, e.point.y - touchStartPos.y);
+        if (dist > 10) {
+            clearTimeout(longPressTimer);
+            longPressTimer = null;
+        }
+    }
 });
 
 window.addEventListener('keydown', (e) => {
@@ -1894,11 +2036,9 @@ function loadStoredSettings() {
     // Basemap — the map was ALREADY initialized with the saved basemap style in the
     // constructor. Dispatching 'change' here would call setStyle() again, destroying
     // all our custom sources and layers. Just sync the UI element.
-    const basemap = localStorage.getItem('route_basemap');
-    if (basemap) {
-        document.getElementById('basemap').value = basemap;
-        // Do NOT dispatch — style is already correct from initialization
-    }
+    const basemap = localStorage.getItem('route_basemap') || 'cyclosm';
+    document.getElementById('basemap').value = basemap;
+    // Do NOT dispatch — style is already correct from initialization
 
     // Units — safe, no map side effects
     const units = localStorage.getItem('route_units');
@@ -2097,7 +2237,7 @@ function initChart() {
             responsive: true,
             maintainAspectRatio: false,
             layout: {
-                padding: { top: 20, right: 10, left: 10, bottom: 0 }
+                padding: window.innerWidth <= 768 ? 4 : { top: 20, right: 10, left: 10, bottom: 0 }
             },
             interaction: {
                 mode: 'routeHover',
@@ -2204,15 +2344,15 @@ function initChart() {
                     type: 'linear',
                     display: true,
                     min: 0,
-                    title: { display: true, text: 'Distance', color: '#aaa' },
+                    title: { display: window.innerWidth > 768, text: 'Distance', color: '#aaa' },
                     grid: { color: '#333' },
-                    ticks: { color: '#aaa' }
+                    ticks: { color: '#aaa', padding: window.innerWidth <= 768 ? 2 : 3 }
                 },
                 y: {
                     display: true,
-                    title: { display: true, text: 'Elevation', color: '#aaa' },
+                    title: { display: window.innerWidth > 768, text: 'Elevation', color: '#aaa' },
                     grid: { color: '#333' },
-                    ticks: { color: '#aaa' }
+                    ticks: { color: '#aaa', padding: window.innerWidth <= 768 ? 2 : 3 }
                 }
             }
         },
@@ -2681,6 +2821,7 @@ let isDraggingWindow = false;
 let startX, startY, initialLeft, initialTop;
 
 elHeader.addEventListener('mousedown', (e) => {
+    if (window.innerWidth <= 768) return; // Disable dragging on mobile
     if (e.target === elMinBtn) return;
     isDraggingWindow = true;
     startX = e.clientX;
@@ -2733,6 +2874,7 @@ let currentResizer = null;
 let resizeStartX, resizeStartY, startW, startH, startLeft, startTop;
 
 function initResize(e) {
+    if (window.innerWidth <= 768) return; // Disable resizing on mobile
     if (elPanel.classList.contains('minimized')) return;
 
     const cl = e.target.classList;
@@ -2950,6 +3092,7 @@ document.getElementById('reset-keybindings').onclick = () => {
 };
 
 function initCustomTooltips() {
+    if (window.innerWidth <= 768) return; // Disable on mobile
     const tooltip = document.createElement('div');
     tooltip.className = 'custom-tooltip';
     document.body.appendChild(tooltip);
