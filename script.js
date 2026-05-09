@@ -353,9 +353,8 @@ let _routeGradStops = null;
 function rebuildMapGradient() {
     if (!currentRouteGeoJSON) return;
     const coords = currentRouteGeoJSON.coordinates;
-    // Display uses miter-corrected coords so inside corners don't overlap.
-    // currentRouteGeoJSON is unchanged — hover/elevation logic uses raw coords.
-    const displayCoords = miterInsideCorners(coords);
+    // Using raw coordinates directly for the map display.
+    const displayCoords = coords;
     currentDisplayCoords = displayCoords; // Store for hover snap engine
     const gradSrc = map.getSource('route-gradient');
     if (gradSrc) gradSrc.setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: displayCoords } });
@@ -619,16 +618,16 @@ function setupRouteLayers() {
 
     if (!map.getSource('terrain-source'))
         map.addSource('terrain-source', { type: 'raster-dem', tiles: terrainTiles, tileSize: 256, encoding: terrainEncoding, maxzoom: 14 });
-    if (!map.getSource('hillshade-source'))
-        map.addSource('hillshade-source', { type: 'raster-dem', tiles: terrainTiles, tileSize: 256, encoding: terrainEncoding, maxzoom: 14 });
-    if (!map.getLayer('hillshade-layer'))
-        map.addLayer({ id: 'hillshade-layer', type: 'hillshade', source: 'hillshade-source', paint: { 'hillshade-exaggeration': 0.4, 'hillshade-shadow-color': 'rgba(0,0,0,0.5)', 'hillshade-highlight-color': 'rgba(255,255,255,0.1)' }, layout: { visibility: 'none' } });
 
-    // Route sources (buffer:0 / tolerance:0 = exact geometry, no tile padding)
+    // Hillshade can use the same source as terrain to save memory and network
+    if (!map.getLayer('hillshade-layer'))
+        map.addLayer({ id: 'hillshade-layer', type: 'hillshade', source: 'terrain-source', paint: { 'hillshade-exaggeration': 0.4, 'hillshade-shadow-color': 'rgba(0,0,0,0.5)', 'hillshade-highlight-color': 'rgba(255,255,255,0.1)' }, layout: { visibility: 'none' } });
+
+    // Route sources (Removed tolerance:0 to allow MapLibre to simplify geometry based on zoom level)
     if (!map.getSource('route'))
-        map.addSource('route', { type: 'geojson', data: { type: 'LineString', coordinates: [] }, buffer: 0, tolerance: 0 });
+        map.addSource('route', { type: 'geojson', data: { type: 'LineString', coordinates: [] } });
     if (!map.getSource('route-segments'))
-        map.addSource('route-segments', { type: 'geojson', data: { type: 'FeatureCollection', features: [] }, buffer: 0, tolerance: 0 });
+        map.addSource('route-segments', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
 
     // Single LineString with lineMetrics:true — required for line-gradient paint.
     let gradData = { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [] } };
@@ -992,7 +991,7 @@ window.addEventListener('blur', clearHoverHighlight);
 
 
 
-function createMarker(lngLat, index) {
+function createMarker(lngLat, index, initialMode) {
     const el = document.createElement('div');
     el.style.width = '24px';
     el.style.height = '34px';
@@ -1049,8 +1048,20 @@ function createMarker(lngLat, index) {
         saveHistory();
     });
 
+    marker.on('drag', () => {
+        const idx = markers.indexOf(marker);
+        if (idx === -1) return;
+        const ll = marker.getLngLat();
+        const guideCoords = [];
+        if (idx > 0) guideCoords.push(waypoints[idx - 1]);
+        guideCoords.push([ll.lng, ll.lat]);
+        if (idx < waypoints.length - 1) guideCoords.push(waypoints[idx + 1]);
+        map.getSource('drag-guide')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: guideCoords } });
+    });
+
     marker.on('dragend', () => {
         isDraggingMarker = false;
+        map.getSource('drag-guide')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [] } });
         const idx = markers.indexOf(marker);
         if (idx > -1) {
             const ll = marker.getLngLat();
@@ -1066,13 +1077,13 @@ function createMarker(lngLat, index) {
         markers.splice(index, 0, marker);
         waypoints.splice(index, 0, lngLatArr);
         // Inherit the mode of the segment being split
-        const oldMode = segmentModes[index - 1] || 'bike';
+        const oldMode = initialMode ?? (segmentModes[index - 1] || 'bike');
         segmentModes.splice(index, 0, oldMode);
     } else {
         markers.push(marker);
         waypoints.push(lngLatArr);
         if (waypoints.length > 1) {
-            segmentModes.push(currentRoutingMode);
+            segmentModes.push(initialMode ?? currentRoutingMode);
         }
     }
     refreshMarkerIcons();
@@ -1204,6 +1215,16 @@ function onLineDown(e) {
 map.on('click', (e) => {
     if (e.originalEvent.button !== 0) return; // Left click only
     if (wasDraggingLine) return;
+
+    // Toggle individual segment mode if clicking on the route
+    if (lastSegIdx !== -1) {
+        saveHistory();
+        const current = segmentModes[lastSegIdx] || 'bike';
+        segmentModes[lastSegIdx] = current === 'direct' ? 'bike' : 'direct';
+        updateRoute();
+        return;
+    }
+
     saveHistory();
     createMarker(e.lngLat);
     updateRoute();
@@ -1275,7 +1296,8 @@ function showWeatherPopup(lngLat) {
             if (iconEl) iconEl.innerHTML = getWeatherIcon(data.current.weather_code);
             if (arrowEl && data.current.wind_direction_10m !== undefined) {
                 arrowEl.style.display = 'inline-block';
-                arrowEl.style.transform = `rotate(${data.current.wind_direction_10m}deg)`;
+                // Meteorological wind is 'from' direction. We add 180 to point the arrow 'towards' the flow.
+                arrowEl.style.transform = `rotate(${data.current.wind_direction_10m + 180}deg)`;
             }
         }).catch(err => console.error('Weather fetch error:', err));
 }
@@ -1972,17 +1994,13 @@ function applyTerrain() {
 
     if (show) {
         map.setLayoutProperty('hillshade-layer', 'visibility', 'visible');
-        if (exVal > 0) {
-            map.setTerrain({ source: 'terrain-source', exaggeration: exVal });
-        } else {
-            if (map.getTerrain()) map.setTerrain(null);
-        }
+        // Apply exaggeration to the 2D hillshade layer
+        map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', Math.min(1.0, exVal / 2));
     } else {
         map.setLayoutProperty('hillshade-layer', 'visibility', 'none');
-        // Only call setTerrain(null) if terrain was previously enabled
-        // Calling setTerrain with any source triggers MapLibre's terrain init pipeline
-        if (map.getTerrain()) map.setTerrain(null);
     }
+    // Disable 3D terrain for now to maximize performance
+    if (map.getTerrain()) map.setTerrain(null);
 
     needsElevationUpdate = true;
     if (typeof updateElevationProfile === 'function') updateElevationProfile();
@@ -2196,12 +2214,9 @@ function getColorForGrade(grade) {
         r = 234 + t * (239 - 234);
         g = 179 + t * (68 - 179);
         b = 8 + t * (68 - 8);
-    } else if (grade <= 40) {
-        // Red for all real steep terrain up to the 40% clamp ceiling
-        return 'rgb(239, 68, 68)';
     } else {
-        // Purple only above 40% — impossible after clamping, indicates artifact
-        return 'rgb(168, 85, 247)';
+        // Red for all steep uphill terrain
+        return 'rgb(239, 68, 68)';
     }
     return `rgb(${Math.round(r)}, ${Math.round(g)}, ${Math.round(b)})`;
 }
@@ -2346,7 +2361,7 @@ function initChart() {
                     min: 0,
                     title: { display: window.innerWidth > 768, text: 'Distance', color: '#aaa' },
                     grid: { color: '#333' },
-                    ticks: { color: '#aaa', padding: window.innerWidth <= 768 ? 2 : 3 }
+                    ticks: { color: '#aaa', padding: window.innerWidth <= 768 ? 2 : 3, align: 'inner' }
                 },
                 y: {
                     display: true,
@@ -2612,32 +2627,32 @@ async function updateElevationProfile() {
         const gainLossEl = document.getElementById('elev-gain-loss');
         if (gainLossEl) gainLossEl.textContent = `${gainLabel}  ${lossLabel}`;
 
-        // Step 3: Clamp physically impossible grades and apply distance-aware smoothing.
+        // Step 3: Apply distance-aware smoothing to segment grades.
         // We now use point-centered grades which are mathematically symmetric.
-        const clampedGrades = pointGrades.map(g => Math.max(-40, Math.min(40, g)));
+        const smoothingGrades = pointGrades;
         const smoothedSegmentGrades = [];
         const targetWindowMeters = 10; // 10m smoothing window
 
-        for (let i = 0; i < clampedGrades.length; i++) {
+        for (let i = 0; i < smoothingGrades.length; i++) {
             let sum = 0, count = 0;
             let distBack = 0, distFwd = 0;
 
             // Average current point
-            sum += clampedGrades[i]; count++;
+            sum += smoothingGrades[i]; count++;
 
             // Scan backward up to targetWindowMeters / 2
             for (let j = i - 1; j >= 0; j--) {
                 const d = haversineDistance(coords[j], coords[j + 1]);
                 distBack += d;
                 if (distBack > targetWindowMeters / 2) break;
-                sum += clampedGrades[j]; count++;
+                sum += smoothingGrades[j]; count++;
             }
             // Scan forward up to targetWindowMeters / 2
-            for (let j = i; j < clampedGrades.length - 1; j++) {
+            for (let j = i; j < smoothingGrades.length - 1; j++) {
                 const d = haversineDistance(coords[j], coords[j + 1]);
                 distFwd += d;
                 if (distFwd > targetWindowMeters / 2) break;
-                sum += clampedGrades[j + 1]; count++;
+                sum += smoothingGrades[j + 1]; count++;
             }
             smoothedSegmentGrades.push(sum / count);
         }
@@ -2737,8 +2752,11 @@ function syncUrl() {
     if (waypoints.length > 0) {
         const wpStr = waypoints.map(wp => `${wp[0].toFixed(5)},${wp[1].toFixed(5)}`).join(';');
         params.set('route', wpStr);
+        if (segmentModes.length > 0) params.set('modes', segmentModes.join(','));
+        else params.delete('modes');
     } else {
         params.delete('route');
+        params.delete('modes');
     }
     if (forceMode) params.set('force', '1'); else params.delete('force');
     window.history.replaceState({}, '', `${window.location.pathname}?${params.toString()}`);
@@ -2752,14 +2770,17 @@ function loadUrlState() {
         updateForceModeBtn();
     }
     const routeStr = params.get('route');
+    const modeStr = params.get('modes');
+    const modes = modeStr ? modeStr.split(',') : [];
+
     if (routeStr) {
         const points = routeStr.split(';');
-        for (const pt of points) {
+        points.forEach((pt, i) => {
             const [lng, lat] = pt.split(',').map(Number);
             if (!isNaN(lng) && !isNaN(lat)) {
-                createMarker({ lng, lat });
+                createMarker({ lng, lat }, undefined, i > 0 ? modes[i - 1] : undefined);
             }
-        }
+        });
         updateRoute();
 
         if (waypoints.length > 1) {
@@ -3127,4 +3148,5 @@ function initCustomTooltips() {
         }
     });
 }
+initCustomTooltips();
 initCustomTooltips();
