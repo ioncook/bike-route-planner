@@ -787,11 +787,13 @@ body.light-mode .custom-tooltip {
     height: 32px !important;
     box-sizing: border-box;
 }
+
 #total-distance:hover {
     background: rgba(255, 255, 255, 0.08) !important;
     border-color: rgba(255, 255, 255, 0.25) !important;
     color: var(--text-main) !important;
 }
+
 #total-distance:active {
     background: rgba(255, 255, 255, 0.12) !important;
     transform: scale(0.96);

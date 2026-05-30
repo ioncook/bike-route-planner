@@ -1112,6 +1112,15 @@ function createMarker(lngLat, index, initialMode) {
 
     marker.on('dragstart', () => {
         isDraggingMarker = true;
+        window._currentlyDraggingMarker = marker;
+        const idx = markers.indexOf(marker);
+        if (idx > -1 && waypoints[idx]) {
+            window._currentlyDraggingMarkerOriginalLngLat = new maplibregl.LngLat(waypoints[idx][0], waypoints[idx][1]);
+        } else {
+            window._currentlyDraggingMarkerOriginalLngLat = marker.getLngLat();
+        }
+        window._currentlyDraggingMarkerCancel = false;
+        console.log('[Antigravity] Marker dragstart. idx:', idx, 'Original location set to:', window._currentlyDraggingMarkerOriginalLngLat);
         saveHistory();
     });
 
@@ -1127,7 +1136,14 @@ function createMarker(lngLat, index, initialMode) {
     });
 
     marker.on('dragend', () => {
+        console.log('[Antigravity] Marker dragend. window._currentlyDraggingMarkerCancel =', window._currentlyDraggingMarkerCancel);
+        if (window._currentlyDraggingMarkerCancel) {
+            console.log('[Antigravity] Marker dragend cancelled, aborting save.');
+            return;
+        }
         isDraggingMarker = false;
+        window._currentlyDraggingMarker = null;
+        window._currentlyDraggingMarkerOriginalLngLat = null;
         map.getSource('drag-guide')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [] } });
         const idx = markers.indexOf(marker);
         if (idx > -1) {
@@ -1184,6 +1200,64 @@ let wasDraggingLine = false;
 let isDraggingLine = false;
 let isDraggingMarker = false;
 let draggedWaypointIndex = -1;
+
+function cancelDraggingGestures() {
+    console.log('[Antigravity] cancelDraggingGestures triggered. isDraggingLine:', isDraggingLine, 'isDraggingMarker:', isDraggingMarker);
+    if (isDraggingLine && typeof window._activeLineDragCleanup === 'function') {
+        console.log('[Antigravity] Cancelling active line drag...');
+        window._activeLineDragCleanup();
+    }
+    
+    const marker = window._currentlyDraggingMarker;
+    const orig = window._currentlyDraggingMarkerOriginalLngLat;
+    console.log('[Antigravity] Active marker to cancel:', marker, 'Original location:', orig);
+    if (marker && orig) {
+        window._currentlyDraggingMarkerCancel = true;
+        console.log('[Antigravity] Reverting marker setLngLat to:', orig.lng, orig.lat);
+        marker.setLngLat(orig);
+        
+        // Call MapLibre's internal cleanup methods directly to terminate dragging state
+        try {
+            if (typeof marker._onUp === 'function') {
+                console.log('[Antigravity] Calling marker._onUp() directly');
+                marker._onUp(new Event('touchend'));
+            } else if (typeof marker._removeDragListeners === 'function') {
+                console.log('[Antigravity] Calling marker._removeDragListeners() directly');
+                marker._removeDragListeners();
+            }
+        } catch (err) {
+            console.error('[Antigravity] Error calling MapLibre internal cleanup:', err);
+        }
+
+        setTimeout(() => {
+            window._currentlyDraggingMarkerCancel = false;
+        }, 50);
+    }
+
+    console.log('[Antigravity] Dispatching mouseup and touchend to window...');
+    window.dispatchEvent(new Event('mouseup', { bubbles: true, cancelable: true }));
+    window.dispatchEvent(new Event('touchend', { bubbles: true, cancelable: true }));
+
+    isDraggingMarker = false;
+    window._currentlyDraggingMarker = null;
+    window._currentlyDraggingMarkerOriginalLngLat = null;
+    map.getSource('drag-guide')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [] } });
+}
+
+// Cancel waypoint dragging if a gesture (rotate, pitch, or pinch zoom) starts
+map.on('rotatestart', () => { console.log('[Antigravity] map rotatestart'); cancelDraggingGestures(); });
+map.on('pitchstart', () => { console.log('[Antigravity] map pitchstart'); cancelDraggingGestures(); });
+map.on('zoomstart', () => { console.log('[Antigravity] map zoomstart'); cancelDraggingGestures(); });
+
+// Intercept touch events on capture phase before MapLibre GL stops propagation
+const handleMultiTouch = (e) => {
+    if (e.touches && e.touches.length > 1) {
+        console.log('[Antigravity] handleMultiTouch: touches.length =', e.touches.length, 'isDraggingMarker:', isDraggingMarker, 'isDraggingLine:', isDraggingLine);
+        cancelDraggingGestures();
+    }
+};
+window.addEventListener('touchstart', handleMultiTouch, { capture: true, passive: true });
+window.addEventListener('touchmove', handleMultiTouch, { capture: true, passive: true });
 
 function distance(p1, p2) {
     const dx = p1[0] - p2[0];
@@ -1281,12 +1355,31 @@ function onLineDown(e) {
         createMarker(upEvent.lngLat, insertIdx);
         updateRoute();
         setTimeout(() => wasDraggingLine = false, 50);
+        window._activeLineDragCleanup = null;
     };
 
     map.on('mousemove', onMove);
     map.on('touchmove', onMove);
     map.on('mouseup', onUp);
     map.on('touchend', onUp);
+
+    window._activeLineDragCleanup = () => {
+        isDraggingLine = false;
+        map.dragPan.enable();
+        map.getCanvas().style.cursor = 'pointer';
+        map.off('mousemove', onMove);
+        map.off('touchmove', onMove);
+        map.off('mouseup', onUp);
+        map.off('touchend', onUp);
+
+        map.getSource('drag-guide')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [] } });
+        const pm = window._dragPreviewMarker;
+        if (pm && pm._added) { pm.remove(); pm._added = false; }
+        
+        wasDraggingLine = true;
+        setTimeout(() => wasDraggingLine = false, 100);
+        window._activeLineDragCleanup = null;
+    };
 }
 
 map.on('click', (e) => {
@@ -2313,9 +2406,10 @@ function applyTerrain() {
 function setRoutingMode(mode) {
     currentRoutingMode = mode;
     localStorage.setItem('route_routing_mode', mode);
-    document.getElementById('mode-bike')?.classList.toggle('active', mode === 'bike');
-    document.getElementById('mode-direct')?.classList.toggle('active', mode === 'direct');
-    document.getElementById('mode-hike')?.classList.toggle('active', mode === 'hike');
+    const displayMode = mode === 'gpx' ? 'bike' : mode;
+    document.getElementById('mode-bike')?.classList.toggle('active', displayMode === 'bike');
+    document.getElementById('mode-direct')?.classList.toggle('active', displayMode === 'direct');
+    document.getElementById('mode-hike')?.classList.toggle('active', displayMode === 'hike');
 }
 
 function cycleRoutingMode() {
@@ -3362,6 +3456,13 @@ function syncUrl() {
     }
     if (forceMode) params.set('force', '1'); else params.delete('force');
     window.history.replaceState({}, '', `${window.location.pathname}?${params.toString()}`);
+
+    // Persist GPX paths in localStorage
+    if (segmentGPXPaths && segmentGPXPaths.some(p => p !== null)) {
+        localStorage.setItem('route_gpx_paths', JSON.stringify(segmentGPXPaths));
+    } else {
+        localStorage.removeItem('route_gpx_paths');
+    }
 }
 
 function loadUrlState() {
@@ -3381,9 +3482,10 @@ function loadUrlState() {
             if (['bike', 'direct', 'hike', 'gpx'].includes(lastMode)) {
                 currentRoutingMode = lastMode;
                 localStorage.setItem('route_routing_mode', lastMode);
-                document.getElementById('mode-bike')?.classList.toggle('active', lastMode === 'bike');
-                document.getElementById('mode-direct')?.classList.toggle('active', lastMode === 'direct');
-                document.getElementById('mode-hike')?.classList.toggle('active', lastMode === 'hike');
+                const displayMode = lastMode === 'gpx' ? 'bike' : lastMode;
+                document.getElementById('mode-bike')?.classList.toggle('active', displayMode === 'bike');
+                document.getElementById('mode-direct')?.classList.toggle('active', displayMode === 'direct');
+                document.getElementById('mode-hike')?.classList.toggle('active', displayMode === 'hike');
             }
         }
         const points = routeStr.split(';');
@@ -3393,6 +3495,20 @@ function loadUrlState() {
                 createMarker({ lng, lat }, undefined, i > 0 ? modes[i - 1] : undefined);
             }
         });
+
+        // Restore GPX paths from localStorage
+        const savedGPX = localStorage.getItem('route_gpx_paths');
+        if (savedGPX) {
+            try {
+                const paths = JSON.parse(savedGPX);
+                if (paths.length === segmentGPXPaths.length) {
+                    segmentGPXPaths = paths;
+                }
+            } catch (e) {
+                console.error('Failed to parse saved GPX paths:', e);
+            }
+        }
+
         updateRoute();
 
         if (waypoints.length > 1) {

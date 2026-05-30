@@ -7,7 +7,7 @@
         content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>Bike Route Planner</title>
     <link rel="icon" href="favicon.png">
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="style.css?v=4">
     <!-- MapLibre CSS -->
     <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@^5.0.0/dist/maplibre-gl.css" />
     <!-- Chart.js -->
@@ -52,7 +52,8 @@
 
                 <div class="icon-btn-divider" style="height: 20px; opacity: 0.5; margin: 0 4px;"></div>
 
-                <span class="stat-value" id="total-distance" title="Click to view detailed route statistics" style="cursor: pointer;">0.0 mi</span>
+                <span class="stat-value" id="total-distance" title="Click to view detailed route statistics"
+                    style="cursor: pointer;">0.0 mi</span>
 
                 <div id="loading-indicator"
                     style="display:none; align-items:center; gap:7px; color:var(--text-muted); font-size:0.82rem; margin-left: 12px;">
@@ -301,8 +302,11 @@
                     <div class="stats-row">
                         <span class="stats-label">Elevation Min/Max</span>
                         <span class="stats-val">
-                            <span id="stats-min" style="cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px;">--</span> / 
-                            <span id="stats-max" style="cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px;">--</span>
+                            <span id="stats-min"
+                                style="cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px;">--</span>
+                            /
+                            <span id="stats-max"
+                                style="cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px;">--</span>
                         </span>
                     </div>
                     <div class="stats-row">
@@ -323,11 +327,13 @@
                     </div>
                     <div class="stats-row">
                         <span class="stats-label">Max Uphill Grade</span>
-                        <span class="stats-val" id="stats-max-up" style="cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px;">--</span>
+                        <span class="stats-val" id="stats-max-up"
+                            style="cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px;">--</span>
                     </div>
                     <div class="stats-row">
                         <span class="stats-label">Max Downhill Grade</span>
-                        <span class="stats-val" id="stats-max-down" style="cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px;">--</span>
+                        <span class="stats-val" id="stats-max-down"
+                            style="cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px;">--</span>
                     </div>
                 </div>
             </div>
@@ -391,7 +397,7 @@
 
     <!-- MapLibre JS -->
     <script src="https://unpkg.com/maplibre-gl@^5.0.0/dist/maplibre-gl.js"></script>
-    <script src="script.js"></script>
+    <script src="script.js?v=4"></script>
 </body>
 
 </html>
