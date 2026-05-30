@@ -86,10 +86,22 @@ body {
     border: 1px solid rgba(239, 68, 68, 0.2);
 }
 
-.btn-danger:hover {
-    background-color: var(--danger);
-    color: white;
-    transform: translateY(-1px);
+@media (hover: hover) {
+    .btn-danger:hover {
+        background-color: var(--danger);
+        color: white;
+        transform: translateY(-1px);
+    }
+
+    .btn-primary:hover {
+        background-color: var(--primary-hover);
+        transform: translateY(-1px);
+    }
+
+    .btn-secondary:hover {
+        background-color: var(--border);
+        transform: translateY(-1px);
+    }
 }
 
 .btn-danger:active {
@@ -101,20 +113,10 @@ body {
     color: white;
 }
 
-.btn-primary:hover {
-    background-color: var(--primary-hover);
-    transform: translateY(-1px);
-}
-
 .btn-secondary {
     background-color: var(--btn-bg);
     color: var(--text-main);
     border: 1px solid var(--border);
-}
-
-.btn-secondary:hover {
-    background-color: var(--border);
-    transform: translateY(-1px);
 }
 
 .modal-overlay {
@@ -274,19 +276,28 @@ body {
     gap: 0;
     height: 32px;
     transition: all 0.2s ease;
+    overflow: hidden;
 }
 
-.icon-btn-group:hover:not(.icon-btn-group-danger):not(.active) {
-    background: rgba(255, 255, 255, 0.05);
+@media (hover: hover) {
+    .icon-btn-group-danger:hover {
+        background: var(--danger) !important;
+        border-color: var(--danger) !important;
+    }
+
+    .icon-btn-group-danger:hover .icon-btn {
+        color: white !important;
+        background: transparent !important;
+    }
 }
 
 .icon-btn-group.active {
-    background: rgba(77, 148, 255, 0.1);
     border-color: var(--primary);
 }
 
 .icon-btn-group.active .icon-btn {
     color: var(--primary);
+    background: var(--bg-panel);
 }
 
 .icon-btn-group-danger {
@@ -300,16 +311,6 @@ body {
     height: 100% !important;
 }
 
-.icon-btn-group-danger:hover {
-    background: var(--danger) !important;
-    border-color: var(--danger) !important;
-}
-
-.icon-btn-group-danger:hover .icon-btn {
-    color: white !important;
-    background: transparent !important;
-}
-
 .icon-btn {
     background: none;
     border: none;
@@ -317,7 +318,7 @@ body {
     padding: 0 8px;
     height: 100%;
     /* Fill the container height */
-    border-radius: 6px;
+    border-radius: 0;
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -325,8 +326,11 @@ body {
     transition: background 0.15s, color 0.15s;
 }
 
-.icon-btn:hover {
-    color: var(--text-main);
+@media (hover: hover) {
+    .icon-btn:hover:not(:disabled) {
+        color: var(--text-main);
+        background: rgba(255, 255, 255, 0.03);
+    }
 }
 
 .icon-btn:disabled {
@@ -390,9 +394,9 @@ body {
     background: var(--btn-bg);
     border: 1px solid var(--border);
     border-radius: 8px;
-    padding: 1px;
+    padding: 0;
     height: 32px;
-    /* Uniform height */
+    overflow: hidden;
 }
 
 .mode-btn {
@@ -400,25 +404,28 @@ body {
     background: none;
     color: var(--text-muted);
     padding: 0 12px;
-    height: 28px;
+    height: 100%;
     font-size: 0.85rem;
     font-weight: 600;
     cursor: pointer;
-    border-radius: 6px;
+    border-radius: 0;
     display: flex;
     align-items: center;
     justify-content: center;
-    transition: all 0.2s ease;
+    transition: all 0.15s ease;
+    flex: 1;
 }
 
 .mode-btn.active {
     background: var(--bg-panel);
     color: var(--primary);
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
 }
 
-.mode-btn:hover:not(.active) {
-    color: var(--text-main);
+@media (hover: hover) {
+    .mode-btn:hover:not(.active) {
+        color: var(--text-main);
+        background: rgba(255, 255, 255, 0.03);
+    }
 }
 
 .settings-dropdown {
@@ -690,8 +697,10 @@ input:checked+.slider:before {
     line-height: 1;
 }
 
-.window-header .minimize-btn:hover {
-    color: var(--text-main);
+@media (hover: hover) {
+    .window-header .minimize-btn:hover {
+        color: var(--text-main);
+    }
 }
 
 /* Custom Fast Tooltips */
@@ -745,7 +754,7 @@ body.light-mode .custom-tooltip {
 
 .maplibregl-popup.weather-popup .maplibregl-popup-close-button {
     color: var(--text-muted) !important;
-    font-size: 16px !important;
+    font-size: 20px !important;
     padding: 0 !important;
     top: -2px !important;
     right: 2px !important;
@@ -763,10 +772,119 @@ body.light-mode .custom-tooltip {
     color: var(--text-main);
 }
 
+
+/* Mileage Button Style */
+#total-distance {
+    cursor: pointer;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--border);
+    padding: 0 10px !important;
+    border-radius: 8px;
+    font-weight: 600;
+    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, transform 0.05s ease;
+    display: inline-flex !important;
+    align-items: center;
+    height: 32px !important;
+    box-sizing: border-box;
+}
+#total-distance:hover {
+    background: rgba(255, 255, 255, 0.08) !important;
+    border-color: rgba(255, 255, 255, 0.25) !important;
+    color: var(--text-main) !important;
+}
+#total-distance:active {
+    background: rgba(255, 255, 255, 0.12) !important;
+    transform: scale(0.96);
+}
+
+/* Stats Panel Styling */
+.stats-panel {
+    position: absolute;
+    top: 54px;
+    left: 12px;
+    width: 280px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    z-index: 1500;
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+    font-family: 'Inter', sans-serif;
+}
+
+.stats-panel.show {
+    display: flex !important;
+}
+
+.stats-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(0, 0, 0, 0.1);
+}
+
+.stats-title {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--text-main);
+}
+
+.close-stats-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 1.4rem;
+    cursor: pointer;
+    line-height: 1;
+    padding: 0;
+    transition: color 0.15s ease;
+}
+
+.close-stats-btn:hover {
+    color: var(--text-main);
+}
+
+.stats-body {
+    padding: 12px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.stats-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.82rem;
+}
+
+.stats-label {
+    color: var(--text-muted);
+}
+
+.stats-val {
+    font-weight: 600;
+    color: var(--text-main);
+}
+
+.stats-val.text-success {
+    color: #22c55e !important;
+}
+
+.stats-val.text-danger {
+    color: #ef4444 !important;
+}
+
 @media (max-width: 768px) {
     #top-bar {
         /* Add safe-area-inset-top to prevent the status bar/notch from overlapping the top padding! */
-        padding: calc(env(safe-area-inset-top) + 8px) 10px 8px 10px !important;
+        padding: calc(env(safe-area-inset-top) + 8px) 6px 8px 6px !important;
         gap: 8px !important;
         display: flex !important;
         align-items: center !important;
@@ -779,14 +897,33 @@ body.light-mode .custom-tooltip {
     #app-title,
     .icon-btn-divider,
     #loading-phase,
-    #open-keybindings {
+    #open-keybindings,
+    #loading-spinner {
         display: none !important;
+    }
+
+    @keyframes logo-spin {
+        100% {
+            transform: rotate(360deg);
+        }
     }
 
     #favicon-mobile {
         display: block !important;
         height: 24px;
         width: 24px;
+        margin-left: 2px !important;
+        margin-right: 0 !important;
+        transition: transform 0.15s ease-out;
+    }
+
+    #favicon-mobile.loading {
+        animation: logo-spin 1s linear infinite;
+    }
+
+    .header-brand {
+        gap: 0 !important;
+        margin-right: 2px !important;
     }
 
     /* Hide the stray hr line left over from hiding the open-keybindings button */
@@ -813,12 +950,36 @@ body.light-mode .custom-tooltip {
         margin: 0 !important;
     }
 
+    .mode-toggle .mode-btn {
+        display: none !important;
+    }
+
+    .mode-toggle .icon-btn-divider {
+        display: none !important;
+    }
+
+    .mode-toggle .mode-btn.active {
+        display: flex !important;
+        border-radius: 6px !important;
+    }
+
     /* Float settings menu below the top bar with a gap */
     .settings-content {
         position: fixed !important;
         top: 52px !important;
-        right: 8px !important;
-        max-height: 70vh !important;
+        right: 10px !important;
+        left: 10px !important;
+        width: auto !important;
+        max-height: 80vh !important;
+    }
+
+    .stats-panel {
+        position: fixed !important;
+        top: 52px !important;
+        left: 10px !important;
+        right: auto !important;
+        width: 260px !important;
+        max-width: calc(100vw - 20px) !important;
     }
 
     /* Rebuild the sidebar as a clean vertical pill */
@@ -876,10 +1037,7 @@ body.light-mode .custom-tooltip {
     #elevation-panel .window-header {
         padding: 0 8px !important;
         height: 36px !important;
-    }
-
-    #elevation-panel .title {
-        display: none !important;
+        cursor: ns-resize !important;
     }
 
     #hover-stats {
@@ -920,5 +1078,113 @@ body.light-mode .custom-tooltip {
 
     .stat-value {
         font-size: 1.1rem !important;
+    }
+
+    /* Mobile Search Screen Overlay */
+    .mobile-search-overlay {
+        position: fixed !important;
+        top: 0 !important;
+        left: 0 !important;
+        right: 0 !important;
+        bottom: 0 !important;
+        background: var(--bg-panel) !important;
+        z-index: 99999 !important;
+        display: flex !important;
+        flex-direction: column !important;
+        padding: calc(env(safe-area-inset-top) + 12px) 16px 16px 16px !important;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
+    }
+
+    .mobile-search-overlay.active {
+        opacity: 1 !important;
+        pointer-events: auto !important;
+    }
+
+    .mobile-search-header {
+        display: flex !important;
+        align-items: center !important;
+        gap: 12px !important;
+        margin-bottom: 16px !important;
+    }
+
+    .mobile-search-input-wrapper {
+        flex-grow: 1 !important;
+        position: relative !important;
+        display: flex !important;
+        align-items: center !important;
+    }
+
+    #mobile-map-search {
+        width: 100% !important;
+        background: var(--btn-bg) !important;
+        border: 1px solid var(--border) !important;
+        color: var(--text-main) !important;
+        padding: 0 36px 0 12px !important;
+        height: 40px !important;
+        border-radius: 8px !important;
+        font-size: 1rem !important;
+        outline: none !important;
+        transition: border-color 0.2s !important;
+    }
+
+    #mobile-map-search:focus {
+        border-color: var(--primary) !important;
+    }
+
+    .search-clear-btn {
+        position: absolute !important;
+        right: 12px !important;
+        background: none !important;
+        border: none !important;
+        color: var(--text-muted) !important;
+        font-size: 1.4rem !important;
+        cursor: pointer !important;
+        padding: 0 !important;
+        line-height: 1 !important;
+    }
+
+    .mobile-search-results {
+        flex-grow: 1 !important;
+        overflow-y: auto !important;
+        display: flex !important;
+        flex-direction: column !important;
+        gap: 6px !important;
+    }
+
+    .mobile-search-results .search-result-row {
+        padding: 14px 12px !important;
+        background: rgba(255, 255, 255, 0.03) !important;
+        border-radius: 8px !important;
+        font-size: 0.95rem !important;
+        color: var(--text-main) !important;
+        cursor: pointer !important;
+        transition: background 0.15s !important;
+        border: 1px solid transparent !important;
+    }
+
+    .mobile-search-results .search-result-row:active {
+        background: rgba(77, 148, 255, 0.15) !important;
+        border-color: rgba(77, 148, 255, 0.3) !important;
+    }
+
+    /* Mobile active/tap flash effect to replace sticky hover highlight */
+    @media (hover: none) {
+
+        .icon-btn:active,
+        .btn:active,
+        .mode-btn:active {
+            background-color: var(--primary) !important;
+            color: white !important;
+            transform: scale(0.92) !important;
+            opacity: 0.9 !important;
+            transition: transform 0.05s ease, background-color 0.05s ease !important;
+        }
+
+        .icon-btn-group-danger .icon-btn:active {
+            background-color: var(--danger) !important;
+            color: white !important;
+        }
     }
 }

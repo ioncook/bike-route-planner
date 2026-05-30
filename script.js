@@ -59,11 +59,16 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 });
 
+const cachedCenter = localStorage.getItem('last_map_center');
+const cachedZoom = localStorage.getItem('last_map_zoom');
+const initialCenter = cachedCenter ? JSON.parse(cachedCenter) : [0, 0];
+const initialZoom = cachedZoom ? parseFloat(cachedZoom) : 1;
+
 const map = new maplibregl.Map({
     container: 'map',
     style: VECTOR_STYLES[currentBasemap] || buildRasterStyle(RASTER_BASEMAPS[currentBasemap]),
-    center: [0, 0],
-    zoom: 1,
+    center: initialCenter,
+    zoom: initialZoom,
     maxZoom: 20,
     projection: { type: localStorage.getItem('route_projection') || 'mercator' },
     antialias: false,
@@ -79,9 +84,7 @@ let isMCRotating = false;
 let mcStartX, mcStartY, mcStartBearing, mcStartPitch;
 let lastMCTime = 0;
 
-// Middle-click zoom & popup
-let isMCZooming = false;
-let mcStartZoom = 0;
+// Middle-click popup helper
 let middleClickStartX = null, middleClickStartY = null;
 
 map.getCanvasContainer().addEventListener('mousedown', (e) => {
@@ -111,21 +114,12 @@ window.addEventListener('mousemove', (e) => {
         const dy = e.clientY - mcStartY;
         map.setBearing(mcStartBearing + (dx * 0.4));
         map.setPitch(Math.min(85, Math.max(0, mcStartPitch - (dy * 0.4))));
-    } else if (isMCZooming) {
-        const dy = e.clientY - middleClickStartY;
-        // Drag up (negative dy) to zoom in, down (positive dy) to zoom out
-        const zoomDelta = -dy * 0.01;
-        map.setZoom(Math.min(20, Math.max(0, mcStartZoom + zoomDelta)));
     }
 });
 
 window.addEventListener('mouseup', (e) => {
     if (isMCRotating && e.button === 2) {
         isMCRotating = false;
-        map.getCanvas().style.cursor = '';
-    }
-    if (isMCZooming && e.button === 1) {
-        isMCZooming = false;
         map.getCanvas().style.cursor = '';
     }
 });
@@ -158,6 +152,19 @@ let currentDistanceMeters = 0;
 let currentUnits = 'imperial';
 let markers = [];
 let waypointDistances = [];
+let currentStats = {
+    gain: 0,
+    loss: 0,
+    min: Infinity,
+    max: -Infinity,
+    minIdx: 0,
+    maxIdx: 0,
+    maxUpGrade: 0,
+    maxDownGrade: 0,
+    maxUpIdx: 0,
+    maxDownIdx: 0,
+    grades: []
+};
 
 // Module-level state for viewport-aware gradient (needs to be accessible from updateElevationProfile)
 let routeGrades = null;
@@ -261,9 +268,9 @@ function syncRoutingUI() {
 // Only rebuild routeScreenPts (for hover hit-testing) when map view changes.
 function rebuildRouteScreenPts() {
     if (!currentRouteGeoJSON) { routeScreenPts = null; return; }
-    // Use miter-corrected display coords if available — they're the actual visible line.
-    // Indices are 1:1 with currentRouteGeoJSON so elevation/grade lookups stay valid.
-    const coords = currentDisplayCoords ?? currentRouteGeoJSON.coordinates;
+    // Snapping and interaction are mapped 1:1 with the original coordinates
+    // to keep index-based elevation/grade lookups valid.
+    const coords = currentRouteGeoJSON.coordinates;
     const bounds = map.getBounds();
     const west = bounds.getWest(), east = bounds.getEast();
     const south = bounds.getSouth(), north = bounds.getNorth();
@@ -328,17 +335,34 @@ function miterInsideCorners(coords) {
         const cross = idX * odY - idY * odX;
         if (Math.abs(cross) < 1e-10) { result.push(p2); continue; }
         const t = ((bx - ax) * odY - (by - ay) * odX) / cross;
+        const s = ((bx - ax) * idY - (by - ay) * idX) / cross;
 
-        // Sanity: intersection must be within segment bounds and not absurdly far
-        if (t < -pxOffset * 2 || t > iLen) { result.push(p2); continue; }
+        // The maximum distance we are willing to shift the vertex along the incoming/outgoing segments
+        // to avoid shifting it past the midpoint of the segment.
+        const maxShiftI = iLen * 0.45;
+        const maxShiftO = oLen * 0.45;
 
-        const mx = ax + t * idX, my = ay + t * idY;
-        if (Math.sqrt((mx - sc.x) ** 2 + (my - sc.y) ** 2) > pxOffset * 8) {
-            result.push(p2); continue;
-        }
+        // Clamp t to be within [-maxShiftI, 0]
+        let clampedT = t;
+        if (clampedT > 0) clampedT = 0;
+        if (clampedT < -maxShiftI) clampedT = -maxShiftI;
 
-        const mPt = map.unproject([mx, my]);
-        result.push([mPt.lng, mPt.lat]);
+        // Clamp s to be within [0, maxShiftO]
+        let clampedS = s;
+        if (clampedS < 0) clampedS = 0;
+        if (clampedS > maxShiftO) clampedS = maxShiftO;
+
+        // Split the corner vertex into two bevel points C1 and C2
+        const cx1 = sc.x + clampedT * idX;
+        const cy1 = sc.y + clampedT * idY;
+        const cx2 = sc.x + clampedS * odX;
+        const cy2 = sc.y + clampedS * odY;
+
+        const mPt1 = map.unproject([cx1, cy1]);
+        const mPt2 = map.unproject([cx2, cy2]);
+
+        result.push([mPt1.lng, mPt1.lat]);
+        result.push([mPt2.lng, mPt2.lat]);
     }
     result.push(coords[coords.length - 1]);
     return result;
@@ -353,8 +377,8 @@ let _routeGradStops = null;
 function rebuildMapGradient() {
     if (!currentRouteGeoJSON) return;
     const coords = currentRouteGeoJSON.coordinates;
-    // Using raw coordinates directly for the map display.
-    const displayCoords = coords;
+    // Using miter-corrected coordinates for the map display.
+    const displayCoords = miterInsideCorners(coords);
     currentDisplayCoords = displayCoords; // Store for hover snap engine
     const gradSrc = map.getSource('route-gradient');
     if (gradSrc) gradSrc.setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: displayCoords } });
@@ -387,7 +411,7 @@ function showHoverSegment(ci) {
     if (!currentRouteGeoJSON || !waypointPathIndices || waypointPathIndices.length < 2) return;
     let segIdx = -1;
     for (let j = 0; j < waypointPathIndices.length - 1; j++) {
-        if (ci >= waypointPathIndices[j] && ci < waypointPathIndices[j + 1]) { segIdx = j; break; }
+        if (ci >= waypointPathIndices[j] && ci <= waypointPathIndices[j + 1]) { segIdx = j; break; }
     }
     if (segIdx === -1 || segIdx === lastSegIdx) return;
     lastSegIdx = segIdx;
@@ -432,21 +456,35 @@ function updateTurnaroundJoins() {
     }
 
     for (let i = 1; i < coords.length - 1; i++) {
-        const bIn = getBearing(coords[i - 1], coords[i]);
-        const bOut = getBearing(coords[i], coords[i + 1]);
+        // Find preceding coordinate at least 1 meter away from coords[i]
+        let prevIdx = i - 1;
+        while (prevIdx >= 0 && haversineDistance(coords[prevIdx], coords[i]) < 1) {
+            prevIdx--;
+        }
+        if (prevIdx < 0) continue;
+
+        // Find succeeding coordinate at least 1 meter away from coords[i]
+        let nextIdx = i + 1;
+        while (nextIdx < coords.length && haversineDistance(coords[i], coords[nextIdx]) < 1) {
+            nextIdx++;
+        }
+        if (nextIdx >= coords.length) continue;
+
+        const bIn = getBearing(coords[prevIdx], coords[i]);
+        const bOut = getBearing(coords[i], coords[nextIdx]);
 
         // Signed deflection: positive = right turn, negative = left turn
         let d = bOut - bIn;
         while (d > 180) d -= 360;
         while (d < -180) d += 360;
 
-        // With positive line-offset (right side), only LEFT turns (d < 0) create an outside gap.
-        // Right turns (d > 0) cross on the inside and are handled by miterInsideCorners.
-        // So we only need staples for sharp left turns.
-        if (d < -100) {
+        // Draw a visual bridging staple ONLY for sharp left turns (where offset is on the outside, d < -100)
+        // or complete 180-degree turnarounds (where the path reverses direction completely, |d| > 135).
+        // Sharp right turns do not need a visual bridge.
+        if (d < -100 || Math.abs(d) > 135) {
             const pCenter = map.project(coords[i]);
-            const pIn = map.project(coords[i - 1]);
-            const pOut = map.project(coords[i + 1]);
+            const pIn = map.project(coords[prevIdx]);
+            const pOut = map.project(coords[nextIdx]);
 
             // Right-hand normal vectors for in/out segments
             const vInX = pCenter.x - pIn.x, vInY = pCenter.y - pIn.y;
@@ -776,6 +814,12 @@ map.on('style.load', () => {
         rebuildRouteScreenPts();
         updateTurnaroundJoins();
         rebuildMapGradient(); // Miter point depends on zoom — refresh display coords
+
+        try {
+            const center = map.getCenter();
+            localStorage.setItem('last_map_center', JSON.stringify([center.lng, center.lat]));
+            localStorage.setItem('last_map_zoom', map.getZoom().toString());
+        } catch (_) { }
     };
     map.on('zoom', updateView);
     map.on('moveend', updateView);
@@ -793,11 +837,17 @@ map.on('load', () => {
 map.on('movestart', () => {
     hideHoverMarker();
     clearHoverHighlight();
+    if (window._collapseSearch) window._collapseSearch();
 });
 
 // Change cursor when hovering the route
 map.on('mouseenter', 'route-line', () => { map.getCanvas().style.cursor = 'pointer'; });
-map.on('mouseleave', 'route-line', () => { if (!isDraggingLine) map.getCanvas().style.cursor = ''; });
+map.on('mouseleave', 'route-line', () => {
+    if (!isDraggingLine) {
+        map.getCanvas().style.cursor = '';
+        clearHoverHighlight();
+    }
+});
 
 // Throttled Hover Logic: Only runs when mouse is near the route
 let lastHoverTime = 0;
@@ -839,7 +889,7 @@ function findClosestPointOnLine(mousePt) {
     return { bestCi, bestT, bestDistSq, bestProj };
 }
 
-map.on('mousemove', 'route-hover-target', (e) => {
+map.on('mousemove', 'route-line', (e) => {
     if (window.innerWidth <= 768) return; // Disable hover interaction on mobile
     const now = performance.now();
     if (now - lastHoverTime < 16) return; // 60fps throttle
@@ -991,6 +1041,17 @@ window.addEventListener('blur', clearHoverHighlight);
 
 
 
+function invalidateGPXSegment(idx) {
+    if (idx > 0 && segmentModes[idx - 1] === 'gpx') {
+        segmentModes[idx - 1] = currentRoutingMode;
+        segmentGPXPaths[idx - 1] = null;
+    }
+    if (idx < segmentModes.length && segmentModes[idx] === 'gpx') {
+        segmentModes[idx] = currentRoutingMode;
+        segmentGPXPaths[idx] = null;
+    }
+}
+
 function createMarker(lngLat, index, initialMode) {
     const el = document.createElement('div');
     el.style.width = '24px';
@@ -1012,7 +1073,13 @@ function createMarker(lngLat, index, initialMode) {
                 saveHistory();
                 markers.splice(idx, 1);
                 waypoints.splice(idx, 1);
-                if (idx > 0) segmentModes.splice(idx - 1, 1);
+                if (idx > 0) {
+                    segmentModes.splice(idx - 1, 1);
+                    segmentGPXPaths.splice(idx - 1, 1);
+                } else {
+                    segmentModes.splice(0, 1);
+                    segmentGPXPaths.splice(0, 1);
+                }
                 marker.remove();
                 updateRoute();
             }
@@ -1064,6 +1131,7 @@ function createMarker(lngLat, index, initialMode) {
         map.getSource('drag-guide')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [] } });
         const idx = markers.indexOf(marker);
         if (idx > -1) {
+            invalidateGPXSegment(idx);
             const ll = marker.getLngLat();
             waypoints[idx] = [ll.lng, ll.lat];
             updateRoute();
@@ -1077,13 +1145,22 @@ function createMarker(lngLat, index, initialMode) {
         markers.splice(index, 0, marker);
         waypoints.splice(index, 0, lngLatArr);
         // Inherit the mode of the segment being split
-        const oldMode = initialMode ?? (segmentModes[index - 1] || 'bike');
+        let oldMode = initialMode ?? (segmentModes[index - 1] || 'bike');
+        if (oldMode === 'gpx') {
+            oldMode = currentRoutingMode;
+            if (index > 0) {
+                segmentModes[index - 1] = currentRoutingMode;
+                segmentGPXPaths[index - 1] = null;
+            }
+        }
         segmentModes.splice(index, 0, oldMode);
+        segmentGPXPaths.splice(index, 0, null);
     } else {
         markers.push(marker);
         waypoints.push(lngLatArr);
         if (waypoints.length > 1) {
             segmentModes.push(initialMode ?? currentRoutingMode);
+            segmentGPXPaths.push(null);
         }
     }
     refreshMarkerIcons();
@@ -1220,7 +1297,14 @@ map.on('click', (e) => {
     if (lastSegIdx !== -1) {
         saveHistory();
         const current = segmentModes[lastSegIdx] || 'bike';
-        segmentModes[lastSegIdx] = current === 'direct' ? 'bike' : 'direct';
+        let next = 'bike';
+        if (current === 'gpx') {
+            next = 'bike';
+            segmentGPXPaths[lastSegIdx] = null;
+        } else if (current === 'bike') next = 'direct';
+        else if (current === 'direct') next = 'hike';
+        else if (current === 'hike') next = 'bike';
+        segmentModes[lastSegIdx] = next;
         updateRoute();
         return;
     }
@@ -1260,10 +1344,18 @@ function showWeatherPopup(lngLat) {
         .setLngLat(lngLat)
         .setHTML(`
             <div style="font-family: 'Inter', sans-serif; min-width: 160px; padding: 4px;">
-                <div style="margin-top: 6px;">
+                <div style="margin-top: 0;">
                     <a href="https://www.google.com/maps/search/?api=1&query=${lat},${lng}" target="_blank" 
-                       style="display: block; color: #3b82f6; text-decoration: underline; text-underline-offset: 2px; font-size: 14px; font-weight: 600; margin-bottom: 8px;">
-                       ${lat.toFixed(6)}, ${lng.toFixed(6)}
+                       style="display: flex; align-items: center; color: #3b82f6; text-decoration: underline; text-underline-offset: 2px; font-size: 14px; font-weight: 600; margin-bottom: 8px;">
+                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 6px; flex-shrink: 0;">
+                           <circle cx="12" cy="12" r="8"></circle>
+                           <circle cx="12" cy="12" r="4.5" fill="currentColor"></circle>
+                           <line x1="12" y1="0" x2="12" y2="4"></line>
+                           <line x1="12" y1="20" x2="12" y2="24"></line>
+                           <line x1="0" y1="12" x2="4" y2="12"></line>
+                           <line x1="20" y1="12" x2="24" y2="12"></line>
+                       </svg>
+                       ${lat.toFixed(2)}, ${lng.toFixed(2)}
                     </a>
                 </div>
                 <div id="weather-info">
@@ -1307,9 +1399,6 @@ map.getCanvasContainer().addEventListener('mousedown', (e) => {
     if (e.button === 1) { // Middle mouse button
         middleClickStartX = e.clientX;
         middleClickStartY = e.clientY;
-        mcStartZoom = map.getZoom();
-        isMCZooming = true;
-        map.getCanvas().style.cursor = 'ns-resize';
         e.preventDefault(); // Prevent auto-scroll
     }
 });
@@ -1387,7 +1476,8 @@ let currentRouteGeoJSON = null;
 let needsElevationUpdate = false;
 let _elevRetryScheduled = false;
 let forceMode = false; // straight-line mode — skips OSRM routing
-let segmentModes = []; // 'routed' | 'direct' for each segment between consecutive waypoints
+let segmentModes = []; // 'routed' | 'direct' | 'gpx' for each segment between consecutive waypoints
+let segmentGPXPaths = []; // stores raw coordinates arrays for segments with mode === 'gpx'
 
 // --- Loading status indicator ---
 function setStatus(phase) {
@@ -1396,6 +1486,9 @@ function setStatus(phase) {
     if (el) el.style.display = 'flex';
     if (ph) ph.textContent = phase;
 
+    const favMobile = document.getElementById('favicon-mobile');
+    if (favMobile) favMobile.classList.add('loading');
+
     // Also update the initial cover text if visible
     const initialText = document.getElementById('initial-loading-text');
     if (initialText) initialText.textContent = phase;
@@ -1403,38 +1496,130 @@ function setStatus(phase) {
 function clearStatus() {
     const el = document.getElementById('loading-indicator');
     if (el) el.style.display = 'none';
+
+    const favMobile = document.getElementById('favicon-mobile');
+    if (favMobile) favMobile.classList.remove('loading');
+}
+
+const segmentCache = new Map();
+
+function getCacheKey(from, to, mode, avoidUnpaved, excludeParam) {
+    const fromStr = `${from[0].toFixed(6)},${from[1].toFixed(6)}`;
+    const toStr = `${to[0].toFixed(6)},${to[1].toFixed(6)}`;
+    const allowFerries = document.getElementById('allow-ferries-check')?.checked ?? false;
+    return `${fromStr}_${toStr}_${mode}_${avoidUnpaved}_${excludeParam}_${allowFerries}`;
+}
+
+async function fetchWithTimeout(url, signal, timeoutMs = 2000) {
+    const timeoutController = new AbortController();
+    const timeoutId = setTimeout(() => timeoutController.abort(), timeoutMs);
+
+    if (signal) {
+        if (signal.aborted) {
+            clearTimeout(timeoutId);
+            throw new DOMException('Aborted', 'AbortError');
+        }
+        signal.addEventListener('abort', () => {
+            clearTimeout(timeoutId);
+            timeoutController.abort();
+        });
+    }
+
+    try {
+        const resp = await fetch(url, { signal: timeoutController.signal });
+        clearTimeout(timeoutId);
+        return resp;
+    } catch (e) {
+        clearTimeout(timeoutId);
+        if (signal && signal.aborted) {
+            throw new DOMException('Aborted', 'AbortError');
+        }
+        if (e.name === 'AbortError') {
+            throw new DOMException('Request timed out', 'TimeoutError');
+        }
+        throw e;
+    }
 }
 
 // Fetch a single routed/direct segment; returns { coords, dist }
-async function fetchOneSegment(from, to, mode, avoidUnpaved, excludeParam) {
+async function fetchOneSegment(from, to, mode, avoidUnpaved, excludeParam, signal, segmentIndex) {
+    if (mode === 'gpx') {
+        const coords = segmentGPXPaths[segmentIndex];
+        if (coords && coords.length > 0) {
+            let totalDist = 0;
+            for (let i = 0; i < coords.length - 1; i++) {
+                totalDist += haversineDistance(coords[i], coords[i + 1]);
+            }
+            return { coords: coords, dist: totalDist };
+        }
+        return { coords: [from, to], dist: turf_distance(from, to) };
+    }
+
     if (mode === 'direct') {
         return { coords: [from, to], dist: turf_distance(from, to) };
     }
+
+    const key = getCacheKey(from, to, mode, avoidUnpaved, excludeParam);
+    if (segmentCache.has(key)) {
+        return segmentCache.get(key);
+    }
+
+    const allowFerries = document.getElementById('allow-ferries-check')?.checked ?? false;
+    const ferryVal = allowFerries ? '1' : '0';
+
     try {
-        const bProfile = avoidUnpaved ? 'fastbike' : 'trekking';
+        const bProfile = (mode === 'hike') ? 'trekking' : 'safety';
         const endpoints = [
-            `https://brouter.de/brouter?lonlats=${from[0]},${from[1]}|${to[0]},${to[1]}&profile=${bProfile}&alternativeidx=0&format=geojson`,
+            `https://brouter.de/brouter?lonlats=${from[0]},${from[1]}|${to[0]},${to[1]}&profile=${bProfile}&alternativeidx=0&format=geojson&profile:allow_ferries=${ferryVal}`,
             `https://routing.openstreetmap.de/routed-bike/route/v1/bicycle/${from[0]},${from[1]};${to[0]},${to[1]}?overview=full&geometries=geojson`,
             `https://router.project-osrm.org/route/v1/cycling/${from[0]},${from[1]};${to[0]},${to[1]}?overview=full&geometries=geojson`
         ];
         for (const url of endpoints) {
+            if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
             try {
-                const resp = await fetch(url);
-                if (!resp.ok) continue;
+                // Limit fetch to 10s for brouter and 3s for others to keep response fast
+                const timeoutLimit = url.includes('brouter') ? 10000 : 3000;
+                const resp = await fetchWithTimeout(url, signal, timeoutLimit);
+                if (!resp.ok) {
+                    console.warn(`Routing endpoint failed (${resp.status}): ${url}`);
+                    continue;
+                }
                 const data = await resp.json();
+
+                let result = null;
                 if (data.type === 'FeatureCollection' && data.features.length > 0) {
-                    return { coords: data.features[0].geometry.coordinates, dist: parseFloat(data.features[0].properties['track-length']) };
+                    result = { coords: data.features[0].geometry.coordinates, dist: parseFloat(data.features[0].properties['track-length']) };
+                } else if (data.code === 'Ok' && data.routes.length > 0) {
+                    result = { coords: data.routes[0].geometry.coordinates, dist: data.routes[0].distance };
                 }
-                if (data.code === 'Ok' && data.routes.length > 0) {
-                    return { coords: data.routes[0].geometry.coordinates, dist: data.routes[0].distance };
+
+                if (result) {
+                    console.log(`Routing endpoint succeeded: ${url}`);
+                    segmentCache.set(key, result);
+                    return result;
                 }
-            } catch (e) { continue; }
+            } catch (e) {
+                console.warn(`Routing endpoint threw error: ${url}`, e);
+                if (e.name === 'AbortError') throw e;
+                continue;
+            }
         }
-    } catch (e) { /* fall through */ }
+    } catch (e) {
+        if (e.name === 'AbortError') throw e;
+    }
     return { coords: [from, to], dist: turf_distance(from, to) };
 }
 
+let currentAbortController = null;
+
 async function updateRoute() {
+    if (currentAbortController) {
+        currentAbortController.abort();
+    }
+    const controller = new AbortController();
+    currentAbortController = controller;
+    const signal = controller.signal;
+
     if (waypoints.length === 0 || waypoints.length === 1) {
         if (map.getSource('route')) map.getSource('route').setData({ type: 'LineString', coordinates: [] });
         if (map.getSource('route-segments')) map.getSource('route-segments').setData({ type: 'FeatureCollection', features: [] });
@@ -1452,13 +1637,9 @@ async function updateRoute() {
         return;
     }
 
-    const avoidMotorways = document.getElementById('avoid-motorways-check')?.checked ?? true;
-    const avoidTolls = document.getElementById('avoid-tolls-check')?.checked ?? true;
     const avoidUnpaved = document.getElementById('avoid-unpaved-check')?.checked ?? false;
 
     let exclude = [];
-    if (avoidMotorways) exclude.push('motorway');
-    if (avoidTolls) exclude.push('toll');
     if (avoidUnpaved) exclude.push('unpaved');
     const excludeParam = exclude.length > 0 ? `&exclude=${exclude.join(',')}` : '';
 
@@ -1466,12 +1647,22 @@ async function updateRoute() {
     const numSegs = waypoints.length - 1;
     setStatus(numSegs === 1 ? 'Routing…' : `Routing ${numSegs} segments…`);
 
-    const segmentPromises = [];
-    for (let i = 0; i < numSegs; i++) {
-        const mode = segmentModes[i] || 'bike';
-        segmentPromises.push(fetchOneSegment(waypoints[i], waypoints[i + 1], mode, avoidUnpaved, excludeParam));
+    let segments = [];
+    try {
+        const segmentPromises = [];
+        for (let i = 0; i < numSegs; i++) {
+            const mode = segmentModes[i] || 'bike';
+            segmentPromises.push(fetchOneSegment(waypoints[i], waypoints[i + 1], mode, avoidUnpaved, excludeParam, signal, i));
+        }
+        segments = await Promise.all(segmentPromises);
+        if (signal.aborted) return;
+    } catch (e) {
+        if (e.name === 'AbortError') {
+            console.log('Routing aborted');
+            return;
+        }
+        throw e;
     }
-    const segments = await Promise.all(segmentPromises);
 
     // Stitch segments together, removing overlapping boundary points
     let allCoords = [];
@@ -1531,7 +1722,11 @@ const undoStack = [];
 const redoStack = [];
 
 function saveHistory() {
-    undoStack.push({ waypoints: waypoints.map(w => [...w]), modes: [...segmentModes] });
+    undoStack.push({
+        waypoints: waypoints.map(w => [...w]),
+        modes: [...segmentModes],
+        gpxPaths: segmentGPXPaths.map(p => p ? p.map(c => [...c]) : null)
+    });
     redoStack.length = 0; // clear redo on new action
     updateUndoRedoBtns();
 }
@@ -1549,6 +1744,7 @@ function applyHistoryState(state) {
     markers = [];
     waypoints = [];
     segmentModes = [];
+    segmentGPXPaths = [];
 
     // Rebuild waypoints and markers via createMarker to ensure all listeners (drag, delete) are attached
     state.waypoints.forEach((wp, i) => {
@@ -1556,8 +1752,9 @@ function applyHistoryState(state) {
         createMarker(wp);
     });
 
-    // Restore the exact modes from history (overwriting the defaults pushed by createMarker)
+    // Restore the exact modes and GPX paths from history
     segmentModes = [...state.modes];
+    segmentGPXPaths = state.gpxPaths ? state.gpxPaths.map(p => p ? p.map(c => [...c]) : null) : [];
 
     refreshMarkerIcons();
     updateRoute();
@@ -1566,13 +1763,21 @@ function applyHistoryState(state) {
 
 function undo() {
     if (!undoStack.length) return;
-    redoStack.push({ waypoints: waypoints.map(w => [...w]), modes: [...segmentModes] });
+    redoStack.push({
+        waypoints: waypoints.map(w => [...w]),
+        modes: [...segmentModes],
+        gpxPaths: segmentGPXPaths.map(p => p ? p.map(c => [...c]) : null)
+    });
     applyHistoryState(undoStack.pop());
 }
 
 function redo() {
     if (!redoStack.length) return;
-    undoStack.push({ waypoints: waypoints.map(w => [...w]), modes: [...segmentModes] });
+    undoStack.push({
+        waypoints: waypoints.map(w => [...w]),
+        modes: [...segmentModes],
+        gpxPaths: segmentGPXPaths.map(p => p ? p.map(c => [...c]) : null)
+    });
     applyHistoryState(redoStack.pop());
 }
 
@@ -1586,6 +1791,7 @@ document.getElementById('clear-route').addEventListener('click', () => {
     markers.forEach(m => m.remove());
     markers = [];
     segmentModes = [];
+    segmentGPXPaths = [];
     const gainLossEl = document.getElementById('elev-gain-loss');
     if (gainLossEl) gainLossEl.textContent = '';
     updateRoute();
@@ -1608,6 +1814,7 @@ function fitRoute() {
 
 document.getElementById('fit-route-btn').addEventListener('click', fitRoute);
 document.getElementById('reverse-route-btn')?.addEventListener('click', reverseRoute);
+document.getElementById('current-location-btn')?.addEventListener('click', () => requestLocation(true));
 
 function toggleSettings(event) {
     const menu = document.getElementById('settings-menu');
@@ -1636,12 +1843,54 @@ function toggleSettings(event) {
     let debounceTimer = null;
     let currentResults = [];
 
+    const mobileScreen = document.getElementById('mobile-search-screen');
+    const mobileInput = document.getElementById('mobile-map-search');
+    const mobileBackBtn = document.getElementById('mobile-search-back');
+    const mobileClearBtn = document.getElementById('mobile-search-clear');
+    const mobileDropdown = document.getElementById('mobile-search-dropdown');
+
     function closeDropdown() {
         dropdown.innerHTML = '';
         dropdown.style.display = 'none';
     }
 
+    function closeMobileSearch() {
+        if (mobileScreen) {
+            mobileScreen.classList.remove('active');
+            if (mobileInput) mobileInput.blur();
+        }
+    }
+
+    function openMobileSearch() {
+        if (mobileScreen) {
+            mobileScreen.classList.add('active');
+            if (mobileInput) {
+                mobileInput.value = '';
+                setTimeout(() => mobileInput.focus(), 200);
+            }
+            if (mobileDropdown) {
+                mobileDropdown.innerHTML = '';
+                mobileDropdown.style.display = 'none';
+            }
+            if (mobileClearBtn) mobileClearBtn.style.display = 'none';
+        }
+    }
+
+    function collapseSearch() {
+        wrapper.classList.remove('expanded');
+        const group = wrapper.closest('.icon-btn-group');
+        if (group) group.classList.remove('active');
+        input.value = '';
+        closeDropdown();
+        input.blur();
+        closeMobileSearch();
+    }
+
     function toggleSearch() {
+        if (window.innerWidth <= 768) {
+            openMobileSearch();
+            return;
+        }
         const isExpanded = wrapper.classList.toggle('expanded');
         const group = wrapper.closest('.icon-btn-group');
         if (group) group.classList.toggle('active', isExpanded);
@@ -1649,9 +1898,7 @@ function toggleSettings(event) {
         if (isExpanded) {
             setTimeout(() => input.focus(), 300);
         } else {
-            input.value = '';
-            closeDropdown();
-            input.blur();
+            collapseSearch();
         }
     }
 
@@ -1663,10 +1910,7 @@ function toggleSettings(event) {
     function selectResult(item) {
         // Fly to location only — do NOT add a waypoint
         map.flyTo({ center: [parseFloat(item.lon), parseFloat(item.lat)], zoom: 14 });
-        input.value = '';
-        closeDropdown();
-        input.blur();
-        wrapper.classList.remove('expanded'); // Auto-close after selection
+        collapseSearch();
     }
 
     function renderDropdown(results) {
@@ -1705,9 +1949,7 @@ function toggleSettings(event) {
         if (e.key === 'Enter') {
             if (currentResults.length > 0) selectResult(currentResults[0]);
         } else if (e.key === 'Escape') {
-            closeDropdown();
-            wrapper.classList.remove('expanded');
-            input.blur();
+            collapseSearch();
         }
     });
 
@@ -1716,15 +1958,91 @@ function toggleSettings(event) {
         setTimeout(closeDropdown, 150);
     });
 
+    // Mobile Search Input & Event Handlers
+    if (mobileInput) {
+        mobileInput.addEventListener('input', () => {
+            clearTimeout(debounceTimer);
+            const q = mobileInput.value.trim();
+            if (q.length === 0) {
+                if (mobileClearBtn) mobileClearBtn.style.display = 'none';
+            } else {
+                if (mobileClearBtn) mobileClearBtn.style.display = 'block';
+            }
+            if (q.length < 2) {
+                if (mobileDropdown) {
+                    mobileDropdown.innerHTML = '';
+                    mobileDropdown.style.display = 'none';
+                }
+                return;
+            }
+            debounceTimer = setTimeout(() => {
+                fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}&limit=5`)
+                    .then(res => res.json())
+                    .then(data => {
+                        if (mobileDropdown) {
+                            mobileDropdown.innerHTML = '';
+                            if (!data.length) {
+                                mobileDropdown.style.display = 'none';
+                                return;
+                            }
+                            data.forEach((item) => {
+                                const row = document.createElement('div');
+                                row.className = 'search-result-row';
+                                row.textContent = item.display_name;
+                                row.addEventListener('click', () => {
+                                    map.flyTo({ center: [parseFloat(item.lon), parseFloat(item.lat)], zoom: 14 });
+                                    closeMobileSearch();
+                                });
+                                mobileDropdown.appendChild(row);
+                            });
+                            mobileDropdown.style.display = 'block';
+                        }
+                    })
+                    .catch(() => { });
+            }, 250);
+        });
+
+        mobileInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                if (mobileDropdown) {
+                    const firstRow = mobileDropdown.querySelector('.search-result-row');
+                    if (firstRow) firstRow.click();
+                }
+            } else if (e.key === 'Escape') {
+                closeMobileSearch();
+            }
+        });
+    }
+
+    if (mobileBackBtn) {
+        mobileBackBtn.addEventListener('click', () => {
+            closeMobileSearch();
+        });
+    }
+
+    if (mobileClearBtn) {
+        mobileClearBtn.addEventListener('click', () => {
+            if (mobileInput) {
+                mobileInput.value = '';
+                mobileInput.focus();
+            }
+            mobileClearBtn.style.display = 'none';
+            if (mobileDropdown) {
+                mobileDropdown.innerHTML = '';
+                mobileDropdown.style.display = 'none';
+            }
+        });
+    }
+
     document.addEventListener('click', (e) => {
-        if (!wrapper.contains(e.target)) {
-            wrapper.classList.remove('expanded');
-            closeDropdown();
+        if (!wrapper.contains(e.target) && (!mobileScreen || !mobileScreen.contains(e.target)) && e.target.id !== 'search-toggle' && !e.target.closest('#search-toggle')) {
+            collapseSearch();
         }
     });
 
     // Make toggleSearch available globally for hotkey
     window._toggleSearch = toggleSearch;
+    window._collapseSearch = collapseSearch;
 })();
 
 function reverseRoute() {
@@ -1784,8 +2102,7 @@ window.addEventListener('keydown', (e) => {
         document.getElementById('elevation-toggle-btn')?.click();
     } else if (key === currentKeybindings.toggleMode) {
         e.preventDefault();
-        const nextMode = currentRoutingMode === 'bike' ? 'direct' : 'bike';
-        setRoutingMode(nextMode);
+        cycleRoutingMode();
     } else if (key === currentKeybindings.fitRoute) {
         e.preventDefault();
         fitRoute();
@@ -1873,7 +2190,7 @@ document.getElementById('projection').addEventListener('change', (e) => {
 // GPX Import: supports track (trkpt) and route/waypoint (rtept, wpt) formats
 function importGPX(file) {
     const reader = new FileReader();
-    reader.onload = e => {
+    reader.onload = async e => {
         try {
             const xml = new DOMParser().parseFromString(e.target.result, 'application/xml');
             const trkpts = [...xml.querySelectorAll('trkpt')];
@@ -1885,6 +2202,7 @@ function importGPX(file) {
             markers.forEach(m => m.remove());
             markers = [];
             segmentModes = [];
+            segmentGPXPaths = [];
             currentRouteGeoJSON = null;
 
             if (trkpts.length > 0) {
@@ -1896,33 +2214,16 @@ function importGPX(file) {
 
                 createMarker({ lng: coords[0][0], lat: coords[0][1] });
                 createMarker({ lng: coords[coords.length - 1][0], lat: coords[coords.length - 1][1] });
-                segmentModes = ['direct'];
 
-                let totalDist = 0;
-                for (let i = 0; i < coords.length - 1; i++) totalDist += turf_distance(coords[i], coords[i + 1]);
-                currentDistanceMeters = totalDist;
-                // Dynamic sampling for GPX: 1 point per 5m, capped at 15000
-                const targetPoints = Math.min(15000, Math.max(2000, Math.ceil(totalDist / 5)));
-                currentRouteGeoJSON = { type: 'LineString', coordinates: resampleLine(coords, targetPoints) };
+                // Set segment mode to GPX and store coordinates in segmentGPXPaths
+                segmentModes = ['gpx'];
+                segmentGPXPaths = [coords];
 
-                // Waypoints for track import are just start and end
-                waypointPathIndices = [0, currentRouteGeoJSON.coordinates.length - 1];
-                waypointDistances = [0, currentDistanceMeters];
-
-                const mapCoords = decimateLine(currentRouteGeoJSON.coordinates, PERF_MAP_POINTS);
-                if (map.getSource('route')) map.getSource('route').setData({ type: 'LineString', coordinates: mapCoords });
-                rebuildMapGradient();
-                rebuildRouteScreenPts();
-                updateDistanceUI();
-                refreshMarkerIcons();
+                await updateRoute();
 
                 const bounds = new maplibregl.LngLatBounds();
                 coords.forEach(c => bounds.extend(c));
                 map.fitBounds(bounds, { padding: 60, maxZoom: 17, duration: 700 });
-
-                needsElevationUpdate = true;
-                updateElevationProfile();
-                syncUrl();
             } else {
                 // Route/waypoints — create markers and route via OSRM / direct
                 const pts = rtepts.length > 0 ? rtepts : wpts;
@@ -1981,10 +2282,10 @@ ${trkpts}
 }
 
 function applyTerrain() {
-    const show = document.getElementById('hillshade-check').checked;
+    const val = document.getElementById('hillshade-select')?.value || 'off';
     const exInput = document.getElementById('terrain-exaggeration');
 
-    localStorage.setItem('route_hillshade', show);
+    localStorage.setItem('route_hillshade', val);
     let exVal = parseFloat(exInput.value);
     if (isNaN(exVal)) exVal = 2.0;
     localStorage.setItem('route_exaggeration', exVal);
@@ -1992,15 +2293,18 @@ function applyTerrain() {
     // Guard: layers may not exist yet if called before map.on('load') completes
     if (!map.getLayer('hillshade-layer') || !map.getSource('terrain-source')) return;
 
-    if (show) {
-        map.setLayoutProperty('hillshade-layer', 'visibility', 'visible');
-        // Apply exaggeration to the 2D hillshade layer
-        map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', Math.min(1.0, exVal / 2));
-    } else {
+    if (val === 'off') {
         map.setLayoutProperty('hillshade-layer', 'visibility', 'none');
+        if (map.getTerrain()) map.setTerrain(null);
+    } else if (val === 'hillshade') {
+        map.setLayoutProperty('hillshade-layer', 'visibility', 'visible');
+        map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', Math.min(1.0, exVal / 2));
+        if (map.getTerrain()) map.setTerrain(null);
+    } else if (val === 'terrain') {
+        map.setLayoutProperty('hillshade-layer', 'visibility', 'visible');
+        map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', Math.min(1.0, exVal / 2));
+        map.setTerrain({ source: 'terrain-source', exaggeration: exVal });
     }
-    // Disable 3D terrain for now to maximize performance
-    if (map.getTerrain()) map.setTerrain(null);
 
     needsElevationUpdate = true;
     if (typeof updateElevationProfile === 'function') updateElevationProfile();
@@ -2011,25 +2315,55 @@ function setRoutingMode(mode) {
     localStorage.setItem('route_routing_mode', mode);
     document.getElementById('mode-bike')?.classList.toggle('active', mode === 'bike');
     document.getElementById('mode-direct')?.classList.toggle('active', mode === 'direct');
-    // Do NOT call updateRoute() here — only affects newly created segments
+    document.getElementById('mode-hike')?.classList.toggle('active', mode === 'hike');
 }
 
-document.getElementById('mode-bike')?.addEventListener('click', () => setRoutingMode('bike'));
-document.getElementById('mode-direct')?.addEventListener('click', () => setRoutingMode('direct'));
+function cycleRoutingMode() {
+    let nextMode = 'bike';
+    if (currentRoutingMode === 'bike') nextMode = 'direct';
+    else if (currentRoutingMode === 'direct') nextMode = 'hike';
+    else if (currentRoutingMode === 'hike') nextMode = 'bike';
+    setRoutingMode(nextMode);
+}
 
-document.getElementById('hillshade-check').addEventListener('change', applyTerrain);
+document.getElementById('mode-bike')?.addEventListener('click', () => {
+    if (window.innerWidth <= 768) cycleRoutingMode();
+    else setRoutingMode('bike');
+});
+document.getElementById('mode-direct')?.addEventListener('click', () => {
+    if (window.innerWidth <= 768) cycleRoutingMode();
+    else setRoutingMode('direct');
+});
+document.getElementById('mode-hike')?.addEventListener('click', () => {
+    if (window.innerWidth <= 768) cycleRoutingMode();
+    else setRoutingMode('hike');
+});
+
+document.getElementById('hillshade-select')?.addEventListener('change', applyTerrain);
 document.getElementById('terrain-exaggeration').addEventListener('change', applyTerrain);
 
 function toggleSettings(event) {
     if (event) event.stopPropagation();
     document.getElementById('settings-menu').classList.toggle('show');
+    document.getElementById('stats-panel').classList.remove('show');
 }
 
-['avoid-motorways-check', 'avoid-tolls-check', 'avoid-unpaved-check'].forEach(id => {
-    document.getElementById(id)?.addEventListener('change', (e) => {
-        localStorage.setItem('route_' + id.replace(/-/g, '_'), e.target.checked);
-        updateRoute();
-    });
+function toggleStatsPanel(event) {
+    if (event) event.stopPropagation();
+    const panel = document.getElementById('stats-panel');
+    const isShow = panel.classList.contains('show');
+    if (isShow) {
+        panel.classList.remove('show');
+    } else {
+        panel.classList.add('show');
+        document.getElementById('settings-menu').classList.remove('show');
+    }
+}
+
+document.getElementById('total-distance').addEventListener('click', toggleStatsPanel);
+document.getElementById('close-stats-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    document.getElementById('stats-panel').classList.remove('show');
 });
 
 window.addEventListener('click', () => {
@@ -2037,6 +2371,128 @@ window.addEventListener('click', () => {
 });
 
 document.getElementById('settings-menu').addEventListener('click', e => e.stopPropagation());
+document.getElementById('stats-panel').addEventListener('click', e => e.stopPropagation());
+
+function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedSegmentGrades) {
+    const hasRoute = waypoints.length >= 2 && currentRouteGeoJSON && currentRouteGeoJSON.coordinates.length > 0;
+    if (!hasRoute) {
+        document.getElementById('stats-distance').textContent = '--';
+        document.getElementById('stats-ascent').textContent = '--';
+        document.getElementById('stats-descent').textContent = '--';
+
+        const minEl = document.getElementById('stats-min');
+        const maxEl = document.getElementById('stats-max');
+        minEl.textContent = '--';
+        maxEl.textContent = '--';
+
+        const upEl = document.getElementById('stats-avg-up');
+        const downEl = document.getElementById('stats-avg-down');
+        const maxUpEl = document.getElementById('stats-max-up');
+        const maxDownEl = document.getElementById('stats-max-down');
+        upEl.textContent = '--'; upEl.style.color = '';
+        downEl.textContent = '--'; downEl.style.color = '';
+        maxUpEl.textContent = '--'; maxUpEl.style.color = '';
+        maxDownEl.textContent = '--'; maxDownEl.style.color = '';
+        return;
+    }
+
+    let distText = '';
+    if (currentUnits === 'metric') {
+        const distanceKm = (currentDistanceMeters / 1000).toFixed(2);
+        distText = distanceKm + ' km';
+    } else {
+        const distanceMi = (currentDistanceMeters * 0.000621371).toFixed(2);
+        distText = distanceMi + ' mi';
+    }
+    document.getElementById('stats-distance').textContent = distText;
+
+    const unitLabel = currentUnits === 'metric' ? 'm' : 'ft';
+    const gainVal = currentUnits === 'metric' ? totalGainM : totalGainM * 3.28084;
+    const lossVal = currentUnits === 'metric' ? totalLossM : totalLossM * 3.28084;
+
+    document.getElementById('stats-ascent').textContent = `+${Math.round(gainVal)} ${unitLabel}`;
+    document.getElementById('stats-descent').textContent = `${Math.round(lossVal)} ${unitLabel}`;
+
+    const minEl = document.getElementById('stats-min');
+    const maxEl = document.getElementById('stats-max');
+    if (minElev !== undefined && maxElev !== undefined && minElev !== Infinity && maxElev !== -Infinity) {
+        minEl.textContent = `${Math.round(minElev)}${unitLabel}`;
+        maxEl.textContent = `${Math.round(maxElev)}${unitLabel}`;
+    } else {
+        minEl.textContent = '--';
+        maxEl.textContent = '--';
+    }
+
+    const upEl = document.getElementById('stats-avg-up');
+    const downEl = document.getElementById('stats-avg-down');
+    const maxUpEl = document.getElementById('stats-max-up');
+    const maxDownEl = document.getElementById('stats-max-down');
+
+    if (smoothedSegmentGrades && smoothedSegmentGrades.length > 0) {
+        let upSum = 0, upCount = 0;
+        let downSum = 0, downCount = 0;
+        let maxUpGrade = 0;
+        let maxDownGrade = 0;
+
+        for (let i = 0; i < smoothedSegmentGrades.length; i++) {
+            const grade = smoothedSegmentGrades[i];
+            if (grade > 0.5) {
+                upSum += grade;
+                upCount++;
+                if (grade > maxUpGrade) maxUpGrade = grade;
+            } else if (grade < -0.5) {
+                downSum += grade;
+                downCount++;
+                if (grade < maxDownGrade) maxDownGrade = grade;
+            }
+        }
+        const avgUpVal = upCount > 0 ? (upSum / upCount) : 0;
+        const avgDownVal = downCount > 0 ? (downSum / downCount) : 0;
+
+        upEl.textContent = `${avgUpVal.toFixed(1)}%`;
+        upEl.style.color = getColorForGrade(avgUpVal);
+
+        downEl.textContent = `${avgDownVal.toFixed(1)}%`;
+        downEl.style.color = getColorForGrade(avgDownVal);
+
+        maxUpEl.textContent = `${maxUpGrade.toFixed(1)}%`;
+        maxUpEl.style.color = getColorForGrade(maxUpGrade);
+
+        maxDownEl.textContent = `${maxDownGrade.toFixed(1)}%`;
+        maxDownEl.style.color = getColorForGrade(maxDownGrade);
+    } else {
+        upEl.textContent = '--'; upEl.style.color = '';
+        downEl.textContent = '--'; downEl.style.color = '';
+        maxUpEl.textContent = '--'; maxUpEl.style.color = '';
+        maxDownEl.textContent = '--'; maxDownEl.style.color = '';
+    }
+
+    // Setup interactive map hovers
+    const hoverTargets = [
+        { id: 'stats-min', getIdx: () => currentStats.minIdx },
+        { id: 'stats-max', getIdx: () => currentStats.maxIdx },
+        { id: 'stats-max-up', getIdx: () => currentStats.maxUpIdx },
+        { id: 'stats-max-down', getIdx: () => currentStats.maxDownIdx }
+    ];
+
+    hoverTargets.forEach(({ id, getIdx }) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+
+        const newEl = el.cloneNode(true);
+        el.parentNode.replaceChild(newEl, el);
+
+        newEl.addEventListener('mouseenter', () => {
+            const ci = getIdx();
+            if (ci !== undefined && ci >= 0 && currentRouteGeoJSON && currentRouteGeoJSON.coordinates.length > ci) {
+                const coords = currentRouteGeoJSON.coordinates;
+                const lngLat = coords[ci];
+                updateHoverHighlight(ci, 0, lngLat);
+            }
+        });
+        newEl.addEventListener('mouseleave', clearHoverHighlight);
+    });
+}
 
 function loadStoredSettings() {
     const mode = localStorage.getItem('route_routing_mode');
@@ -2078,7 +2534,11 @@ function loadStoredSettings() {
     // Terrain/hillshade UI values (applyTerrain reads them)
     const hillshade = localStorage.getItem('route_hillshade');
     if (hillshade !== null) {
-        document.getElementById('hillshade-check').checked = hillshade === 'true';
+        let val = hillshade;
+        if (val === 'true') val = 'hillshade';
+        else if (val === 'false') val = 'off';
+        const el = document.getElementById('hillshade-select');
+        if (el) el.value = val;
     }
     const exaggeration = localStorage.getItem('route_exaggeration');
     if (exaggeration !== null) {
@@ -2089,14 +2549,34 @@ function loadStoredSettings() {
     applyTerrain();
 
     // Routing options
-    ['avoid-motorways-check', 'avoid-tolls-check', 'avoid-unpaved-check'].forEach(id => {
-        const val = localStorage.getItem('route_' + id.replace(/-/g, '_'));
-        if (val !== null) {
-            const el = document.getElementById(id);
-            if (el) el.checked = val === 'true';
-        }
-    });
+    const unpavedVal = localStorage.getItem('route_avoid_unpaved_check');
+    if (unpavedVal !== null) {
+        const el = document.getElementById('avoid-unpaved-check');
+        if (el) el.checked = unpavedVal === 'true';
+    }
+
+    const allowFerriesVal = localStorage.getItem('route_allow_ferries_check');
+    if (allowFerriesVal !== null) {
+        const el = document.getElementById('allow-ferries-check');
+        if (el) el.checked = allowFerriesVal === 'true';
+    }
+
+    const showLocationVal = localStorage.getItem('route_show_location_check');
+    const locationEl = document.getElementById('show-location-check');
+    if (locationEl) {
+        locationEl.checked = showLocationVal !== null ? showLocationVal === 'true' : true;
+    }
+    updateUserLocationPin();
 }
+
+document.getElementById('allow-ferries-check')?.addEventListener('change', (e) => {
+    localStorage.setItem('route_allow_ferries_check', e.target.checked);
+    updateRoute();
+});
+
+document.getElementById('show-location-check')?.addEventListener('change', () => {
+    updateUserLocationPin();
+});
 
 // Wire up GPX buttons
 document.getElementById('gpx-import-btn').addEventListener('click', () => {
@@ -2254,101 +2734,12 @@ function initChart() {
             layout: {
                 padding: window.innerWidth <= 768 ? 4 : { top: 20, right: 10, left: 10, bottom: 0 }
             },
-            interaction: {
-                mode: 'routeHover',
-                intersect: false
-            },
-            onHover: (event, activeElements, chart) => {
-                if (!currentRouteGeoJSON || !currentRouteGeoJSON.coordinates) { hideHoverMarker(); return; }
-
-                const data = chart.data.datasets[0]?.data;
-                const coords = currentRouteGeoJSON.coordinates;
-                if (!data || data.length < 2 || !coords || coords.length < 2) { hideHoverMarker(); return; }
-
-                const xValue = chart.scales.x.getValueForPixel(event.x); // display-unit distance
-
-                // Find the chart data index closest to the hover x
-                let low = 0, high = data.length - 2, i = 0;
-                while (low <= high) {
-                    const mid = (low + high) >> 1;
-                    if (data[mid].x <= xValue) { i = mid; low = mid + 1; }
-                    else high = mid - 1;
-                }
-
-                // Map hover x-value (display distance) → coordinate index via routePathDistances
-                // This is accurate even if chart data has been filtered/resampled.
-                let ci = 0;
-                if (routePathDistances && routePathDistances.length === coords.length) {
-                    const xMeters = currentUnits === 'imperial' ? xValue * 1609.344 : xValue * 1000;
-                    let lo = 0, hi = routePathDistances.length - 2;
-                    while (lo <= hi) {
-                        const mid = (lo + hi) >> 1;
-                        if (routePathDistances[mid] <= xMeters) { ci = mid; lo = mid + 1; }
-                        else hi = mid - 1;
-                    }
-                    ci = Math.min(ci, coords.length - 2);
-                } else {
-                    // Fallback: proportional mapping
-                    const ratio = i / Math.max(1, data.length - 1);
-                    ci = Math.min(Math.floor(ratio * (coords.length - 1)), coords.length - 2);
-                }
-                const ciNext = ci + 1;
-
-                const t = (data[i + 1] && data[i + 1].x !== data[i].x)
-                    ? Math.max(0, Math.min(1, (xValue - data[i].x) / (data[i + 1].x - data[i].x)))
-                    : 0;
-
-                // Get geographic center point
-                const lngCenter = coords[ci][0] + t * (coords[ciNext][0] - coords[ci][0]);
-                const latCenter = coords[ci][1] + t * (coords[ciNext][1] - coords[ci][1]);
-
-                // Shift to offset side in screen space, then unproject
-                const pCenter = map.project([lngCenter, latCenter]);
-                const p0 = map.project(coords[ci]);
-                const p1 = map.project(coords[ciNext]);
-                const vX = p1.x - p0.x, vY = p1.y - p0.y;
-                const len = Math.sqrt(vX * vX + vY * vY);
-                let shiftedLngLat;
-                if (len > 0.1) {
-                    const nx = -vY / len, ny = vX / len;
-                    const off = getPixelOffset(map.getZoom());
-                    shiftedLngLat = map.unproject([pCenter.x + nx * off, pCenter.y + ny * off]);
-                } else {
-                    shiftedLngLat = { lng: lngCenter, lat: latCenter };
-                }
-                const lng = shiftedLngLat.lng;
-                const lat = shiftedLngLat.lat;
-
-                const ds = chart.data.datasets[0];
-                const grade = ds.grades?.[ci];
-
-                // Update vertical hover line
-                currentHoverDispDist = xValue;
-                chart.update('none');
-
-                const distLabel = xValue.toFixed(2) + (currentUnits === 'metric' ? ' km' : ' mi');
-                const elevVal = data[i].y;
-                const elevLabel = elevVal != null
-                    ? elevVal.toFixed(1) + (currentUnits === 'metric' ? ' m' : ' ft')
-                    : '';
-                const gradeLabel = grade !== undefined ? (grade >= 0 ? '+' : '') + grade.toFixed(2) + '%' : '';
-
-                const info = `${distLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${elevLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${gradeLabel}`;
-                showHoverMarker([lng, lat], info);
-                showHoverSegment(ci);
-
-                const statsDiv = document.getElementById('hover-stats');
-                if (statsDiv) {
-                    statsDiv.style.opacity = '1';
-                    document.getElementById('hover-dist').textContent = distLabel;
-                    document.getElementById('hover-elev').textContent = elevLabel;
-                    document.getElementById('hover-grade').textContent = gradeLabel;
-                }
-            },
+            interaction: { mode: 'routeHover', intersect: false },
             onLeave: () => {
                 const statsDiv = document.getElementById('hover-stats');
                 if (statsDiv) statsDiv.style.opacity = '0';
                 hideHoverMarker();
+                currentHoverDispDist = null;
             },
             plugins: {
                 legend: { display: false },
@@ -2359,9 +2750,66 @@ function initChart() {
                     type: 'linear',
                     display: true,
                     min: 0,
-                    title: { display: window.innerWidth > 768, text: 'Distance', color: '#aaa' },
+                    title: { display: window.innerWidth > 768, text: 'Distance', color: '#aaa', padding: { top: -6 } },
                     grid: { color: '#333' },
-                    ticks: { color: '#aaa', padding: window.innerWidth <= 768 ? 2 : 3, align: 'inner' }
+                    ticks: {
+                        color: '#aaa',
+                        padding: window.innerWidth <= 768 ? 2 : 3,
+                        align: 'inner',
+                        callback: function (value, index, ticks) {
+                            const maxVal = this.chart.scales.x.max;
+                            if (maxVal === null || maxVal === undefined) return value;
+                            if (Math.abs(value - maxVal) < 0.001) {
+                                if (ticks.length >= 2) {
+                                    const secondToLast = ticks[ticks.length - 2].value;
+                                    let step = 1;
+                                    if (maxVal <= 1) step = 0.2;
+                                    else if (maxVal <= 2) step = 0.5;
+                                    else if (maxVal <= 5) step = 1;
+                                    else if (maxVal <= 10) step = 2;
+                                    else if (maxVal <= 25) step = 5;
+                                    else if (maxVal <= 55) step = 10;
+                                    else if (maxVal <= 115) step = 20;
+                                    else if (maxVal <= 250) step = 50;
+                                    else step = 100;
+
+                                    if ((maxVal - secondToLast) < step * 0.4) {
+                                        return "";
+                                    }
+                                }
+                            }
+                            return Math.round(value * 10) / 10;
+                        }
+                    },
+                    afterBuildTicks: (axis) => {
+                        if (axis.max === null || axis.max === undefined) return;
+                        const maxVal = axis.max;
+
+                        let step = 1;
+                        if (maxVal <= 1) step = 0.2;
+                        else if (maxVal <= 2) step = 0.5;
+                        else if (maxVal <= 5) step = 1;
+                        else if (maxVal <= 10) step = 2;
+                        else if (maxVal <= 25) step = 5;
+                        else if (maxVal <= 55) step = 10;
+                        else if (maxVal <= 115) step = 20;
+                        else if (maxVal <= 250) step = 50;
+                        else step = 100;
+
+                        const ticks = [];
+                        let val = 0;
+                        while (val <= maxVal) {
+                            ticks.push({ value: val });
+                            val += step;
+                        }
+
+                        const lastStepTickVal = ticks[ticks.length - 1].value;
+                        if (Math.abs(maxVal - lastStepTickVal) > 0.001) {
+                            ticks.push({ value: maxVal });
+                        }
+
+                        axis.ticks = ticks;
+                    }
                 },
                 y: {
                     display: true,
@@ -2429,15 +2877,126 @@ function initChart() {
         }]
     });
 
-    // Native mouseout guarantees hover state clears even if Chart.js onLeave drops the event
-    ctx.canvas.addEventListener('mouseout', () => {
+    const clearHover = () => {
         if (elevationChart) {
             elevationChart.setActiveElements([]);
             if (elevationChart.tooltip) elevationChart.tooltip.setActiveElements([]);
             elevationChart.update('none');
         }
+        currentHoverDispDist = null;
         hideHoverMarker();
+        const statsDiv = document.getElementById('hover-stats');
+        if (statsDiv) statsDiv.style.opacity = '0';
+    };
+
+    const handleHoverMove = (clientX) => {
+        if (!elevationChart || !currentRouteGeoJSON?.coordinates) return;
+        const chart = elevationChart;
+        const rect = ctx.canvas.getBoundingClientRect();
+        const canvasX = clientX - rect.left;
+
+        // canvasX is in CSS pixels; Chart.js scales use the same coordinate space.
+        const xValue = chart.scales.x?.getValueForPixel(canvasX);
+        if (xValue == null) return;
+
+        const data = chart.data.datasets[0]?.data;
+        const coords = currentRouteGeoJSON.coordinates;
+        if (!data || data.length < 2 || !coords || coords.length < 2) return;
+
+        // Binary search: find chart data index just below xValue
+        let low = 0, high = data.length - 2, i = 0;
+        while (low <= high) {
+            const mid = (low + high) >> 1;
+            if (data[mid].x <= xValue) { i = mid; low = mid + 1; }
+            else high = mid - 1;
+        }
+
+        // Sub-index interpolation factor between data[i] and data[i+1]
+        const t = (data[i + 1] && data[i + 1].x !== data[i].x)
+            ? Math.max(0, Math.min(1, (xValue - data[i].x) / (data[i + 1].x - data[i].x)))
+            : 0;
+
+        // Map xValue → route coordinate index via cumulative distances (continuous)
+        let ci = 0;
+        if (routePathDistances && routePathDistances.length === coords.length) {
+            const xMeters = currentUnits === 'imperial' ? xValue * 1609.344 : xValue * 1000;
+            let lo = 0, hi = routePathDistances.length - 2;
+            while (lo <= hi) {
+                const mid = (lo + hi) >> 1;
+                if (routePathDistances[mid] <= xMeters) { ci = mid; lo = mid + 1; }
+                else hi = mid - 1;
+            }
+            ci = Math.min(ci, coords.length - 2);
+        } else {
+            ci = Math.min(Math.floor((i / Math.max(1, data.length - 1)) * (coords.length - 1)), coords.length - 2);
+        }
+        const ciNext = ci + 1;
+
+        // Interpolated geographic position
+        const lngC = coords[ci][0] + t * (coords[ciNext][0] - coords[ci][0]);
+        const latC = coords[ci][1] + t * (coords[ciNext][1] - coords[ci][1]);
+
+        // Offset marker to sit on the route line (same logic as map hover)
+        const pCenter = map.project([lngC, latC]);
+        const p0 = map.project(coords[ci]);
+        const p1 = map.project(coords[ciNext]);
+        const vX = p1.x - p0.x, vY = p1.y - p0.y;
+        const segLen = Math.sqrt(vX * vX + vY * vY);
+        let markerLngLat;
+        if (segLen > 0.1) {
+            const nx = -vY / segLen, ny = vX / segLen;
+            const off = getPixelOffset(map.getZoom());
+            markerLngLat = map.unproject([pCenter.x + nx * off, pCenter.y + ny * off]);
+        } else {
+            markerLngLat = { lng: lngC, lat: latC };
+        }
+
+        // Interpolate elevation and grade continuously
+        const ds = chart.data.datasets[0];
+        const elevA = data[i]?.y, elevB = data[i + 1]?.y;
+        const elevVal = (elevA != null && elevB != null) ? elevA + t * (elevB - elevA) : (elevA ?? null);
+        const gradeA = ds.grades?.[ci];
+        const gradeB = ds.grades?.[Math.min(ci + 1, (ds.grades?.length ?? 1) - 1)];
+        const grade = (gradeA !== undefined && gradeB !== undefined) ? gradeA + t * (gradeB - gradeA) : gradeA;
+
+        // Update hover line on chart
+        currentHoverDispDist = xValue;
+        chart.update('none');
+
+        const distLabel = xValue.toFixed(2) + (currentUnits === 'metric' ? ' km' : ' mi');
+        const elevLabel = elevVal != null ? elevVal.toFixed(1) + (currentUnits === 'metric' ? ' m' : ' ft') : '';
+        const gradeLabel = grade !== undefined ? (grade >= 0 ? '+' : '') + grade.toFixed(2) + '%' : '';
+        const info = `${distLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${elevLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${gradeLabel}`;
+
+        showHoverMarker([markerLngLat.lng, markerLngLat.lat], info);
+        showHoverSegment(ci);
+
+        const statsDiv = document.getElementById('hover-stats');
+        if (statsDiv) {
+            statsDiv.style.opacity = '1';
+            document.getElementById('hover-dist').textContent = distLabel;
+            document.getElementById('hover-elev').textContent = elevLabel;
+            document.getElementById('hover-grade').textContent = gradeLabel;
+        }
+    };
+
+    ctx.canvas.addEventListener('mouseout', clearHover);
+    ctx.canvas.addEventListener('touchend', clearHover, { passive: true });
+    ctx.canvas.addEventListener('touchcancel', clearHover, { passive: true });
+
+    ctx.canvas.addEventListener('mousemove', (e) => {
+        handleHoverMove(e.clientX);
     });
+    ctx.canvas.addEventListener('touchstart', (e) => {
+        if (e.touches.length > 0) {
+            handleHoverMove(e.touches[0].clientX);
+        }
+    }, { passive: true });
+    ctx.canvas.addEventListener('touchmove', (e) => {
+        if (e.touches.length > 0) {
+            handleHoverMove(e.touches[0].clientX);
+        }
+    }, { passive: true });
 }
 
 
@@ -2451,6 +3010,8 @@ async function updateElevationProfile() {
             if (elevationChart.data.datasets[1]) elevationChart.data.datasets[1].data = [];
             elevationChart.update('none');
             hideHoverMarker();
+            currentStats = { gain: 0, loss: 0, min: Infinity, max: -Infinity, minIdx: 0, maxIdx: 0, maxUpGrade: 0, maxDownGrade: 0, maxUpIdx: 0, maxDownIdx: 0, grades: [] };
+            updateStatsUI(0, 0, Infinity, -Infinity, []);
         }
         return;
     }
@@ -2591,6 +3152,7 @@ async function updateElevationProfile() {
 
         let filteredDist = 0;
         let filteredMax = -Infinity, filteredMin = Infinity;
+        let minElevIdx = 0, maxElevIdx = 0;
         for (let i = 0; i < coords.length; i++) {
             const dval = elevations[i];
             if (i > 0) {
@@ -2600,8 +3162,14 @@ async function updateElevationProfile() {
             const displayElev = dval != null ? (currentUnits === 'metric' ? dval : dval * 3.28084) : null;
             filteredChartData.push({ x: getDisplayDistance(filteredDist), y: displayElev ?? null });
             if (displayElev != null) {
-                filteredMax = Math.max(filteredMax, displayElev);
-                filteredMin = Math.min(filteredMin, displayElev);
+                if (displayElev > filteredMax) {
+                    filteredMax = displayElev;
+                    maxElevIdx = i;
+                }
+                if (displayElev < filteredMin) {
+                    filteredMin = displayElev;
+                    minElevIdx = i;
+                }
             }
         }
 
@@ -2625,7 +3193,7 @@ async function updateElevationProfile() {
             ? `${Math.round(totalLossM)}m`
             : `${Math.round(totalLossM * 3.28084)}ft`;
         const gainLossEl = document.getElementById('elev-gain-loss');
-        if (gainLossEl) gainLossEl.textContent = `${gainLabel}  ${lossLabel}`;
+        if (gainLossEl) gainLossEl.textContent = '';
 
         // Step 3: Apply distance-aware smoothing to segment grades.
         // We now use point-centered grades which are mathematically symmetric.
@@ -2734,8 +3302,42 @@ async function updateElevationProfile() {
             elevationChart.update('none');
         } catch (e) { }
 
+        let maxUpGrade = 0;
+        let maxDownGrade = 0;
+        let maxUpIdx = 0;
+        let maxDownIdx = 0;
+
+        for (let i = 0; i < smoothedSegmentGrades.length; i++) {
+            const grade = smoothedSegmentGrades[i];
+            if (grade > 0.5) {
+                if (grade > maxUpGrade) {
+                    maxUpGrade = grade;
+                    maxUpIdx = i;
+                }
+            } else if (grade < -0.5) {
+                if (grade < maxDownGrade) {
+                    maxDownGrade = grade;
+                    maxDownIdx = i;
+                }
+            }
+        }
+
         rebuildMapGradient(); // update line colors on map
         updateTurnaroundJoins(); // update turn colors
+        currentStats = {
+            gain: totalGainM,
+            loss: totalLossM,
+            min: minElev,
+            max: maxElev,
+            minIdx: minElevIdx,
+            maxIdx: maxElevIdx,
+            maxUpGrade: maxUpGrade,
+            maxDownGrade: maxDownGrade,
+            maxUpIdx: maxUpIdx,
+            maxDownIdx: maxDownIdx,
+            grades: [...smoothedSegmentGrades]
+        };
+        updateStatsUI(currentStats.gain, currentStats.loss, currentStats.min, currentStats.max, currentStats.grades);
         needsElevationUpdate = false;
     } finally {
         isUpdatingElevation = false;
@@ -2774,6 +3376,16 @@ function loadUrlState() {
     const modes = modeStr ? modeStr.split(',') : [];
 
     if (routeStr) {
+        if (modes.length > 0) {
+            const lastMode = modes[modes.length - 1];
+            if (['bike', 'direct', 'hike', 'gpx'].includes(lastMode)) {
+                currentRoutingMode = lastMode;
+                localStorage.setItem('route_routing_mode', lastMode);
+                document.getElementById('mode-bike')?.classList.toggle('active', lastMode === 'bike');
+                document.getElementById('mode-direct')?.classList.toggle('active', lastMode === 'direct');
+                document.getElementById('mode-hike')?.classList.toggle('active', lastMode === 'hike');
+            }
+        }
         const points = routeStr.split(';');
         points.forEach((pt, i) => {
             const [lng, lat] = pt.split(',').map(Number);
@@ -2799,9 +3411,8 @@ function loadUrlState() {
             removeInitialCover();
         }
     } else {
-        // No route — remove the initial cover and try geolocation automatically
+        // No route — remove the initial cover. Map remains centered where it last was on startup
         removeInitialCover();
-        requestLocation();
     }
 }
 
@@ -2816,18 +3427,51 @@ function removeInitialCover() {
     }
 }
 
-function requestLocation() {
+function requestLocation(fly = false) {
+    const isLocalhost = ['localhost', '127.0.0.1', '0.0.0.0'].includes(window.location.hostname);
+    if (isLocalhost) {
+        const options = {
+            center: [-122.4018, 37.7885],
+            zoom: 13,
+            speed: 1.5,
+            curve: 1.2
+        };
+        if (fly) {
+            map.flyTo(options);
+        } else {
+            map.jumpTo({ center: options.center, zoom: options.zoom });
+        }
+        return;
+    }
+
     if (!("geolocation" in navigator)) return;
     navigator.geolocation.getCurrentPosition(
         (pos) => {
-            map.jumpTo({
-                center: [pos.coords.longitude, pos.coords.latitude],
-                zoom: 13
-            });
+            const freshLng = pos.coords.longitude;
+            const freshLat = pos.coords.latitude;
+            const currentCenter = map.getCenter();
+
+            // Check if fresh coordinates differ significantly from current center (~500 meters)
+            const diffLng = Math.abs(currentCenter.lng - freshLng);
+            const diffLat = Math.abs(currentCenter.lat - freshLat);
+
+            const options = {
+                center: [freshLng, freshLat],
+                zoom: 13,
+                speed: 1.5, // fast flyTo speed
+                curve: 1.2
+            };
+
+            if (diffLng > 0.005 || diffLat > 0.005) {
+                if (fly) {
+                    map.flyTo(options);
+                } else {
+                    map.jumpTo({ center: options.center, zoom: options.zoom });
+                }
+            }
         },
         () => {
-            // If we are at [0,0] zoom 1, stay there.
-            // If this was a manual button click, user knows it failed.
+            // Keep current location if fetch fails
         },
         { timeout: 5000, enableHighAccuracy: true }
     );
@@ -3149,4 +3793,135 @@ function initCustomTooltips() {
     });
 }
 initCustomTooltips();
-initCustomTooltips();
+
+// Mobile drag-to-resize elevation profile
+(function () {
+    let isMobileResizing = false;
+    let mobileStartY = 0;
+    let mobileStartH = 0;
+
+    function initMobileResize(e) {
+        if (window.innerWidth > 768) return; // Only on mobile
+        if (elPanel.classList.contains('minimized')) return;
+
+        isMobileResizing = true;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        mobileStartY = clientY;
+        mobileStartH = elPanel.offsetHeight;
+
+        if (e.touches) {
+            document.addEventListener('touchmove', mobileResizeWindow, { passive: false });
+            document.addEventListener('touchend', stopMobileResize);
+        } else {
+            document.addEventListener('mousemove', mobileResizeWindow);
+            document.addEventListener('mouseup', stopMobileResize);
+        }
+        if (e.cancelable) e.preventDefault();
+    }
+
+    function mobileResizeWindow(e) {
+        if (!isMobileResizing) return;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        const dy = mobileStartY - clientY;
+        const newH = Math.max(120, Math.min(window.innerHeight * 0.7, mobileStartH + dy));
+        elPanel.style.setProperty('height', newH + 'px', 'important');
+        if (elevationChart) elevationChart.resize();
+        saveWindowState();
+    }
+
+    function stopMobileResize() {
+        isMobileResizing = false;
+        document.removeEventListener('touchmove', mobileResizeWindow);
+        document.removeEventListener('touchend', stopMobileResize);
+        document.removeEventListener('mousemove', mobileResizeWindow);
+        document.removeEventListener('mouseup', stopMobileResize);
+    }
+
+    const elevHeader = document.getElementById('elevation-header');
+    if (elevHeader) {
+        elevHeader.addEventListener('mousedown', initMobileResize);
+        elevHeader.addEventListener('touchstart', initMobileResize, { passive: false });
+    }
+})();
+
+let userLocationMarker = null;
+let userLocationWatchId = null;
+
+function updateUserLocationPin() {
+    const showCheck = document.getElementById('show-location-check');
+    const isEnabled = showCheck ? showCheck.checked : false;
+    localStorage.setItem('route_show_location_check', isEnabled);
+
+    const isLocalhost = ['localhost', '127.0.0.1', '0.0.0.0'].includes(window.location.hostname);
+
+    if (!isEnabled) {
+        if (userLocationWatchId !== null) {
+            if (isLocalhost) {
+                clearInterval(userLocationWatchId);
+            } else {
+                navigator.geolocation.clearWatch(userLocationWatchId);
+            }
+            userLocationWatchId = null;
+        }
+        if (userLocationMarker) {
+            userLocationMarker.remove();
+            userLocationMarker = null;
+        }
+        return;
+    }
+
+    if (isLocalhost) {
+        if (userLocationWatchId === null) {
+            const updateLocalMarker = () => {
+                const lngLat = [-122.4018, 37.7885];
+                if (!userLocationMarker) {
+                    const el = document.createElement('div');
+                    el.style.width = '20px';
+                    el.style.height = '20px';
+                    el.style.backgroundColor = '#3b82f6';
+                    el.style.border = '3px solid #ffffff';
+                    el.style.borderRadius = '50%';
+                    el.style.boxShadow = '0 0 6px rgba(0,0,0,0.4), 0 0 0 4px rgba(59, 130, 246, 0.4)';
+                    el.style.cursor = 'default';
+                    userLocationMarker = new maplibregl.Marker({ element: el, anchor: 'center' })
+                        .setLngLat(lngLat)
+                        .addTo(map);
+                } else {
+                    userLocationMarker.setLngLat(lngLat);
+                }
+            };
+            updateLocalMarker();
+            userLocationWatchId = setInterval(updateLocalMarker, 5000);
+        }
+        return;
+    }
+
+    if (!("geolocation" in navigator)) return;
+
+    if (userLocationWatchId === null) {
+        userLocationWatchId = navigator.geolocation.watchPosition(
+            (pos) => {
+                const lngLat = [pos.coords.longitude, pos.coords.latitude];
+                if (!userLocationMarker) {
+                    const el = document.createElement('div');
+                    el.style.width = '20px';
+                    el.style.height = '20px';
+                    el.style.backgroundColor = '#3b82f6';
+                    el.style.border = '3px solid #ffffff';
+                    el.style.borderRadius = '50%';
+                    el.style.boxShadow = '0 0 6px rgba(0,0,0,0.4), 0 0 0 4px rgba(59, 130, 246, 0.4)';
+                    el.style.cursor = 'default';
+                    userLocationMarker = new maplibregl.Marker({ element: el, anchor: 'center' })
+                        .setLngLat(lngLat)
+                        .addTo(map);
+                } else {
+                    userLocationMarker.setLngLat(lngLat);
+                }
+            },
+            () => {
+                // Ignore errors
+            },
+            { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+        );
+    }
+}

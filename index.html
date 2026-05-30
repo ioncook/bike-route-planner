@@ -3,7 +3,8 @@
 
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>Bike Route Planner</title>
     <link rel="icon" href="favicon.png">
     <link rel="stylesheet" href="style.css">
@@ -17,21 +18,41 @@
 
 <body>
     <div id="app">
+        <!-- Mobile Search Screen Overlay -->
+        <div id="mobile-search-screen" class="mobile-search-overlay" style="display: none;">
+            <div class="mobile-search-header">
+                <button id="mobile-search-back" class="icon-btn" aria-label="Go back">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="19" y1="12" x2="5" y2="12"></line>
+                        <polyline points="12 19 5 12 12 5"></polyline>
+                    </svg>
+                </button>
+                <div class="mobile-search-input-wrapper">
+                    <input type="text" id="mobile-map-search" placeholder="Search locations..." autocomplete="off">
+                    <button id="mobile-search-clear" class="search-clear-btn" style="display: none;">&times;</button>
+                </div>
+            </div>
+            <div id="mobile-search-dropdown" class="mobile-search-results"></div>
+        </div>
+
         <main id="map-container">
             <div id="top-bar">
                 <div class="header-brand" style="display: flex; align-items: center; gap: 10px;">
-                    <a href="https://github.com/ioncook" target="_blank" style="display: flex; align-items: center; text-decoration: none; color: inherit;">
+                    <a href="https://github.com/ioncook" target="_blank"
+                        style="display: flex; align-items: center; text-decoration: none; color: inherit;">
                         <img src="logo.png" id="logo" alt="Logo">
                         <img src="favicon.png" id="favicon-mobile" alt="Favicon" style="display: none;">
                     </a>
-                    <a href="https://github.com/ioncook/bike-route-planner" target="_blank" style="text-decoration: none; color: inherit;">
+                    <a href="https://github.com/ioncook/bike-route-planner" target="_blank"
+                        style="text-decoration: none; color: inherit;">
                         <h1 id="app-title">Bike Route Planner</h1>
                     </a>
                 </div>
 
                 <div class="icon-btn-divider" style="height: 20px; opacity: 0.5; margin: 0 4px;"></div>
 
-                <span class="stat-value" id="total-distance">0.0 mi</span>
+                <span class="stat-value" id="total-distance" title="Click to view detailed route statistics" style="cursor: pointer;">0.0 mi</span>
 
                 <div id="loading-indicator"
                     style="display:none; align-items:center; gap:7px; color:var(--text-muted); font-size:0.82rem; margin-left: 12px;">
@@ -46,7 +67,8 @@
 
                 <div class="icon-btn-group icon-btn-group-danger">
                     <button id="clear-route" class="icon-btn" title="Delete entire route (Ctrl+Backspace)">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
                             <line x1="18" y1="6" x2="6" y2="18"></line>
                             <line x1="6" y1="6" x2="18" y2="18"></line>
                         </svg>
@@ -56,7 +78,8 @@
                 <div class="icon-btn-group">
                     <div class="search-wrapper">
                         <button id="search-toggle" class="icon-btn" title="Search locations (S)">
-                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                                 <circle cx="10.5" cy="10.5" r="7.5"></circle>
                                 <line x1="21" y1="21" x2="15.8" y2="15.8"></line>
                             </svg>
@@ -104,6 +127,18 @@
                             <path d="M21 13v2a4 4 0 0 1-4 4H3" />
                         </svg>
                     </button>
+                    <button id="current-location-btn" class="icon-btn" title="Center on current location"
+                        aria-label="Center on current location">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="8"></circle>
+                            <circle cx="12" cy="12" r="4.5" fill="currentColor"></circle>
+                            <line x1="12" y1="0" x2="12" y2="4"></line>
+                            <line x1="12" y1="20" x2="12" y2="24"></line>
+                            <line x1="0" y1="12" x2="4" y2="12"></line>
+                            <line x1="20" y1="12" x2="24" y2="12"></line>
+                        </svg>
+                    </button>
                     <div class="icon-btn-divider"></div>
                     <button id="gpx-import-btn" class="icon-btn" title="Import GPX" aria-label="Import GPX">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -125,7 +160,7 @@
 
                 <input type="file" id="gpx-file-input" accept=".gpx" style="display:none;">
                 <div class="mode-toggle">
-                    <button id="mode-bike" class="mode-btn active" title="Follow Roads (Routed)">
+                    <button id="mode-bike" class="mode-btn active" title="Cycling (Paved routes)">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <circle cx="18.5" cy="17.5" r="3.5"></circle>
@@ -134,7 +169,8 @@
                             <path d="M12 17.5V14l-3-3 4-3 2 3h2"></path>
                         </svg>
                     </button>
-                    <button id="mode-direct" class="mode-btn" title="Direct Line (Beeline)">
+                    <div class="icon-btn-divider"></div>
+                    <button id="mode-direct" class="mode-btn" title="Direct (Straight line)">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <path d="M5 12h14"></path>
@@ -142,10 +178,28 @@
                             <circle cx="19" cy="12" r="1"></circle>
                         </svg>
                     </button>
+                    <div class="icon-btn-divider"></div>
+                    <button id="mode-hike" class="mode-btn" title="Hiking (Allow unpaved)">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                            <g transform="translate(7, 14) rotate(-15) scale(0.75)">
+                                <path
+                                    d="M -3.5,-3 C -3.5,-7.5 -2.5,-10 0,-10 C 2.5,-10 3.5,-7.5 3.5,-3 C 3.5,0.5 2.5,2 0,2 C -2.5,2 -3.5,0.5 -3.5,-3 Z" />
+                                <path
+                                    d="M -2.5,5 C -2.5,4 2.5,4 2.5,5 C 2.5,8 1.8,9.5 0,9.5 C -1.8,9.5 -2.5,8 -2.5,5 Z" />
+                            </g>
+                            <g transform="translate(17, 8) rotate(15) scale(0.75)">
+                                <path
+                                    d="M -3.5,-3 C -3.5,-7.5 -2.5,-10 0,-10 C 2.5,-10 3.5,-7.5 3.5,-3 C 3.5,0.5 2.5,2 0,2 C -2.5,2 -3.5,0.5 -3.5,-3 Z" />
+                                <path
+                                    d="M -2.5,5 C -2.5,4 2.5,4 2.5,5 C 2.5,8 1.8,9.5 0,9.5 C -1.8,9.5 -2.5,8 -2.5,5 Z" />
+                            </g>
+                        </svg>
+                    </button>
                 </div>
                 <div class="icon-btn-group" id="elevation-toggle-group">
                     <button id="elevation-toggle-btn" class="icon-btn" title="Toggle elevation profile (E)">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <polyline points="4 18 9 12 13 16 18 6 22 14"></polyline>
                         </svg>
                     </button>
@@ -198,36 +252,29 @@
                             </select>
                         </div>
                         <div class="setting-row">
-                            <span>3D Relief & Hillshade</span>
-                            <label class="switch">
-                                <input type="checkbox" id="hillshade-check">
-                                <span class="slider"></span>
-                            </label>
+                            <span>Hillshade</span>
+                            <select id="hillshade-select">
+                                <option value="off">Off</option>
+                                <option value="hillshade">Hillshade</option>
+                                <option value="terrain">Hillshade & 3D Terrain</option>
+                            </select>
                         </div>
                         <div class="setting-row">
                             <span>3D Exaggeration</span>
                             <input type="number" id="terrain-exaggeration" step="0.1" min="0" max="20" value="2.0"
                                 style="width: 60px; background:var(--bg-panel); color:var(--text-main); border:1px solid var(--border); border-radius:4px; padding:2px 5px;">
                         </div>
-                        <hr style="border:0; border-top: 1px solid var(--border); margin: 8px 0;">
                         <div class="setting-row">
-                            <span>Avoid Motorways</span>
+                            <span>Allow Ferries</span>
                             <label class="switch">
-                                <input type="checkbox" id="avoid-motorways-check">
+                                <input type="checkbox" id="allow-ferries-check">
                                 <span class="slider"></span>
                             </label>
                         </div>
                         <div class="setting-row">
-                            <span>Avoid Tolls</span>
+                            <span>Show My Location</span>
                             <label class="switch">
-                                <input type="checkbox" id="avoid-tolls-check">
-                                <span class="slider"></span>
-                            </label>
-                        </div>
-                        <div class="setting-row">
-                            <span>Avoid Unpaved</span>
-                            <label class="switch">
-                                <input type="checkbox" id="avoid-unpaved-check">
+                                <input type="checkbox" id="show-location-check">
                                 <span class="slider"></span>
                             </label>
                         </div>
@@ -240,6 +287,50 @@
                 </div>
             </div>
             <div id="map"></div>
+            <!-- Stats Panel -->
+            <div id="stats-panel" class="stats-panel" style="display: none;">
+                <div class="stats-header">
+                    <span class="stats-title">Route Statistics</span>
+                    <button id="close-stats-btn" class="close-stats-btn" aria-label="Close stats">&times;</button>
+                </div>
+                <div class="stats-body">
+                    <div class="stats-row">
+                        <span class="stats-label">Total Distance</span>
+                        <span class="stats-val" id="stats-distance">--</span>
+                    </div>
+                    <div class="stats-row">
+                        <span class="stats-label">Elevation Min/Max</span>
+                        <span class="stats-val">
+                            <span id="stats-min" style="cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px;">--</span> / 
+                            <span id="stats-max" style="cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px;">--</span>
+                        </span>
+                    </div>
+                    <div class="stats-row">
+                        <span class="stats-label">Total Ascent</span>
+                        <span class="stats-val text-success" id="stats-ascent">--</span>
+                    </div>
+                    <div class="stats-row">
+                        <span class="stats-label">Total Descent</span>
+                        <span class="stats-val text-danger" id="stats-descent">--</span>
+                    </div>
+                    <div class="stats-row">
+                        <span class="stats-label">Avg Uphill Grade</span>
+                        <span class="stats-val" id="stats-avg-up">--</span>
+                    </div>
+                    <div class="stats-row">
+                        <span class="stats-label">Avg Downhill Grade</span>
+                        <span class="stats-val" id="stats-avg-down">--</span>
+                    </div>
+                    <div class="stats-row">
+                        <span class="stats-label">Max Uphill Grade</span>
+                        <span class="stats-val" id="stats-max-up" style="cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px;">--</span>
+                    </div>
+                    <div class="stats-row">
+                        <span class="stats-label">Max Downhill Grade</span>
+                        <span class="stats-val" id="stats-max-down" style="cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px;">--</span>
+                    </div>
+                </div>
+            </div>
             <div id="elevation-panel" class="floating-window">
                 <div class="resizer n"></div>
                 <div class="resizer s"></div>
