@@ -885,7 +885,11 @@ map.on('load', () => {
 map.on('movestart', () => {
     hideHoverMarker();
     clearHoverHighlight();
-    if (window._collapseSearch) window._collapseSearch();
+    const mobileScreen = document.getElementById('mobile-search-screen');
+    const isMobileSearchActive = mobileScreen && mobileScreen.classList.contains('active');
+    if (!isMobileSearchActive && window._collapseSearch) {
+        window._collapseSearch();
+    }
 });
 
 // Change cursor when hovering the route
