@@ -169,8 +169,10 @@ const DEFAULT_KEYBINDINGS = {
     fitRoute: 'f',
     toggleSettings: 't',
     search: 's',
+    toggleStats: 'm',
     reverse: 'v',
     deleteLast: 'backspace',
+    resetOrientation: 'n',
 };
 let currentKeybindings = { ...DEFAULT_KEYBINDINGS };
 let activeCaptureKey = null;
@@ -866,6 +868,12 @@ map.on('style.load', () => {
     map.on('moveend', updateView);
     map.on('zoomend', () => { isZooming = false; updateView(); });
     map.on('zoomstart', () => { isZooming = true; });
+    const updateCompass = () => {
+        const compass = document.getElementById('compass-needle-svg');
+        if (compass) compass.style.transform = `rotate(${-map.getBearing()}deg)`;
+    };
+    map.on('rotate', updateCompass);
+    updateCompass();
 });
 
 map.on('load', () => {
@@ -1952,6 +1960,9 @@ function fitRoute() {
 document.getElementById('fit-route-btn').addEventListener('click', fitRoute);
 document.getElementById('reverse-route-btn')?.addEventListener('click', reverseRoute);
 document.getElementById('current-location-btn')?.addEventListener('click', () => requestLocation(true));
+document.getElementById('reset-orientation-btn')?.addEventListener('click', () => {
+    map.flyTo({ bearing: 0, pitch: 0 });
+});
 
 function toggleSettings(event) {
     const menu = document.getElementById('settings-menu');
@@ -2256,6 +2267,9 @@ window.addEventListener('keydown', (e) => {
             input.focus();
             input.select();
         }
+    } else if (key === currentKeybindings.toggleStats) {
+        e.preventDefault();
+        toggleStatsPanel();
     } else if (key === currentKeybindings.reverse) {
         e.preventDefault();
         reverseRoute();
@@ -2267,7 +2281,7 @@ window.addEventListener('keydown', (e) => {
         } else {
             deleteLastWaypoint();
         }
-    } else if (key === 'n') {
+    } else if (key === currentKeybindings.resetOrientation) {
         e.preventDefault();
         map.flyTo({ bearing: 0, pitch: 0 });
     }
@@ -2484,11 +2498,21 @@ document.getElementById('mode-hike')?.addEventListener('click', () => {
 document.getElementById('hillshade-select')?.addEventListener('change', applyTerrain);
 document.getElementById('terrain-exaggeration').addEventListener('change', applyTerrain);
 
+function updateStatsToggleBtn() {
+    const panel = document.getElementById('stats-panel');
+    const totalDistBtn = document.getElementById('total-distance');
+    if (panel && totalDistBtn) {
+        const visible = panel.classList.contains('show');
+        totalDistBtn.classList.toggle('active', visible);
+    }
+}
+
 function toggleSettings(event) {
     if (event) event.stopPropagation();
     document.getElementById('settings-menu').classList.toggle('show');
     document.getElementById('stats-panel').classList.remove('show');
     localStorage.setItem('stats_panel_visible', 'false');
+    updateStatsToggleBtn();
 }
 
 function toggleStatsPanel(event) {
@@ -2503,6 +2527,7 @@ function toggleStatsPanel(event) {
         localStorage.setItem('stats_panel_visible', 'true');
         document.getElementById('settings-menu').classList.remove('show');
     }
+    updateStatsToggleBtn();
 }
 
 document.getElementById('total-distance').addEventListener('click', toggleStatsPanel);
@@ -2510,6 +2535,7 @@ document.getElementById('close-stats-btn').addEventListener('click', (e) => {
     e.stopPropagation();
     document.getElementById('stats-panel').classList.remove('show');
     localStorage.setItem('stats_panel_visible', 'false');
+    updateStatsToggleBtn();
 });
 
 window.addEventListener('click', () => {
@@ -2734,9 +2760,23 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
     }
     document.getElementById('stats-distance').textContent = distText;
 
+    const getAvgSpeedStr = (minutes) => {
+        if (!minutes || minutes <= 0) return '';
+        const hours = minutes / 60;
+        if (currentUnits === 'metric') {
+            const distanceKm = currentDistanceMeters / 1000;
+            const avgSpeed = distanceKm / hours;
+            return `${avgSpeed.toFixed(1)} km/h`;
+        } else {
+            const distanceMi = currentDistanceMeters * 0.000621371;
+            const avgSpeed = distanceMi / hours;
+            return `${avgSpeed.toFixed(1)} mph`;
+        }
+    };
+
     // First display base time immediately
     const baseMinutes = getEstimatedTime(currentDistanceMeters, totalGainM, currentRoutingMode);
-    document.getElementById('stats-time').textContent = formatDuration(baseMinutes);
+    document.getElementById('stats-time').textContent = `${formatDuration(baseMinutes)} (${getAvgSpeedStr(baseMinutes)})`;
 
     // Fetch route-level wind data asynchronously
     const queryToken = ++activeWeatherQueryToken;
@@ -2754,9 +2794,9 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
                 const windTimeStr = formatDuration(estimates.windMin);
                 const hasSignificantWind = windSamples.some(s => s.windSpeedKmh > 3);
                 if (hasSignificantWind) {
-                    document.getElementById('stats-time').textContent = `${windTimeStr}`;
+                    document.getElementById('stats-time').textContent = `${windTimeStr} (${getAvgSpeedStr(estimates.windMin)})`;
                 } else {
-                    document.getElementById('stats-time').textContent = baseTimeStr;
+                    document.getElementById('stats-time').textContent = `${baseTimeStr} (${getAvgSpeedStr(estimates.baseMin)})`;
                 }
             }
         }).catch(err => console.warn('Wind stats calc error:', err));
@@ -2805,13 +2845,13 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
         const avgUpVal = upCount > 0 ? (upSum / upCount) : 0;
         const avgDownVal = downCount > 0 ? (downSum / downCount) : 0;
 
-        upEl.textContent = `${avgUpVal.toFixed(1)}%`;
+        upEl.textContent = `+${avgUpVal.toFixed(1)}%`;
         upEl.style.color = getColorForGrade(avgUpVal);
 
         downEl.textContent = `${avgDownVal.toFixed(1)}%`;
         downEl.style.color = getColorForGrade(avgDownVal);
 
-        maxUpEl.textContent = `${maxUpGrade.toFixed(1)}%`;
+        maxUpEl.textContent = `+${maxUpGrade.toFixed(1)}%`;
         maxUpEl.style.color = getColorForGrade(maxUpGrade);
 
         maxDownEl.textContent = `${maxDownGrade.toFixed(1)}%`;
@@ -2960,6 +3000,7 @@ function loadStoredSettings() {
     if (statsVisible === 'true') {
         document.getElementById('stats-panel').classList.add('show');
     }
+    updateStatsToggleBtn();
 }
 
 document.getElementById('allow-ferries-check')?.addEventListener('change', (e) => {
@@ -3125,7 +3166,7 @@ function initChart() {
             responsive: true,
             maintainAspectRatio: false,
             layout: {
-                padding: window.innerWidth <= 768 ? 4 : { top: 20, right: 10, left: 10, bottom: 0 }
+                padding: window.innerWidth <= 768 ? 4 : { top: 10, right: 10, left: 10, bottom: 0 }
             },
             interaction: { mode: 'routeHover', intersect: false },
             onLeave: () => {
@@ -3143,13 +3184,14 @@ function initChart() {
                     type: 'linear',
                     display: true,
                     min: 0,
-                    title: { display: window.innerWidth > 768, text: 'Distance', color: '#aaa', padding: { top: -6 } },
+                    title: { display: false },
                     grid: { color: '#333' },
                     ticks: {
                         color: '#aaa',
                         padding: window.innerWidth <= 768 ? 2 : 3,
                         align: 'inner',
                         callback: function (value, index, ticks) {
+                            if (value === 0) return "Dist.";
                             const maxVal = this.chart.scales.x.max;
                             if (maxVal === null || maxVal === undefined) return value;
                             if (Math.abs(value - maxVal) < 0.001) {
@@ -3206,9 +3248,16 @@ function initChart() {
                 },
                 y: {
                     display: true,
-                    title: { display: window.innerWidth > 768, text: 'Elevation', color: '#aaa' },
+                    title: { display: false },
                     grid: { color: '#333' },
-                    ticks: { color: '#aaa', padding: window.innerWidth <= 768 ? 2 : 3 }
+                    ticks: {
+                        color: '#aaa',
+                        padding: window.innerWidth <= 768 ? 2 : 3,
+                        callback: function (value) {
+                            if (value === 0) return "Elev.";
+                            return value;
+                        }
+                    }
                 }
             }
         },
@@ -3680,8 +3729,6 @@ async function updateElevationProfile() {
 
         elevationChart.update('none');
         elevationChart.options.scales.x.max = getDisplayDistance(distMeters);
-        elevationChart.options.scales.x.title.text = `Distance (${currentUnits === 'metric' ? 'km' : 'mi'})`;
-        elevationChart.options.scales.y.title.text = `Elevation (${currentUnits === 'metric' ? 'm' : 'ft'})`;
 
         if (maxElev === -Infinity) maxElev = 100;
         if (minElev === Infinity) minElev = 0;
@@ -3844,7 +3891,11 @@ function removeInitialCover() {
 }
 
 function requestLocation(fly = false) {
-    const isLocalhost = ['localhost', '127.0.0.1', '0.0.0.0'].includes(window.location.hostname);
+    const isLocalhost = ['localhost', '127.0.0.1', '0.0.0.0'].includes(window.location.hostname) ||
+        window.location.hostname.startsWith('192.168.') ||
+        window.location.hostname.startsWith('10.') ||
+        window.location.hostname.startsWith('172.') ||
+        !("geolocation" in navigator);
     if (isLocalhost) {
         const options = {
             center: [-122.4018, 37.7885],
@@ -3898,8 +3949,15 @@ const elPanel = document.getElementById('elevation-panel');
 const elHeader = document.getElementById('elevation-header');
 const elMinBtn = document.getElementById('elevation-min-btn');
 
+const statsPanel = document.getElementById('stats-panel');
+const statsHeader = statsPanel.querySelector('.stats-header');
+const closeStatsBtn = document.getElementById('close-stats-btn');
+
 let isDraggingWindow = false;
 let startX, startY, initialLeft, initialTop;
+
+let isDraggingStats = false;
+let statsStartX, statsStartY, statsInitialLeft, statsInitialTop;
 
 elHeader.addEventListener('mousedown', (e) => {
     if (window.innerWidth <= 768) return; // Disable dragging on mobile
@@ -3918,24 +3976,57 @@ elHeader.addEventListener('mousedown', (e) => {
     initialTop = rect.top;
 });
 
+statsHeader.addEventListener('mousedown', (e) => {
+    if (window.innerWidth <= 768) return; // Disable dragging on mobile
+    if (e.target === closeStatsBtn || e.target.closest('#close-stats-btn')) return;
+    isDraggingStats = true;
+    statsStartX = e.clientX;
+    statsStartY = e.clientY;
+
+    const rect = statsPanel.getBoundingClientRect();
+    statsPanel.style.position = 'absolute';
+    statsPanel.style.left = rect.left + 'px';
+    statsPanel.style.top = rect.top + 'px';
+    statsPanel.style.right = 'auto';
+    statsPanel.style.bottom = 'auto';
+
+    statsInitialLeft = rect.left;
+    statsInitialTop = rect.top;
+    e.preventDefault();
+});
+
 document.addEventListener('mousemove', (e) => {
-    if (!isDraggingWindow) return;
-    const dx = e.clientX - startX;
-    const dy = e.clientY - startY;
-    const container = document.getElementById('map').getBoundingClientRect();
-    const panelW = elPanel.offsetWidth;
-    const panelH = elPanel.offsetHeight;
-    // Keep panel fully inside the map container
-    const newLeft = Math.min(Math.max(initialLeft + dx, container.left), container.right - panelW);
-    const newTop = Math.min(Math.max(initialTop + dy, container.top), container.bottom - panelH);
-    elPanel.style.left = newLeft + 'px';
-    elPanel.style.top = newTop + 'px';
+    if (isDraggingWindow) {
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+        const container = document.getElementById('map').getBoundingClientRect();
+        const panelW = elPanel.offsetWidth;
+        const panelH = elPanel.offsetHeight;
+        const newLeft = Math.min(Math.max(initialLeft + dx, container.left), container.right - panelW);
+        const newTop = Math.min(Math.max(initialTop + dy, container.top), container.bottom - panelH);
+        elPanel.style.left = newLeft + 'px';
+        elPanel.style.top = newTop + 'px';
+    } else if (isDraggingStats) {
+        const dx = e.clientX - statsStartX;
+        const dy = e.clientY - statsStartY;
+        const container = document.getElementById('map').getBoundingClientRect();
+        const panelW = statsPanel.offsetWidth;
+        const panelH = statsPanel.offsetHeight;
+        const newLeft = Math.min(Math.max(statsInitialLeft + dx, container.left), container.right - panelW);
+        const newTop = Math.min(Math.max(statsInitialTop + dy, container.top), container.bottom - panelH);
+        statsPanel.style.left = newLeft + 'px';
+        statsPanel.style.top = newTop + 'px';
+    }
 });
 
 document.addEventListener('mouseup', () => {
     if (isDraggingWindow) {
         isDraggingWindow = false;
         saveWindowState();
+    }
+    if (isDraggingStats) {
+        isDraggingStats = false;
+        saveStatsPosition();
     }
 });
 
@@ -4076,6 +4167,15 @@ function saveWindowState() {
     localStorage.setItem('elevation_window', JSON.stringify(state));
 }
 
+function saveStatsPosition() {
+    if (window.innerWidth <= 768) return;
+    const pos = {
+        left: statsPanel.style.left,
+        top: statsPanel.style.top
+    };
+    setCookie('stats_panel_pos', JSON.stringify(pos));
+}
+
 function loadWindowState() {
     const stateStr = localStorage.getItem('elevation_window');
     if (stateStr) {
@@ -4094,7 +4194,28 @@ function loadWindowState() {
     }
 }
 
+function loadStatsPosition() {
+    if (window.innerWidth <= 768) return;
+    const posStr = getCookie('stats_panel_pos');
+    if (posStr) {
+        try {
+            const pos = JSON.parse(posStr);
+            if (pos.left) {
+                statsPanel.style.position = 'absolute';
+                statsPanel.style.left = pos.left;
+                statsPanel.style.right = 'auto';
+            }
+            if (pos.top) {
+                statsPanel.style.position = 'absolute';
+                statsPanel.style.top = pos.top;
+                statsPanel.style.bottom = 'auto';
+            }
+        } catch (e) { }
+    }
+}
+
 loadWindowState();
+loadStatsPosition();
 
 // Restore elevation panel visibility
 const savedVisible = localStorage.getItem('elevation_panel_visible');
@@ -4110,8 +4231,10 @@ const ACTION_NAMES = {
     fitRoute: 'Fit Map to Route',
     toggleSettings: 'Open/Close Settings',
     search: 'Focus Search Bar',
+    toggleStats: 'Toggle Route Statistics',
     reverse: 'Reverse Entire Route',
-    deleteLast: 'Delete Last Point / Clear Route (Ctrl)'
+    deleteLast: 'Delete Last Point / Clear Route (Ctrl)',
+    resetOrientation: 'Reset Map Orientation'
 };
 
 function renderKeybindings() {
@@ -4268,7 +4391,11 @@ function updateUserLocationPin() {
     const isEnabled = showCheck ? showCheck.checked : false;
     localStorage.setItem('route_show_location_check', isEnabled);
 
-    const isLocalhost = ['localhost', '127.0.0.1', '0.0.0.0'].includes(window.location.hostname);
+    const isLocalhost = ['localhost', '127.0.0.1', '0.0.0.0'].includes(window.location.hostname) ||
+        window.location.hostname.startsWith('192.168.') ||
+        window.location.hostname.startsWith('10.') ||
+        window.location.hostname.startsWith('172.') ||
+        !("geolocation" in navigator);
 
     if (!isEnabled) {
         if (userLocationWatchId !== null) {
@@ -4341,3 +4468,17 @@ function updateUserLocationPin() {
         );
     }
 }
+
+// Dynamic Top Bar Height Sync (for perfect positioning of mobile panels right against it)
+function syncTopBarHeight() {
+    const topBar = document.getElementById('top-bar');
+    if (topBar) {
+        const height = topBar.getBoundingClientRect().height;
+        document.documentElement.style.setProperty('--top-bar-height', `${height}px`);
+    }
+}
+window.addEventListener('resize', syncTopBarHeight);
+window.addEventListener('orientationchange', syncTopBarHeight);
+syncTopBarHeight();
+setTimeout(syncTopBarHeight, 100);
+setTimeout(syncTopBarHeight, 500);

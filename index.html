@@ -140,6 +140,13 @@
                             <line x1="20" y1="12" x2="24" y2="12"></line>
                         </svg>
                     </button>
+                    <button id="reset-orientation-btn" class="icon-btn" title="Reset orientation (N)"
+                        aria-label="Reset orientation">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" id="compass-needle-svg" style="transition: transform 0.15s ease-out; transform-origin: center;">
+                            <polygon points="12,2 16,12 8,12" fill="var(--text-muted)" stroke="var(--text-muted)" />
+                            <polyline points="16,12 12,22 8,12" fill="none" stroke="var(--text-muted)" />
+                        </svg>
+                    </button>
                     <div class="icon-btn-divider"></div>
                     <button id="gpx-import-btn" class="icon-btn" title="Import GPX" aria-label="Import GPX">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -299,7 +306,7 @@
             </div>
             <div id="map"></div>
             <!-- Stats Panel -->
-            <div id="stats-panel" class="stats-panel" style="display: none;">
+            <div id="stats-panel" class="stats-panel">
                 <div class="stats-header">
                     <span class="stats-title">Route Statistics</span>
                     <button id="close-stats-btn" class="close-stats-btn" aria-label="Close stats">&times;</button>
@@ -314,36 +321,36 @@
                         <span class="stats-val" id="stats-time">--</span>
                     </div>
                     <div class="stats-row">
-                        <span class="stats-label">Elevation Min/Max</span>
+                        <span class="stats-label">Elevation Max/Min</span>
                         <span class="stats-val">
-                            <span id="stats-min" class="stats-interactive">--</span>
+                            <span id="stats-max" class="stats-interactive text-success">--</span>
                             /
-                            <span id="stats-max" class="stats-interactive">--</span>
+                            <span id="stats-min" class="stats-interactive text-danger">--</span>
                         </span>
                     </div>
                     <div class="stats-row">
-                        <span class="stats-label">Total Ascent</span>
-                        <span class="stats-val text-success" id="stats-ascent">--</span>
+                        <span class="stats-label">Ascent/Descent</span>
+                        <span class="stats-val">
+                            <span id="stats-ascent" class="text-success">--</span>
+                            /
+                            <span id="stats-descent" class="text-danger">--</span>
+                        </span>
                     </div>
                     <div class="stats-row">
-                        <span class="stats-label">Total Descent</span>
-                        <span class="stats-val text-danger" id="stats-descent">--</span>
+                        <span class="stats-label">Avg Grade</span>
+                        <span class="stats-val">
+                            <span id="stats-avg-up">--</span>
+                            /
+                            <span id="stats-avg-down">--</span>
+                        </span>
                     </div>
                     <div class="stats-row">
-                        <span class="stats-label">Avg Uphill Grade</span>
-                        <span class="stats-val" id="stats-avg-up">--</span>
-                    </div>
-                    <div class="stats-row">
-                        <span class="stats-label">Avg Downhill Grade</span>
-                        <span class="stats-val" id="stats-avg-down">--</span>
-                    </div>
-                    <div class="stats-row">
-                        <span class="stats-label">Max Uphill Grade</span>
-                        <span class="stats-val stats-interactive" id="stats-max-up">--</span>
-                    </div>
-                    <div class="stats-row">
-                        <span class="stats-label">Max Downhill Grade</span>
-                        <span class="stats-val stats-interactive" id="stats-max-down">--</span>
+                        <span class="stats-label">Max Grade</span>
+                        <span class="stats-val">
+                            <span id="stats-max-up" class="stats-interactive">--</span>
+                            /
+                            <span id="stats-max-down" class="stats-interactive">--</span>
+                        </span>
                     </div>
                 </div>
             </div>
