@@ -1120,8 +1120,8 @@ function createMarker(lngLat, index, initialMode) {
         .setLngLat(lngLat)
         .addTo(map);
 
-    const onMiddleClick = (evt) => {
-        if (evt.button === 1) { // middle click
+    const onRightClick = (evt) => {
+        if (evt.button === 2) { // Right click
             evt.preventDefault();
             evt.stopPropagation();
             const idx = markers.indexOf(marker);
@@ -1141,8 +1141,20 @@ function createMarker(lngLat, index, initialMode) {
             }
         }
     };
-    marker.getElement().addEventListener('mousedown', onMiddleClick);
-    marker.getElement().addEventListener('auxclick', onMiddleClick);
+    marker.getElement().addEventListener('mousedown', (evt) => {
+        if (evt.button !== 0) {
+            if (evt.button === 2) {
+                onRightClick(evt);
+            }
+            evt.preventDefault();
+            evt.stopPropagation();
+        }
+    }, true);
+    marker.getElement().addEventListener('auxclick', onRightClick);
+    marker.getElement().addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+    });
 
     // Mobile Long-Press Deletion
     let markerTouchStart = null;
@@ -1441,6 +1453,14 @@ function onLineDown(e) {
 map.on('click', (e) => {
     if (e.originalEvent.button !== 0) return; // Left click only
     if (wasDraggingLine) return;
+
+    // Check if the click is on or too close to an existing waypoint
+    const clickedPoint = e.point;
+    const tooClose = waypoints.some(wp => {
+        const wpPoint = map.project(new maplibregl.LngLat(wp[0], wp[1]));
+        return Math.hypot(clickedPoint.x - wpPoint.x, clickedPoint.y - wpPoint.y) < 20;
+    });
+    if (tooClose) return;
 
     // Toggle individual segment mode if clicking on the route
     if (lastSegIdx !== -1) {
@@ -1947,18 +1967,100 @@ document.getElementById('clear-route').addEventListener('click', () => {
     updateUndoRedoBtns();
 });
 
+function getFitBoundsPadding() {
+    const mapContainer = map.getContainer();
+    const mapRect = mapContainer ? mapContainer.getBoundingClientRect() : null;
+    if (!mapRect || mapRect.width === 0 || mapRect.height === 0) {
+        return 60;
+    }
+
+    // Default base padding in pixels
+    let padding = { top: 60, bottom: 60, left: 60, right: 60 };
+
+    function applyPanelPadding(panelId) {
+        const isComputer = window.innerWidth > 768;
+        if (panelId === 'stats-panel' && !isComputer) {
+            return;
+        }
+
+        const panel = document.getElementById(panelId);
+        if (!panel || panel.offsetWidth === 0 || panel.offsetHeight === 0) {
+            return;
+        }
+        const rect = panel.getBoundingClientRect();
+        
+        // Relative coordinates to map container
+        const panelLeft = rect.left - mapRect.left;
+        const panelRight = rect.right - mapRect.left;
+        const panelTop = rect.top - mapRect.top;
+        const panelBottom = rect.bottom - mapRect.top;
+
+        // Check if it overlaps the map container
+        if (rect.bottom >= mapRect.top && rect.top <= mapRect.bottom &&
+            rect.right >= mapRect.left && rect.left <= mapRect.right) {
+            
+            const isFullWidth = rect.width >= mapRect.width * 0.85;
+            const isFullHeight = rect.height >= mapRect.height * 0.85;
+
+            if (isComputer && !isFullWidth && !isFullHeight) {
+                // Floating panel on computer: compare screen proportions to decide the best axis to pad.
+                const widthProportion = rect.width / mapRect.width;
+                const heightProportion = rect.height / mapRect.height;
+
+                if (widthProportion > heightProportion) {
+                    // Panel is wide/short: pad vertically
+                    const isTop = (rect.top + rect.height / 2) < (mapRect.top + mapRect.height / 2);
+                    if (isTop) {
+                        const overlapTop = Math.max(0, rect.bottom - mapRect.top);
+                        padding.top = Math.max(padding.top, overlapTop + 20);
+                    } else {
+                        const overlapBottom = Math.max(0, mapRect.bottom - rect.top);
+                        padding.bottom = Math.max(padding.bottom, overlapBottom + 20);
+                    }
+                } else {
+                    // Panel is tall/narrow: pad horizontally
+                    const isLeft = (rect.left + rect.width / 2) < (mapRect.left + mapRect.width / 2);
+                    if (isLeft) {
+                        const overlapLeft = Math.max(0, rect.right - mapRect.left);
+                        padding.left = Math.max(padding.left, overlapLeft + 20);
+                    } else {
+                        const overlapRight = Math.max(0, mapRect.right - rect.left);
+                        padding.right = Math.max(padding.right, overlapRight + 20);
+                    }
+                }
+            } else {
+                // Mobile or full-screen panels:
+                if (isFullWidth || panelId === 'elevation-panel') {
+                    // Default elevation profile style is bottom-aligned
+                    const overlapBottom = Math.max(0, mapRect.bottom - rect.top);
+                    padding.bottom = Math.max(padding.bottom, overlapBottom + 20);
+                } else {
+                    // Default stats panel is left-aligned on mobile
+                    const overlapLeft = Math.max(0, rect.right - mapRect.left);
+                    padding.left = Math.max(padding.left, overlapLeft + 20);
+                }
+            }
+        }
+    }
+
+    applyPanelPadding('elevation-panel');
+    applyPanelPadding('stats-panel');
+
+    return padding;
+}
+
 function fitRoute() {
     if (!currentRouteGeoJSON || currentRouteGeoJSON.coordinates.length === 0) {
         if (waypoints.length > 0) {
             const bounds = new maplibregl.LngLatBounds();
             waypoints.forEach(wp => bounds.extend(wp));
-            map.fitBounds(bounds, { padding: 60, duration: 600 });
+            map.fitBounds(bounds, { padding: getFitBoundsPadding(), duration: 600 });
         }
         return;
     }
     const bounds = new maplibregl.LngLatBounds();
     currentRouteGeoJSON.coordinates.forEach(c => bounds.extend(c));
-    map.fitBounds(bounds, { padding: 60, duration: 600 });
+    map.fitBounds(bounds, { padding: getFitBoundsPadding(), duration: 600 });
 }
 
 document.getElementById('fit-route-btn').addEventListener('click', fitRoute);
@@ -1967,16 +2069,6 @@ document.getElementById('current-location-btn')?.addEventListener('click', () =>
 document.getElementById('reset-orientation-btn')?.addEventListener('click', () => {
     map.flyTo({ bearing: 0, pitch: 0 });
 });
-
-function toggleSettings(event) {
-    const menu = document.getElementById('settings-menu');
-    if (menu.style.display === 'none' || menu.style.display === '') {
-        menu.style.display = 'block';
-    } else {
-        menu.style.display = 'none';
-    }
-    if (event) event.stopPropagation();
-}
 
 // --- Search and Shortcuts ---
 
@@ -2382,7 +2474,7 @@ function importGPX(file) {
 
                 const bounds = new maplibregl.LngLatBounds();
                 coords.forEach(c => bounds.extend(c));
-                map.fitBounds(bounds, { padding: 60, maxZoom: 17, duration: 700 });
+                map.fitBounds(bounds, { padding: getFitBoundsPadding(), maxZoom: 17, duration: 700 });
             } else {
                 // Route/waypoints — create markers and route via OSRM / direct
                 const pts = rtepts.length > 0 ? rtepts : wpts;
@@ -2514,9 +2606,6 @@ function updateStatsToggleBtn() {
 function toggleSettings(event) {
     if (event) event.stopPropagation();
     document.getElementById('settings-menu').classList.toggle('show');
-    document.getElementById('stats-panel').classList.remove('show');
-    localStorage.setItem('stats_panel_visible', 'false');
-    updateStatsToggleBtn();
 }
 
 function toggleStatsPanel(event) {
@@ -2529,7 +2618,6 @@ function toggleStatsPanel(event) {
     } else {
         panel.classList.add('show');
         localStorage.setItem('stats_panel_visible', 'true');
-        document.getElementById('settings-menu').classList.remove('show');
     }
     updateStatsToggleBtn();
 }
@@ -3867,7 +3955,7 @@ function loadUrlState() {
             for (const wp of waypoints) {
                 bounds.extend(wp);
             }
-            map.fitBounds(bounds, { padding: 50, duration: 0 }); // Instant fit on load
+            map.fitBounds(bounds, { padding: getFitBoundsPadding(), duration: 0 }); // Instant fit on load
             // After camera settles and tiles load, force an elevation refresh
             map.once('idle', () => {
                 needsElevationUpdate = true;
