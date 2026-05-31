@@ -883,6 +883,20 @@ body.light-mode .custom-tooltip {
     color: #ef4444 !important;
 }
 
+.stats-interactive {
+    cursor: pointer;
+    border-bottom: 1px dotted;
+    text-decoration: none;
+    padding-bottom: 1px;
+}
+
+.help-interactive {
+    cursor: help;
+    border-bottom: 1px dotted;
+    text-decoration: none;
+    padding-bottom: 1px;
+}
+
 @media (max-width: 768px) {
     #top-bar {
         /* Add safe-area-inset-top to prevent the status bar/notch from overlapping the top padding! */

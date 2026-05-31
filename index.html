@@ -265,6 +265,16 @@
                             <input type="number" id="terrain-exaggeration" step="0.1" min="0" max="20" value="2.0"
                                 style="width: 60px; background:var(--bg-panel); color:var(--text-main); border:1px solid var(--border); border-radius:4px; padding:2px 5px;">
                         </div>
+                        <hr style="border:0; border-top: 1px solid var(--border); margin: 8px 0;">
+                        <div class="setting-row">
+                            <span title="Your speed on flat terrain with no wind" class="help-interactive">Speed</span>
+                            <div style="display: flex; align-items: center; gap: 4px;">
+                                <input type="number" id="base-speed-input" step="0.1" min="1" max="100"
+                                    style="width: 60px; background:var(--bg-panel); color:var(--text-main); border:1px solid var(--border); border-radius:4px; padding:2px 5px;">
+                                <span id="speed-unit-label"
+                                    style="font-size: 0.8rem; color: var(--text-muted);">km/h</span>
+                            </div>
+                        </div>
                         <div class="setting-row">
                             <span>Allow Ferries</span>
                             <label class="switch">
@@ -300,13 +310,15 @@
                         <span class="stats-val" id="stats-distance">--</span>
                     </div>
                     <div class="stats-row">
+                        <span class="stats-label">Est. Time</span>
+                        <span class="stats-val" id="stats-time">--</span>
+                    </div>
+                    <div class="stats-row">
                         <span class="stats-label">Elevation Min/Max</span>
                         <span class="stats-val">
-                            <span id="stats-min"
-                                style="cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px;">--</span>
+                            <span id="stats-min" class="stats-interactive">--</span>
                             /
-                            <span id="stats-max"
-                                style="cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px;">--</span>
+                            <span id="stats-max" class="stats-interactive">--</span>
                         </span>
                     </div>
                     <div class="stats-row">
@@ -327,13 +339,11 @@
                     </div>
                     <div class="stats-row">
                         <span class="stats-label">Max Uphill Grade</span>
-                        <span class="stats-val" id="stats-max-up"
-                            style="cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px;">--</span>
+                        <span class="stats-val stats-interactive" id="stats-max-up">--</span>
                     </div>
                     <div class="stats-row">
                         <span class="stats-label">Max Downhill Grade</span>
-                        <span class="stats-val" id="stats-max-down"
-                            style="cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px;">--</span>
+                        <span class="stats-val stats-interactive" id="stats-max-down">--</span>
                     </div>
                 </div>
             </div>

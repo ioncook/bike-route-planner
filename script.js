@@ -207,6 +207,7 @@ let bestCiGlobal = -1; // Exported from mousemove for use in dragging
 let waypointPathIndices = []; // Indices in currentRouteGeoJSON.coordinates where waypoints reside
 let lastSegIdx = -1;
 let currentRoutingMode = 'bike'; // 'bike' or 'direct'
+let currentBaseSpeedKmh = parseFloat(localStorage.getItem('route_base_speed')) || 18;
 
 function decodePolyline6(str) {
     let index = 0, lat = 0, lng = 0, coordinates = [];
@@ -380,7 +381,7 @@ function miterInsideCorners(coords) {
     mapping.push([result.length, result.length]);
     toRaw.push(coords.length - 1);
     result.push(coords[coords.length - 1]);
-    
+
     rawIndexToDisplayRange = mapping;
     displayIndexToRawIndex = toRaw;
     return result;
@@ -445,7 +446,7 @@ function showHoverSegment(ci) {
     lastSegIdx = segIdx;
     const startIndex = waypointPathIndices[segIdx];
     const endIndex = waypointPathIndices[segIdx + 1];
-    
+
     let subCoords;
     let displayStart = 0;
     let displayEnd = 0;
@@ -2315,6 +2316,7 @@ document.getElementById('units').addEventListener('change', (e) => {
     currentUnits = e.target.value;
     localStorage.setItem('route_units', currentUnits);
     updateDistanceUI();
+    updateSpeedSettingUI();
     // Force chart to re-render with new units (elevation data is cached in the worker tile cache)
     needsElevationUpdate = true;
     if (typeof updateElevationProfile === 'function') updateElevationProfile();
@@ -2486,6 +2488,7 @@ function toggleSettings(event) {
     if (event) event.stopPropagation();
     document.getElementById('settings-menu').classList.toggle('show');
     document.getElementById('stats-panel').classList.remove('show');
+    localStorage.setItem('stats_panel_visible', 'false');
 }
 
 function toggleStatsPanel(event) {
@@ -2494,8 +2497,10 @@ function toggleStatsPanel(event) {
     const isShow = panel.classList.contains('show');
     if (isShow) {
         panel.classList.remove('show');
+        localStorage.setItem('stats_panel_visible', 'false');
     } else {
         panel.classList.add('show');
+        localStorage.setItem('stats_panel_visible', 'true');
         document.getElementById('settings-menu').classList.remove('show');
     }
 }
@@ -2504,6 +2509,7 @@ document.getElementById('total-distance').addEventListener('click', toggleStatsP
 document.getElementById('close-stats-btn').addEventListener('click', (e) => {
     e.stopPropagation();
     document.getElementById('stats-panel').classList.remove('show');
+    localStorage.setItem('stats_panel_visible', 'false');
 });
 
 window.addEventListener('click', () => {
@@ -2513,10 +2519,192 @@ window.addEventListener('click', () => {
 document.getElementById('settings-menu').addEventListener('click', e => e.stopPropagation());
 document.getElementById('stats-panel').addEventListener('click', e => e.stopPropagation());
 
-function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedSegmentGrades) {
+let activeWeatherQueryToken = 0;
+const windForecastCache = new Map();
+
+async function fetchWindAtCoordinates(lat, lng) {
+    const latRounded = Math.round(lat * 100) / 100;
+    const lngRounded = Math.round(lng * 100) / 100;
+    const cacheKey = `${latRounded},${lngRounded}`;
+
+    if (windForecastCache.has(cacheKey)) {
+        return windForecastCache.get(cacheKey);
+    }
+
+    try {
+        const url = `https://api.open-meteo.com/v1/forecast?latitude=${latRounded}&longitude=${lngRounded}&current=wind_speed_10m,wind_direction_10m&wind_speed_unit=kmh`;
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`Weather fetch failed: ${resp.status}`);
+        const data = await resp.json();
+
+        const result = {
+            windSpeedKmh: data.current?.wind_speed_10m ?? 0,
+            windDir: data.current?.wind_direction_10m ?? 0
+        };
+        windForecastCache.set(cacheKey, result);
+        return result;
+    } catch (e) {
+        console.warn(`Could not fetch wind forecast at ${cacheKey}:`, e);
+        return { windSpeedKmh: 0, windDir: 0 };
+    }
+}
+
+function getRouteWeatherSamples() {
+    if (!currentRouteGeoJSON || !routePathDistances || routePathDistances.length < 2) return [];
+
+    const coords = currentRouteGeoJSON.coordinates;
+    const totalDist = routeTotalDist;
+    const interval = Math.max(totalDist / 10, 3218.68); // 1/10th or 2 miles in meters
+
+    const samples = [];
+    let nextTarget = 0;
+
+    for (let i = 0; i < coords.length; i++) {
+        const d = routePathDistances[i];
+        if (d >= nextTarget || i === coords.length - 1) {
+            samples.push({
+                coord: coords[i],
+                rawIdx: i,
+                dist: d
+            });
+            nextTarget += interval;
+        }
+    }
+    return samples;
+}
+
+async function fetchRouteWindData(samples) {
+    const promises = samples.map(s => fetchWindAtCoordinates(s.coord[1], s.coord[0]));
+    const results = await Promise.all(promises);
+    return samples.map((s, idx) => ({
+        ...s,
+        windSpeedKmh: results[idx].windSpeedKmh,
+        windDir: results[idx].windDir
+    }));
+}
+
+function getWindForDistance(routeDist, windSamples) {
+    if (!windSamples || windSamples.length === 0) return { windSpeedKmh: 0, windDir: 0 };
+
+    let closestSample = windSamples[0];
+    let minDiff = Infinity;
+
+    for (const s of windSamples) {
+        const diff = Math.abs(s.dist - routeDist);
+        if (diff < minDiff) {
+            minDiff = diff;
+            closestSample = s;
+        }
+    }
+    return closestSample;
+}
+
+function computeDetailedTimeEstimates(coords, elevations, mode, windSamples) {
+    if (!coords || coords.length < 2) return { baseMin: 0, windMin: 0 };
+
+    let totalBaseMin = 0;
+    let totalWindMin = 0;
+
+    const baseSpeed = currentBaseSpeedKmh;
+    const headwindFactor = (mode === 'hike') ? 0.05 : 0.25;
+    const minSpeed = (mode === 'hike') ? 1.5 : 5;
+    const maxSpeed = (mode === 'hike') ? 8 : 50;
+    const ascentPenalty = (mode === 'hike') ? 0.1 : 0.0833;
+
+    let lastBearing = undefined;
+
+    for (let i = 0; i < coords.length - 1; i++) {
+        const d = haversineDistance(coords[i], coords[i + 1]);
+        if (d <= 0) continue;
+
+        let bearing = 0;
+        if (d > 15) {
+            bearing = getBearing(coords[i], coords[i + 1]);
+            lastBearing = bearing;
+        } else if (lastBearing !== undefined) {
+            bearing = lastBearing;
+        } else {
+            // Find next point that is at least 15m away to get a stable initial bearing
+            let nextIdx = i + 1;
+            while (nextIdx < coords.length && haversineDistance(coords[i], coords[nextIdx]) < 15) {
+                nextIdx++;
+            }
+            if (nextIdx < coords.length) {
+                bearing = getBearing(coords[i], coords[nextIdx]);
+                lastBearing = bearing;
+            } else {
+                bearing = getBearing(coords[i], coords[i + 1]);
+            }
+        }
+
+        const midDist = (routePathDistances[i] + routePathDistances[i + 1]) / 2;
+        const wind = getWindForDistance(midDist, windSamples);
+
+        let segmentBaseSpeed = baseSpeed;
+        if (mode === 'hike') {
+            segmentBaseSpeed = 4.5;
+        }
+
+        // Base time (flat + climb)
+        const baseFlatMin = (d / 1000) / segmentBaseSpeed * 60;
+
+        // Wind-adjusted time (flat adjusted + climb)
+        const relAngle = wind.windDir - bearing;
+        const headwind = wind.windSpeedKmh * Math.cos(relAngle * Math.PI / 180);
+        let adjSpeed = segmentBaseSpeed - (headwind * headwindFactor);
+        adjSpeed = Math.max(minSpeed, Math.min(maxSpeed, adjSpeed));
+        const windFlatMin = (d / 1000) / adjSpeed * 60;
+
+        // Climbing penalty
+        let climbMin = 0;
+        if (elevations && elevations[i] != null && elevations[i + 1] != null) {
+            const elevDiff = elevations[i + 1] - elevations[i];
+            if (elevDiff > 0) {
+                climbMin = elevDiff * ascentPenalty;
+            }
+        }
+
+        totalBaseMin += baseFlatMin + climbMin;
+        totalWindMin += windFlatMin + climbMin;
+    }
+
+    return { baseMin: totalBaseMin, windMin: totalWindMin };
+}
+
+function getEstimatedTime(distanceMeters, elevationGainMeters, mode) {
+    if (distanceMeters <= 0) return 0;
+
+    let speedKmh = currentBaseSpeedKmh;
+    let ascentPenaltyMinPerMeter = 0.0833; // 1 min per 12m gain
+
+    if (mode === 'hike') {
+        speedKmh = 4.5;
+        ascentPenaltyMinPerMeter = 0.1; // 1 min per 10m gain (Naismith's rule)
+    } else if (mode === 'direct') {
+        speedKmh = 16;
+        ascentPenaltyMinPerMeter = 0.0833;
+    }
+
+    const flatTimeMin = (distanceMeters / 1000) / speedKmh * 60;
+    const climbTimeMin = elevationGainMeters * ascentPenaltyMinPerMeter;
+    return flatTimeMin + climbTimeMin;
+}
+
+function formatDuration(minutes) {
+    if (!minutes || minutes <= 0) return '--';
+    const hrs = Math.floor(minutes / 60);
+    const mins = Math.round(minutes % 60);
+    if (hrs > 0) {
+        return `${hrs}h ${mins}m`;
+    }
+    return `${mins}m`;
+}
+
+async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedSegmentGrades) {
     const hasRoute = waypoints.length >= 2 && currentRouteGeoJSON && currentRouteGeoJSON.coordinates.length > 0;
     if (!hasRoute) {
         document.getElementById('stats-distance').textContent = '--';
+        document.getElementById('stats-time').textContent = '--';
         document.getElementById('stats-ascent').textContent = '--';
         document.getElementById('stats-descent').textContent = '--';
 
@@ -2545,6 +2733,34 @@ function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedSegment
         distText = distanceMi + ' mi';
     }
     document.getElementById('stats-distance').textContent = distText;
+
+    // First display base time immediately
+    const baseMinutes = getEstimatedTime(currentDistanceMeters, totalGainM, currentRoutingMode);
+    document.getElementById('stats-time').textContent = formatDuration(baseMinutes);
+
+    // Fetch route-level wind data asynchronously
+    const queryToken = ++activeWeatherQueryToken;
+    const samples = getRouteWeatherSamples();
+    if (samples.length > 0) {
+        fetchRouteWindData(samples).then(windSamples => {
+            if (queryToken !== activeWeatherQueryToken) return; // stale query
+
+            const coords = currentRouteGeoJSON.coordinates;
+            const elevations = currentStats ? currentStats.elevations : null;
+            const estimates = computeDetailedTimeEstimates(coords, elevations, currentRoutingMode, windSamples);
+
+            if (estimates.windMin > 0 && queryToken === activeWeatherQueryToken) {
+                const baseTimeStr = formatDuration(estimates.baseMin);
+                const windTimeStr = formatDuration(estimates.windMin);
+                const hasSignificantWind = windSamples.some(s => s.windSpeedKmh > 3);
+                if (hasSignificantWind) {
+                    document.getElementById('stats-time').textContent = `${windTimeStr}`;
+                } else {
+                    document.getElementById('stats-time').textContent = baseTimeStr;
+                }
+            }
+        }).catch(err => console.warn('Wind stats calc error:', err));
+    }
 
     const unitLabel = currentUnits === 'metric' ? 'm' : 'ft';
     const gainVal = currentUnits === 'metric' ? totalGainM : totalGainM * 3.28084;
@@ -2634,6 +2850,20 @@ function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedSegment
     });
 }
 
+function updateSpeedSettingUI() {
+    const input = document.getElementById('base-speed-input');
+    const label = document.getElementById('speed-unit-label');
+    if (!input || !label) return;
+
+    if (currentUnits === 'metric') {
+        input.value = currentBaseSpeedKmh.toFixed(1);
+        label.textContent = 'km/h';
+    } else {
+        input.value = (currentBaseSpeedKmh * 0.621371).toFixed(1);
+        label.textContent = 'mph';
+    }
+}
+
 function loadStoredSettings() {
     const mode = localStorage.getItem('route_routing_mode');
     if (mode) {
@@ -2661,6 +2891,23 @@ function loadStoredSettings() {
         document.getElementById('units').value = units;
         updateDistanceUI();
     }
+
+    // Initialize speed input and unit label
+    updateSpeedSettingUI();
+    document.getElementById('base-speed-input').addEventListener('input', (e) => {
+        const val = parseFloat(e.target.value) || 0;
+        if (val > 0) {
+            if (currentUnits === 'metric') {
+                currentBaseSpeedKmh = val;
+            } else {
+                currentBaseSpeedKmh = val / 0.621371;
+            }
+            localStorage.setItem('route_base_speed', currentBaseSpeedKmh);
+            if (currentStats && typeof updateStatsUI === 'function') {
+                updateStatsUI(currentStats.gain, currentStats.loss, currentStats.min, currentStats.max, currentStats.grades);
+            }
+        }
+    });
 
     // Projection — safe after load
     const proj = localStorage.getItem('route_projection');
@@ -2707,6 +2954,12 @@ function loadStoredSettings() {
         locationEl.checked = showLocationVal !== null ? showLocationVal === 'true' : true;
     }
     updateUserLocationPin();
+
+    // Restore stats panel visibility
+    const statsVisible = localStorage.getItem('stats_panel_visible');
+    if (statsVisible === 'true') {
+        document.getElementById('stats-panel').classList.add('show');
+    }
 }
 
 document.getElementById('allow-ferries-check')?.addEventListener('change', (e) => {
@@ -3475,7 +3728,8 @@ async function updateElevationProfile() {
             maxDownGrade: maxDownGrade,
             maxUpIdx: maxUpIdx,
             maxDownIdx: maxDownIdx,
-            grades: [...smoothedSegmentGrades]
+            grades: [...smoothedSegmentGrades],
+            elevations: [...elevations]
         };
         updateStatsUI(currentStats.gain, currentStats.loss, currentStats.min, currentStats.max, currentStats.grades);
         needsElevationUpdate = false;
