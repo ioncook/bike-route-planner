@@ -943,6 +943,10 @@ function findClosestPointOnLine(mousePt) {
 
 map.on('mousemove', 'route-line', (e) => {
     if (window.innerWidth <= 768) return; // Disable hover interaction on mobile
+    if (isDraggingLine || isDraggingMarker) {
+        clearHoverHighlight();
+        return;
+    }
     if (map.isMoving() || map.isZooming() || map.isRotating()) {
         clearHoverHighlight();
         return;
@@ -1189,6 +1193,7 @@ function createMarker(lngLat, index, initialMode) {
         }
         window._currentlyDraggingMarkerCancel = false;
         console.log('[Antigravity] Marker dragstart. idx:', idx, 'Original location set to:', window._currentlyDraggingMarkerOriginalLngLat);
+        hideHoverMarker();
         saveHistory();
     });
 
@@ -1213,6 +1218,7 @@ function createMarker(lngLat, index, initialMode) {
         window._currentlyDraggingMarker = null;
         window._currentlyDraggingMarkerOriginalLngLat = null;
         map.getSource('drag-guide')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [] } });
+        hideHoverMarker();
         const idx = markers.indexOf(marker);
         if (idx > -1) {
             invalidateGPXSegment(idx);
@@ -1379,6 +1385,7 @@ function onLineDown(e) {
     }
 
     saveHistory();
+    hideHoverMarker();
     isDraggingLine = true;
     wasDraggingLine = true;
     map.dragPan.disable();
@@ -1417,6 +1424,7 @@ function onLineDown(e) {
         map.off('touchend', onUp);
 
         map.getSource('drag-guide')?.setData({ type: 'LineString', coordinates: [] });
+        hideHoverMarker();
         const pm = window._dragPreviewMarker;
         if (pm && pm._added) { pm.remove(); pm._added = false; }
 
@@ -1441,6 +1449,7 @@ function onLineDown(e) {
         map.off('touchend', onUp);
 
         map.getSource('drag-guide')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [] } });
+        hideHoverMarker();
         const pm = window._dragPreviewMarker;
         if (pm && pm._added) { pm.remove(); pm._added = false; }
 
@@ -1737,9 +1746,13 @@ async function fetchOneSegment(from, to, mode, avoidUnpaved, excludeParam, signa
     const ferryVal = allowFerries ? '1' : '0';
 
     try {
-        const bProfile = (mode === 'hike') ? 'trekking' : 'safety';
+        const bProfile = (mode === 'hike') ? 'trekking' : 'fastbike-lowtraffic';
+        let bRouterUrl = `https://brouter.de/brouter?lonlats=${from[0]},${from[1]}|${to[0]},${to[1]}&profile=${bProfile}&alternativeidx=0&format=geojson&profile:allow_ferries=${ferryVal}`;
+        if (avoidUnpaved) {
+            bRouterUrl += `&profile:avoid_unpaved=1&profile:avoid_gravel=1`;
+        }
         const endpoints = [
-            `https://brouter.de/brouter?lonlats=${from[0]},${from[1]}|${to[0]},${to[1]}&profile=${bProfile}&alternativeidx=0&format=geojson&profile:allow_ferries=${ferryVal}`,
+            bRouterUrl,
             `https://routing.openstreetmap.de/routed-bike/route/v1/bicycle/${from[0]},${from[1]};${to[0]},${to[1]}?overview=full&geometries=geojson`,
             `https://router.project-osrm.org/route/v1/cycling/${from[0]},${from[1]};${to[0]},${to[1]}?overview=full&geometries=geojson`
         ];
@@ -1806,12 +1819,6 @@ async function updateRoute() {
         return;
     }
 
-    const avoidUnpaved = document.getElementById('avoid-unpaved-check')?.checked ?? false;
-
-    let exclude = [];
-    if (avoidUnpaved) exclude.push('unpaved');
-    const excludeParam = exclude.length > 0 ? `&exclude=${exclude.join(',')}` : '';
-
     // --- Routing phase: fetch ALL segments in parallel ---
     const numSegs = waypoints.length - 1;
     setStatus(numSegs === 1 ? 'Routing…' : `Routing ${numSegs} segments…`);
@@ -1821,6 +1828,10 @@ async function updateRoute() {
         const segmentPromises = [];
         for (let i = 0; i < numSegs; i++) {
             const mode = segmentModes[i] || 'bike';
+            const avoidUnpaved = (mode !== 'hike');
+            let exclude = [];
+            if (avoidUnpaved) exclude.push('unpaved');
+            const excludeParam = exclude.length > 0 ? `&exclude=${exclude.join(',')}` : '';
             segmentPromises.push(fetchOneSegment(waypoints[i], waypoints[i + 1], mode, avoidUnpaved, excludeParam, signal, i));
         }
         segments = await Promise.all(segmentPromises);
@@ -3068,11 +3079,6 @@ function loadStoredSettings() {
     applyTerrain();
 
     // Routing options
-    const unpavedVal = localStorage.getItem('route_avoid_unpaved_check');
-    if (unpavedVal !== null) {
-        const el = document.getElementById('avoid-unpaved-check');
-        if (el) el.checked = unpavedVal === 'true';
-    }
 
     const allowFerriesVal = localStorage.getItem('route_allow_ferries_check');
     if (allowFerriesVal !== null) {
