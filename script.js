@@ -79,54 +79,12 @@ const map = new maplibregl.Map({
     }
 });
 
-// Custom Right-Click Rotation & Tilt Handler
-let isMCRotating = false;
-let mcStartX, mcStartY, mcStartBearing, mcStartPitch;
-let lastMCTime = 0;
+// Enable native right-click tilt/rotate controls (MapLibre's built-in dragRotate is highly optimized)
+map.dragRotate.enable();
+map.touchZoomRotate.enable(); // No 'around: center' — use finger midpoint for pinch zoom/rotate
 
 // Middle-click popup helper
 let middleClickStartX = null, middleClickStartY = null;
-
-map.getCanvasContainer().addEventListener('mousedown', (e) => {
-    if (e.button === 2) { // Right mouse button — rotate & tilt
-        const now = Date.now();
-        if (now - lastMCTime < 400) {
-            map.flyTo({ pitch: 0, bearing: 0 });
-            isMCRotating = false;
-            lastMCTime = 0;
-            return;
-        }
-        lastMCTime = now;
-
-        isMCRotating = true;
-        mcStartX = e.clientX;
-        mcStartY = e.clientY;
-        mcStartBearing = map.getBearing();
-        mcStartPitch = map.getPitch();
-        map.getCanvas().style.cursor = 'grabbing';
-        e.preventDefault(); // Prevent context menu
-    }
-}, true);
-
-window.addEventListener('mousemove', (e) => {
-    if (isMCRotating) {
-        const dx = e.clientX - mcStartX;
-        const dy = e.clientY - mcStartY;
-        map.setBearing(mcStartBearing + (dx * 0.4));
-        map.setPitch(Math.min(85, Math.max(0, mcStartPitch - (dy * 0.4))));
-    }
-});
-
-window.addEventListener('mouseup', (e) => {
-    if (isMCRotating && e.button === 2) {
-        isMCRotating = false;
-        map.getCanvas().style.cursor = '';
-    }
-});
-
-// Disable default right-click context menu rotation; we handle it ourselves
-map.dragRotate.disable();
-map.touchZoomRotate.enable(); // No 'around: center' — use finger midpoint for pinch zoom/rotate
 
 function buildRasterStyle(tileUrl) {
     const tiles = Array.isArray(tileUrl) ? tileUrl : [tileUrl];
@@ -659,7 +617,7 @@ function setupRouteLayers() {
 
     // Hillshade can use the same source as terrain to save memory and network
     if (!map.getLayer('hillshade-layer'))
-        map.addLayer({ id: 'hillshade-layer', type: 'hillshade', source: 'terrain-source', paint: { 'hillshade-exaggeration': 0.4, 'hillshade-shadow-color': 'rgba(0,0,0,0.5)', 'hillshade-highlight-color': 'rgba(255,255,255,0.1)' }, layout: { visibility: 'none' } });
+        map.addLayer({ id: 'hillshade-layer', type: 'hillshade', source: 'terrain-source', paint: { 'hillshade-exaggeration': 0.5, 'hillshade-shadow-color': 'rgba(0,0,0,0.5)', 'hillshade-highlight-color': 'rgba(255,255,255,0.1)' }, layout: { visibility: 'none' } });
 
     // Route sources (Removed tolerance:0 to allow MapLibre to simplify geometry based on zoom level)
     if (!map.getSource('route'))
@@ -1207,7 +1165,7 @@ function cancelDraggingGestures() {
         console.log('[Antigravity] Cancelling active line drag...');
         window._activeLineDragCleanup();
     }
-    
+
     const marker = window._currentlyDraggingMarker;
     const orig = window._currentlyDraggingMarkerOriginalLngLat;
     console.log('[Antigravity] Active marker to cancel:', marker, 'Original location:', orig);
@@ -1215,7 +1173,7 @@ function cancelDraggingGestures() {
         window._currentlyDraggingMarkerCancel = true;
         console.log('[Antigravity] Reverting marker setLngLat to:', orig.lng, orig.lat);
         marker.setLngLat(orig);
-        
+
         // Call MapLibre's internal cleanup methods directly to terminate dragging state
         try {
             if (typeof marker._onUp === 'function') {
@@ -1375,7 +1333,7 @@ function onLineDown(e) {
         map.getSource('drag-guide')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [] } });
         const pm = window._dragPreviewMarker;
         if (pm && pm._added) { pm.remove(); pm._added = false; }
-        
+
         wasDraggingLine = true;
         setTimeout(() => wasDraggingLine = false, 100);
         window._activeLineDragCleanup = null;
@@ -2391,11 +2349,11 @@ function applyTerrain() {
         if (map.getTerrain()) map.setTerrain(null);
     } else if (val === 'hillshade') {
         map.setLayoutProperty('hillshade-layer', 'visibility', 'visible');
-        map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', Math.min(1.0, exVal / 2));
+        map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', 0.5);
         if (map.getTerrain()) map.setTerrain(null);
     } else if (val === 'terrain') {
         map.setLayoutProperty('hillshade-layer', 'visibility', 'visible');
-        map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', Math.min(1.0, exVal / 2));
+        map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', 0.5);
         map.setTerrain({ source: 'terrain-source', exaggeration: exVal });
     }
 
