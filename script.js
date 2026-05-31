@@ -70,6 +70,7 @@ const map = new maplibregl.Map({
     center: initialCenter,
     zoom: initialZoom,
     maxZoom: 20,
+    maxPitch: 85,
     projection: { type: localStorage.getItem('route_projection') || 'mercator' },
     antialias: false,
     fadeDuration: 0,
@@ -78,6 +79,22 @@ const map = new maplibregl.Map({
         // No custom headers to avoid CORS preflight failures on tile servers
     }
 });
+
+// Double right-click capture to reset orientation
+let lastRightClickTime = 0;
+map.getCanvasContainer().addEventListener('mousedown', (e) => {
+    if (e.button === 2) { // Right mouse button
+        const now = Date.now();
+        if (now - lastRightClickTime < 350) {
+            e.preventDefault();
+            e.stopPropagation();
+            map.flyTo({ bearing: 0, pitch: 0 });
+            lastRightClickTime = 0;
+            return;
+        }
+        lastRightClickTime = now;
+    }
+}, true);
 
 // Enable native right-click tilt/rotate controls (MapLibre's built-in dragRotate is highly optimized)
 map.dragRotate.enable();
@@ -242,6 +259,10 @@ function rebuildRouteScreenPts() {
 }
 
 let currentDisplayCoords = null; // Miter-corrected display coords, updated by rebuildMapGradient
+let rawIndexToDisplayRange = []; // Maps raw coordinates index to [displayStart, displayEnd] indices
+let displayIndexToRawIndex = []; // Maps display coordinates index to raw coordinate index
+let displayMercatorDistances = []; // Cumulative Mercator distances of displayCoords
+let displayMercTotalDist = 0;
 
 // Fixes the line-offset inside-corner overlap at sharp right turns ONLY.
 // For positive line-offset (right side), a right turn puts the offset on the
@@ -250,12 +271,24 @@ let currentDisplayCoords = null; // Miter-corrected display coords, updated by r
 // both segments so they meet cleanly. Left turns (outside gap) are untouched.
 // Only modifies the display source — currentRouteGeoJSON is never changed.
 function miterInsideCorners(coords) {
-    if (coords.length < 3) return coords;
+    if (coords.length < 3) {
+        rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
+        displayIndexToRawIndex = coords.map((_, i) => i);
+        return coords;
+    }
     const pxOffset = getPixelOffset(map.getZoom());
-    if (pxOffset < 1) return coords; // No visible offset at low zooms
+    if (pxOffset < 1) { // No visible offset at low zooms
+        rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
+        displayIndexToRawIndex = coords.map((_, i) => i);
+        return coords;
+    }
 
     const result = [coords[0]];
+    const mapping = [[0, 0]];
+    const toRaw = [0];
+
     for (let i = 1; i < coords.length - 1; i++) {
+        const currentLen = result.length;
         const p1 = coords[i - 1], p2 = coords[i], p3 = coords[i + 1];
 
         // Signed deflection angle. Positive = right turn.
@@ -265,7 +298,12 @@ function miterInsideCorners(coords) {
 
         // Only fix right turns > 30° — these are inside corners for positive offset.
         // Left turns produce a gap (not overlap), already handled by turnaround staples.
-        if (d < 30) { result.push(p2); continue; }
+        if (d < 30) {
+            result.push(p2);
+            mapping.push([currentLen, currentLen]);
+            toRaw.push(i);
+            continue;
+        }
 
         const sc = map.project(p2);
         const s1 = map.project(p1);
@@ -273,12 +311,22 @@ function miterInsideCorners(coords) {
 
         const ivX = sc.x - s1.x, ivY = sc.y - s1.y;
         const iLen = Math.sqrt(ivX * ivX + ivY * ivY);
-        if (iLen < 1) { result.push(p2); continue; }
+        if (iLen < 1) {
+            result.push(p2);
+            mapping.push([currentLen, currentLen]);
+            toRaw.push(i);
+            continue;
+        }
         const idX = ivX / iLen, idY = ivY / iLen;
 
         const ovX = s3.x - sc.x, ovY = s3.y - sc.y;
         const oLen = Math.sqrt(ovX * ovX + ovY * ovY);
-        if (oLen < 1) { result.push(p2); continue; }
+        if (oLen < 1) {
+            result.push(p2);
+            mapping.push([currentLen, currentLen]);
+            toRaw.push(i);
+            continue;
+        }
         const odX = ovX / oLen, odY = ovY / oLen;
 
         // Right-hand normals for incoming and outgoing directions
@@ -291,7 +339,12 @@ function miterInsideCorners(coords) {
 
         // Intersect: line through (ax,ay) dir (idX,idY) vs line through (bx,by) dir (odX,odY)
         const cross = idX * odY - idY * odX;
-        if (Math.abs(cross) < 1e-10) { result.push(p2); continue; }
+        if (Math.abs(cross) < 1e-10) {
+            result.push(p2);
+            mapping.push([currentLen, currentLen]);
+            toRaw.push(i);
+            continue;
+        }
         const t = ((bx - ax) * odY - (by - ay) * odX) / cross;
         const s = ((bx - ax) * idY - (by - ay) * idX) / cross;
 
@@ -321,8 +374,15 @@ function miterInsideCorners(coords) {
 
         result.push([mPt1.lng, mPt1.lat]);
         result.push([mPt2.lng, mPt2.lat]);
+        mapping.push([currentLen, currentLen + 1]);
+        toRaw.push(i, i);
     }
+    mapping.push([result.length, result.length]);
+    toRaw.push(coords.length - 1);
     result.push(coords[coords.length - 1]);
+    
+    rawIndexToDisplayRange = mapping;
+    displayIndexToRawIndex = toRaw;
     return result;
 }
 
@@ -338,10 +398,19 @@ function rebuildMapGradient() {
     // Using miter-corrected coordinates for the map display.
     const displayCoords = miterInsideCorners(coords);
     currentDisplayCoords = displayCoords; // Store for hover snap engine
+
+    // Calculate display-level Mercator cumulative distances
+    displayMercatorDistances = [0];
+    let dAcc = 0;
+    for (let i = 1; i < displayCoords.length; i++) {
+        dAcc += getMercatorDistance(displayCoords[i - 1], displayCoords[i]);
+        displayMercatorDistances.push(dAcc);
+    }
+    displayMercTotalDist = dAcc;
+
     const gradSrc = map.getSource('route-gradient');
     if (gradSrc) gradSrc.setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: displayCoords } });
     rebuildRouteScreenPts(); // Snap engine must reflect the new display line
-
 
     const grades = routeGrades;
     if (!grades || !routeMercatorDistances || routeMercTotalDist <= 0) {
@@ -352,11 +421,12 @@ function rebuildMapGradient() {
     }
     const gradStops = [];
     let lastFrac = -1;
-    for (let i = 0; i < routeMercatorDistances.length; i++) {
-        const frac = Math.min(Math.max(routeMercatorDistances[i] / routeMercTotalDist, 0), 1);
+    for (let i = 0; i < displayCoords.length; i++) {
+        const frac = Math.min(Math.max(displayMercatorDistances[i] / (displayMercTotalDist || 1), 0), 1);
         if (frac <= lastFrac) continue;
         lastFrac = frac;
-        gradStops.push(frac, getColorForGrade(grades[Math.min(i + 1, grades.length - 1)] ?? 0));
+        const rawIdx = displayIndexToRawIndex[i];
+        gradStops.push(frac, getColorForGrade(grades[Math.min(rawIdx + 1, grades.length - 1)] ?? 0));
     }
     if (map.getLayer('route-gradient-layer'))
         map.setPaintProperty('route-gradient-layer', 'line-gradient',
@@ -375,21 +445,34 @@ function showHoverSegment(ci) {
     lastSegIdx = segIdx;
     const startIndex = waypointPathIndices[segIdx];
     const endIndex = waypointPathIndices[segIdx + 1];
-    const subCoords = miterInsideCorners(currentRouteGeoJSON.coordinates.slice(startIndex, endIndex + 1));
+    
+    let subCoords;
+    let displayStart = 0;
+    let displayEnd = 0;
+    if (rawIndexToDisplayRange && rawIndexToDisplayRange[startIndex] && rawIndexToDisplayRange[endIndex] && currentDisplayCoords) {
+        displayStart = rawIndexToDisplayRange[startIndex][0];
+        displayEnd = rawIndexToDisplayRange[endIndex][0];
+        subCoords = currentDisplayCoords.slice(displayStart, displayEnd + 1);
+    } else {
+        subCoords = currentDisplayCoords ? currentDisplayCoords.slice(startIndex, endIndex + 1) : currentRouteGeoJSON.coordinates.slice(startIndex, endIndex + 1);
+    }
 
     const stops = ['interpolate', ['linear'], ['line-progress']];
-    if (routeGrades && routeMercatorDistances) {
-        const startMerc = routeMercatorDistances[startIndex];
-        const segMercDist = (routeMercatorDistances[endIndex] - startMerc) || 1;
+    if (routeGrades && displayMercatorDistances && displayMercTotalDist > 0 && subCoords) {
+        const startMerc = displayMercatorDistances[displayStart];
+        const segMercDist = (displayMercatorDistances[displayEnd] - startMerc) || 1;
         let lastFrac = -1;
-        for (let k = 0; k < subCoords.length; k++) {
-            const idx = startIndex + k;
-            const frac = Math.min(Math.max((routeMercatorDistances[idx] - startMerc) / segMercDist, 0), 1);
+        for (let displayIdx = displayStart; displayIdx <= displayEnd; displayIdx++) {
+            const frac = Math.min(Math.max((displayMercatorDistances[displayIdx] - startMerc) / segMercDist, 0), 1);
             if (frac <= lastFrac) continue;
             lastFrac = frac;
-            stops.push(frac, getColorForGrade(routeGrades[Math.min(idx + 1, routeGrades.length - 1)] ?? 0));
+            const rawIdx = displayIndexToRawIndex[displayIdx];
+            stops.push(frac, getColorForGrade(routeGrades[Math.min(rawIdx + 1, routeGrades.length - 1)] ?? 0));
         }
-        if (lastFrac < 1) stops.push(1, getColorForGrade(routeGrades[Math.min(endIndex + 1, routeGrades.length - 1)] ?? 0));
+        if (lastFrac < 1) {
+            const rawIdx = displayIndexToRawIndex[displayEnd];
+            stops.push(1, getColorForGrade(routeGrades[Math.min(rawIdx + 1, routeGrades.length - 1)] ?? 0));
+        }
     } else {
         stops.push(0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)');
     }
@@ -613,7 +696,7 @@ function setupRouteLayers() {
     const terrainEncoding = 'terrarium';
 
     if (!map.getSource('terrain-source'))
-        map.addSource('terrain-source', { type: 'raster-dem', tiles: terrainTiles, tileSize: 256, encoding: terrainEncoding, maxzoom: 14 });
+        map.addSource('terrain-source', { type: 'raster-dem', tiles: terrainTiles, tileSize: 256, encoding: terrainEncoding, maxzoom: 12 });
 
     // Hillshade can use the same source as terrain to save memory and network
     if (!map.getLayer('hillshade-layer'))
@@ -779,11 +862,9 @@ map.on('style.load', () => {
             localStorage.setItem('last_map_zoom', map.getZoom().toString());
         } catch (_) { }
     };
-    map.on('zoom', updateView);
     map.on('moveend', updateView);
     map.on('zoomend', () => { isZooming = false; updateView(); });
     map.on('zoomstart', () => { isZooming = true; });
-    map.on('idle', updateView);
 });
 
 map.on('load', () => {
@@ -849,6 +930,10 @@ function findClosestPointOnLine(mousePt) {
 
 map.on('mousemove', 'route-line', (e) => {
     if (window.innerWidth <= 768) return; // Disable hover interaction on mobile
+    if (map.isMoving() || map.isZooming() || map.isRotating()) {
+        clearHoverHighlight();
+        return;
+    }
     const now = performance.now();
     if (now - lastHoverTime < 16) return; // 60fps throttle
     lastHoverTime = now;
@@ -2181,8 +2266,11 @@ window.addEventListener('keydown', (e) => {
         } else {
             deleteLastWaypoint();
         }
+    } else if (key === 'n') {
+        e.preventDefault();
+        map.flyTo({ bearing: 0, pitch: 0 });
     }
-});
+}, true);
 
 // Settings Handlers
 document.getElementById('theme').addEventListener('change', (e) => {
