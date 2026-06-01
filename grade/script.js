@@ -107,300 +107,16 @@ function getDistance(coord1, coord2) {
     const dLon = (coord2[0] - coord1[0]) * Math.PI / 180;
 
     const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-              Math.cos(lat1) * Math.cos(lat2) *
-              Math.sin(dLon / 2) * Math.sin(dLon / 2);
+        Math.cos(lat1) * Math.cos(lat2) *
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     return R * c;
 }
 
-// Densify coordinate list to ensure we have nodes at least every maxSegmentLen meters and at least minPoints nodes
-function densifyCoordinates(coords, maxSegmentLen = 15, minPoints = 5) {
-    const densified = [coords[0]];
-    if (coords.length < 2) return coords;
-
-    // Calculate total way distance
-    let totalDist = 0;
-    for (let i = 0; i < coords.length - 1; i++) {
-        totalDist += getDistance(coords[i], coords[i+1]);
-    }
-
-    // Determine target spacing to satisfy both maxSegmentLen and minPoints
-    let spacing = maxSegmentLen;
-    if (totalDist > 0) {
-        const minSegments = minPoints - 1;
-        const maxSpacingForMinPoints = totalDist / minSegments;
-        spacing = Math.min(maxSegmentLen, maxSpacingForMinPoints);
-    }
-
-    for (let i = 0; i < coords.length - 1; i++) {
-        const p1 = coords[i];
-        const p2 = coords[i+1];
-        const d = getDistance(p1, p2);
-        if (d > spacing) {
-            const steps = Math.ceil(d / spacing);
-            for (let j = 1; j < steps; j++) {
-                const t = j / steps;
-                const lng = p1[0] + t * (p2[0] - p1[0]);
-                const lat = p1[1] + t * (p2[1] - p1[1]);
-                densified.push([lng, lat]);
-            }
-        }
-        densified.push(p2);
-    }
-    return densified;
-}
-
-// Interpolate elevation at any coord along the densified way profile using clamped projection
-function getInterpolatedElevation(coord, denseCoords, denseElevs) {
-    if (denseCoords.length === 0) return null;
-    if (denseCoords.length === 1) return denseElevs[0];
-
-    let minD = Infinity;
-    let bestSegmentIdx = 0; // index of the start of the segment
-    let bestT = 0;
-
-    // Find the segment [i, i+1] that is closest to coord
-    for (let i = 0; i < denseCoords.length - 1; i++) {
-        const A = denseCoords[i];
-        const B = denseCoords[i+1];
-        
-        // Vector projection of coord onto segment AB
-        const dx = B[0] - A[0];
-        const dy = B[1] - A[1];
-        const lenSq = dx * dx + dy * dy;
-        
-        let t = 0;
-        if (lenSq > 0) {
-            const ux = coord[0] - A[0];
-            const uy = coord[1] - A[1];
-            t = (ux * dx + uy * dy) / lenSq;
-            // Clamp projection factor to the segment bounds [0, 1]
-            t = Math.max(0, Math.min(1, t));
-        }
-        
-        // Find the projected point coordinates
-        const projPoint = [A[0] + t * dx, A[1] + t * dy];
-        
-        // Euclidean distance squared (degrees) - extremely fast, avoids heavy trig in inner loop
-        const px = coord[0] - projPoint[0];
-        const py = coord[1] - projPoint[1];
-        const dSq = px * px + py * py;
-        
-        if (dSq < minD) {
-            minD = dSq;
-            bestSegmentIdx = i;
-            bestT = t;
-        }
-    }
-
-    const eStart = denseElevs[bestSegmentIdx];
-    const eEnd = denseElevs[bestSegmentIdx + 1];
-    
-    if (eStart === null || eStart === undefined || eEnd === null || eEnd === undefined) {
-        return eStart ?? eEnd ?? null;
-    }
-
-    return eStart + bestT * (eEnd - eStart);
-}
-
-// Calculate the least squares slope of a segment based on all its node coordinates and elevations
-function calculateLeastSquaresSlope(coords, elevations) {
-    const N = coords.length;
-    if (N < 2) return 0;
-
-    // Calculate cumulative distances along the segment
-    const x = [0];
-    let distAcc = 0;
-    for (let i = 1; i < N; i++) {
-        distAcc += getDistance(coords[i - 1], coords[i]);
-        x.push(distAcc);
-    }
-
-    let sumX = 0;
-    let sumY = 0;
-    let sumXY = 0;
-    let sumXX = 0;
-    let validCount = 0;
-
-    for (let i = 0; i < N; i++) {
-        const xi = x[i];
-        const yi = elevations[i];
-        if (yi === null || yi === undefined) continue;
-        sumX += xi;
-        sumY += yi;
-        sumXY += xi * yi;
-        sumXX += xi * xi;
-        validCount++;
-    }
-
-    if (validCount < 2) return 0;
-
-    const denom = validCount * sumXX - sumX * sumX;
-    if (denom === 0) return 0;
-
-    const slope = (validCount * sumXY - sumX * sumY) / denom;
-    return isNaN(slope) ? 0 : slope;
-}
-
-// Fill any null or undefined elevations in the way using linear interpolation to prevent flat 0% fallbacks
-function fillNullElevations(elevations) {
-    const N = elevations.length;
-    if (N === 0) return;
-
-    let firstNonNullIdx = -1;
-    for (let i = 0; i < N; i++) {
-        if (elevations[i] !== null && elevations[i] !== undefined) {
-            firstNonNullIdx = i;
-            break;
-        }
-    }
-
-    if (firstNonNullIdx === -1) {
-        for (let i = 0; i < N; i++) elevations[i] = 0;
-        return;
-    }
-
-    for (let i = 0; i < firstNonNullIdx; i++) {
-        elevations[i] = elevations[firstNonNullIdx];
-    }
-
-    let lastValidIdx = firstNonNullIdx;
-    for (let i = firstNonNullIdx + 1; i < N; i++) {
-        const v = elevations[i];
-        if (v !== null && v !== undefined) {
-            if (i - lastValidIdx > 1) {
-                const startVal = elevations[lastValidIdx];
-                const endVal = v;
-                const steps = i - lastValidIdx;
-                for (let j = 1; j < steps; j++) {
-                    elevations[lastValidIdx + j] = startVal + (j / steps) * (endVal - startVal);
-                }
-            }
-            lastValidIdx = i;
-        }
-    }
-
-    for (let i = lastValidIdx + 1; i < N; i++) {
-        elevations[i] = elevations[lastValidIdx];
-    }
-}
-
-// Smooth elevations along the way using despiking and Gaussian filtering (matching the main app's route profile logic)
-function smoothWayElevations(denseCoords, elevations) {
-    if (elevations.length < 3) return;
-
-    // Boundary despiker for start node
-    const d01 = getDistance(denseCoords[0], denseCoords[1]);
-    const d12 = getDistance(denseCoords[1], denseCoords[2]);
-    if (d01 > 0 && d12 > 0 && elevations[0] !== null && elevations[1] !== null && elevations[2] !== null) {
-        const g01 = Math.abs(elevations[0] - elevations[1]) / d01;
-        const g12 = Math.abs(elevations[1] - elevations[2]) / d12;
-        if (g01 > 0.25 && g01 > g12 * 2.0) {
-            elevations[0] = elevations[1];
-        }
-    }
-
-    // Boundary despiker for end node
-    const n = elevations.length;
-    const dN_2_1 = getDistance(denseCoords[n - 2], denseCoords[n - 1]);
-    const dN_3_2 = getDistance(denseCoords[n - 3], denseCoords[n - 2]);
-    if (dN_2_1 > 0 && dN_3_2 > 0 && elevations[n - 1] !== null && elevations[n - 2] !== null && elevations[n - 3] !== null) {
-        const gN_2_1 = Math.abs(elevations[n - 1] - elevations[n - 2]) / dN_2_1;
-        const gN_3_2 = Math.abs(elevations[n - 2] - elevations[n - 3]) / dN_3_2;
-        if (gN_2_1 > 0.25 && gN_2_1 > gN_3_2 * 2.0) {
-            elevations[n - 1] = elevations[n - 2];
-        }
-    }
-
-    // Pass 1: Isolation despiker — eliminates single-point glitches.
-    for (let pass = 0; pass < 6; pass++) {
-        const readElevs = [...elevations];
-        for (let i = 1; i < elevations.length - 1; i++) {
-            const v = readElevs[i];
-            const prev = readElevs[i - 1];
-            const next = readElevs[i + 1];
-            if (v == null || prev == null || next == null) continue;
-
-            const d1 = getDistance(denseCoords[i - 1], denseCoords[i]);
-            const d2 = getDistance(denseCoords[i], denseCoords[i + 1]);
-            if (d1 <= 0 || d2 <= 0) continue;
-            const rise1 = Math.abs(v - prev);
-            const rise2 = Math.abs(v - next);
-            const neighborDiff = Math.abs(prev - next);
-            const mean = (prev + next) / 2;
-
-            const isOutlier = rise1 > d1 * 0.2 && rise2 > d2 * 0.2;
-            const neighborsAgree = neighborDiff < Math.min(rise1, rise2) * 0.5;
-            const isNoise = rise1 > 0.5 && rise2 > 0.5 && Math.abs(v - mean) > 0.4;
-
-            if ((isOutlier && neighborsAgree) || isNoise) {
-                elevations[i] = mean;
-            }
-        }
-    }
-
-    // Pass 2: Two-tier grade-based filter.
-    for (let pass = 0; pass < 5; pass++) {
-        const readElevs = [...elevations];
-        for (let i = 1; i < elevations.length - 1; i++) {
-            const v = readElevs[i], prev = readElevs[i - 1], next = readElevs[i + 1];
-            if (v == null || prev == null || next == null) continue;
-            const d1 = getDistance(denseCoords[i - 1], denseCoords[i]);
-            const d2 = getDistance(denseCoords[i], denseCoords[i + 1]);
-            if (d1 <= 0 || d2 <= 0) continue;
-            const rise1 = Math.abs(v - prev);
-            const rise2 = Math.abs(v - next);
-            const g1 = rise1 / d1;
-            const g2 = rise2 / d2;
-            if (g1 > 1.0 && g2 > 1.0) {
-                elevations[i] = (prev + next) / 2;
-            } else if (g1 > 0.6 && g2 > 0.6) {
-                const neighborDiff = Math.abs(prev - next);
-                if (neighborDiff < Math.min(rise1, rise2) * 0.5) {
-                    elevations[i] = (prev + next) / 2;
-                }
-            }
-        }
-    }
-
-    // Gaussian smoothing kernel (15-point symmetric kernel, sigma ~ 3)
-    const GAUSS = [
-        0.012, 0.025, 0.047, 0.075, 0.108, 0.138, 0.157, 0.164,
-        0.157, 0.138, 0.108, 0.075, 0.047, 0.025, 0.012
-    ];
-    const WIN_HALF = 7;
-    const smoothedElevs = elevations.map((v, i) => {
-        if (v == null) return null;
-        let sum = 0, weight = 0;
-        for (let k = -WIN_HALF; k <= WIN_HALF; k++) {
-            const idx = i + k;
-            if (idx >= 0 && idx < elevations.length) {
-                const e = elevations[idx];
-                if (e != null) {
-                    const w = GAUSS[k + WIN_HALF];
-                    sum += e * w;
-                    weight += w;
-                }
-            }
-        }
-        return weight > 0 ? sum / weight : v;
-    });
-    for (let i = 0; i < elevations.length; i++) elevations[i] = smoothedElevs[i];
-}
-
-// Split way into equal-length segments targeting ~180 meters, ensuring no tiny tail segments
-function splitWayIntoSegments(coords, wayId, targetLen = 180) {
+// Split way into segments under 1/4 mile (402.336 meters)
+function splitWayIntoSegments(coords, wayId, maxLen = 402.336) {
     const segments = [];
     if (coords.length < 2) return segments;
-
-    // Calculate total way distance
-    let totalDist = 0;
-    for (let i = 0; i < coords.length - 1; i++) {
-        totalDist += getDistance(coords[i], coords[i+1]);
-    }
-
-    const numSegs = Math.max(1, Math.round(totalDist / targetLen));
-    const segLen = totalDist / numSegs;
 
     let currentSegment = [coords[0]];
     let currentDist = 0;
@@ -408,16 +124,17 @@ function splitWayIntoSegments(coords, wayId, targetLen = 180) {
 
     for (let i = 0; i < coords.length - 1; i++) {
         const p1 = coords[i];
-        const p2 = coords[i+1];
+        const p2 = coords[i + 1];
         const d = getDistance(p1, p2);
 
         let rem = d;
         let prevPoint = p1;
 
-        while (segIdx < numSegs - 1 && currentDist + rem > segLen) {
-            const needed = segLen - currentDist;
+        while (currentDist + rem > maxLen) {
+            const needed = maxLen - currentDist;
             const t = needed / rem;
 
+            // Interpolate point
             const lng = prevPoint[0] + t * (p2[0] - prevPoint[0]);
             const lat = prevPoint[1] + t * (p2[1] - prevPoint[1]);
             const splitPoint = [lng, lat];
@@ -426,7 +143,7 @@ function splitWayIntoSegments(coords, wayId, targetLen = 180) {
             segments.push({
                 id: `${wayId}_${segIdx++}`,
                 coordinates: currentSegment,
-                distance: segLen
+                distance: maxLen
             });
 
             currentSegment = [splitPoint];
@@ -440,7 +157,7 @@ function splitWayIntoSegments(coords, wayId, targetLen = 180) {
         currentDist += rem;
     }
 
-    if (currentSegment.length >= 2) {
+    if (currentSegment.length >= 2 && currentDist > 0.1) {
         segments.push({
             id: `${wayId}_${segIdx++}`,
             coordinates: currentSegment,
@@ -453,10 +170,7 @@ function splitWayIntoSegments(coords, wayId, targetLen = 180) {
 
 // Cache for processed ways: wayId -> Array of Segment objects
 const wayCache = new Map();
-const GRID_SIZE = 0.015; // Grid cell size in degrees (approx 1.6km)
-const processedCells = new Set();
-let activeQueue = [];
-let isQueueRunning = false;
+let isFetching = false;
 
 // Sticky/locked popup state
 let stickySegmentId = null;
@@ -644,7 +358,7 @@ function setupGradeLayers() {
                         const lat = midpoint[1];
                         const lng = midpoint[0];
                         const svUrl = `https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${lat},${lng}`;
-                        
+
                         hoverPopup.setLngLat(midpoint)
                             .setHTML(`<div style="font-family:'Inter',sans-serif;font-size:0.82rem;font-weight:600;background:var(--bg-panel);padding:4px 6px;display:flex;align-items:center;gap:10px;border-bottom:2px solid ${getGradeColor(gradePercent)};">
                                 <span>Grade: <span style="color:${getGradeColor(gradePercent)};font-weight:700;">${formatted}</span></span>
@@ -751,225 +465,119 @@ function updateMapData() {
     });
 }
 
-// Dispatcher to process the pending cells queue starting from the center out
-async function runProgressiveLoadQueue() {
-    if (isQueueRunning) return;
-    isQueueRunning = true;
-
+// Fetch ways and process grades
+async function fetchAndProcessViewport() {
+    const zoom = map.getZoom();
+    const warning = document.getElementById('zoom-warning');
     const loading = document.getElementById('loading-indicator');
-    if (loading) loading.style.display = 'flex';
 
-    while (activeQueue.length > 0) {
-        // Sort queue dynamically to always prioritize the closest cell to the current map center
-        const mapCenter = map.getCenter();
-        for (const task of activeQueue) {
-            const cellLng = (task.cx + 0.5) * GRID_SIZE;
-            const cellLat = (task.cy + 0.5) * GRID_SIZE;
-            task.dist = getDistance([cellLng, cellLat], [mapCenter.lng, mapCenter.lat]);
-        }
-        activeQueue.sort((a, b) => a.dist - b.dist);
+    if (zoom < 13) {
+        warning.classList.remove('hidden');
+        return;
+    } else {
+        warning.classList.add('hidden');
+    }
 
-        // Get the closest cell
-        const currentTask = activeQueue.shift();
-        const { key, cx, cy } = currentTask;
+    if (isFetching) return;
+    isFetching = true;
+    loading.style.display = 'flex';
 
-        // Double check we haven't already processed it
-        if (processedCells.has(key)) continue;
-        processedCells.add(key);
+    try {
+        const bounds = map.getBounds();
+        const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
 
-        try {
-            // Calculate cell bounds
-            const w = cx * GRID_SIZE;
-            const e = (cx + 1) * GRID_SIZE;
-            const s = cy * GRID_SIZE;
-            const n = (cy + 1) * GRID_SIZE;
+        // Exclude footways, pedestrian paths, steps, service roads/driveways, tracks, paths, bridleways (keep cycleways)
+        const query = `[out:json][timeout:25];way[highway]["highway"!~"footway|pedestrian|steps|construction|proposed|abandoned|service|track|corridor|elevator|platform|path|bridleway"](${bbox});out geom;`;
+        const res = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`);
 
-            const bbox = `${s},${w},${n},${e}`;
-            
-            // Fetch ways in this cell
-            const query = `[out:json][timeout:25];way[highway]["highway"!~"footway|pedestrian|steps|construction|proposed|abandoned|service|track|corridor|elevator|platform|path|bridleway"](${bbox});out geom;`;
-            const res = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`);
-            if (!res.ok) throw new Error('Query failed');
+        if (!res.ok) throw new Error('Overpass query failed');
 
-            const data = await res.json();
-            const ways = data.elements || [];
+        const data = await res.json();
+        const ways = data.elements || [];
 
-            const newWaysToResolve = [];
-            for (const way of ways) {
-                if (way.type === 'way' && way.geometry && !wayCache.has(way.id)) {
-                    const geomCoords = way.geometry.map(p => [p.lon, p.lat]);
-                    const denseCoords = densifyCoordinates(geomCoords, 20);
-                    newWaysToResolve.push({
-                        id: way.id,
-                        geomCoords: geomCoords,
-                        denseCoords: denseCoords
+        // Identify new ways to process
+        const newSegmentsToResolve = [];
+        for (const way of ways) {
+            if (way.type === 'way' && way.geometry && !wayCache.has(way.id)) {
+                const geomCoords = way.geometry.map(p => [p.lon, p.lat]);
+                const segments = splitWayIntoSegments(geomCoords, way.id);
+
+                // Initialize cache entry
+                wayCache.set(way.id, segments);
+
+                for (const seg of segments) {
+                    newSegmentsToResolve.push({
+                        wayId: way.id,
+                        segment: seg
                     });
                 }
             }
-
-            if (newWaysToResolve.length > 0) {
-                const uniqueCoordsMap = new Map();
-                const uniqueCoordsArray = [];
-                const getCoordKey = (coord) => `${coord[0].toFixed(6)},${coord[1].toFixed(6)}`;
-
-                for (const wayInfo of newWaysToResolve) {
-                    for (const pt of wayInfo.denseCoords) {
-                        const key = getCoordKey(pt);
-                        if (!uniqueCoordsMap.has(key)) {
-                            uniqueCoordsMap.set(key, uniqueCoordsArray.length);
-                            uniqueCoordsArray.push(pt);
-                        }
-                    }
-                }
-
-                const uniqueElevations = await getHighResElevation(uniqueCoordsArray);
-
-                for (const wayInfo of newWaysToResolve) {
-                    const denseCoords = wayInfo.denseCoords;
-                    const elevations = [];
-                    for (const pt of denseCoords) {
-                        const key = getCoordKey(pt);
-                        const idx = uniqueCoordsMap.get(key);
-                        elevations.push(uniqueElevations[idx]);
-                    }
-
-                    fillNullElevations(elevations);
-                    smoothWayElevations(denseCoords, elevations);
-
-                    const segments = splitWayIntoSegments(wayInfo.geomCoords, wayInfo.id);
-
-                    for (const seg of segments) {
-                        const coords = seg.coordinates;
-                        const dist = seg.distance;
-                        const start = coords[0];
-                        const end = coords[coords.length - 1];
-                        let gradeVal = 0;
-                        let isDownhill = false;
-
-                        if (dist >= 60) {
-                            const segElevs = [];
-                            let hasNull = false;
-                            for (const pt of coords) {
-                                const el = getInterpolatedElevation(pt, denseCoords, elevations);
-                                if (el === null || el === undefined) {
-                                    hasNull = true;
-                                    break;
-                                }
-                                segElevs.push(el);
-                            }
-
-                            if (!hasNull && segElevs.length >= 2) {
-                                const slope = calculateLeastSquaresSlope(coords, segElevs);
-                                gradeVal = Math.abs(slope) * 100;
-                                isDownhill = segElevs[0] > segElevs[segElevs.length - 1];
-                            }
-                        } else {
-                            const latMid = (start[1] + end[1]) / 2;
-                            const lngMid = (start[0] + end[0]) / 2;
-                            const dLat = end[1] - start[1];
-                            const dLng = end[0] - start[0];
-                            const len = Math.sqrt(dLat * dLat + dLng * dLng);
-
-                            if (len === 0) {
-                                const elevStart = getInterpolatedElevation(start, denseCoords, elevations);
-                                const elevEnd = getInterpolatedElevation(end, denseCoords, elevations);
-                                if (elevStart !== null && elevEnd !== null) {
-                                    gradeVal = dist > 0 ? (Math.abs(elevEnd - elevStart) / dist) * 100 : 0;
-                                    isDownhill = elevStart > elevEnd;
-                                }
-                            } else {
-                                const uLat = dLat / len;
-                                const uLng = dLng / len;
-
-                                const degLat = 30 / 111111;
-                                const degLng = 30 / (111111 * Math.cos(latMid * Math.PI / 180));
-
-                                const startVirtual = [lngMid - uLng * degLng, latMid - uLat * degLat];
-                                const endVirtual = [lngMid + uLng * degLng, latMid + uLat * degLat];
-
-                                const elevStart = getInterpolatedElevation(startVirtual, denseCoords, elevations);
-                                const elevEnd = getInterpolatedElevation(endVirtual, denseCoords, elevations);
-
-                                if (elevStart !== null && elevEnd !== null) {
-                                    gradeVal = (Math.abs(elevEnd - elevStart) / 60) * 100;
-                                    isDownhill = elevStart > elevEnd;
-                                }
-                            }
-                        }
-
-                        if (isNaN(gradeVal) || gradeVal === null || gradeVal === undefined) {
-                            gradeVal = 0;
-                        }
-                        seg.gradePercent = gradeVal;
-                        seg.grade = Math.min(gradeVal, 20);
-
-                        if (isDownhill) {
-                            seg.coordinates.reverse();
-                        }
-                    }
-
-                    wayCache.set(wayInfo.id, segments);
-                }
-
-                // Incrementally update the map as we load roads tile by tile
-                updateMapData();
-            }
-        } catch (err) {
-            console.warn(`Error processing cell ${key}:`, err);
         }
 
-        // yield to keep browser responsive
-        await new Promise(r => setTimeout(r, 20));
-    }
+        if (newSegmentsToResolve.length > 0) {
+            // Deduplicate coordinates to minimize worker payload and speed up decoding
+            const uniqueCoordsMap = new Map();
+            const uniqueCoordsArray = [];
 
-    isQueueRunning = false;
-    if (loading) loading.style.display = 'none';
-}
+            const getCoordKey = (coord) => `${coord[0].toFixed(6)},${coord[1].toFixed(6)}`;
 
-// Fetch ways and process grades using the progressive tiling system
-function fetchAndProcessViewport() {
-    const zoom = map.getZoom();
-    const warning = document.getElementById('zoom-warning');
-    
-    if (zoom < 13) {
-        if (warning) warning.classList.remove('hidden');
-        activeQueue = [];
-        return;
-    } else {
-        if (warning) warning.classList.add('hidden');
-    }
+            for (const item of newSegmentsToResolve) {
+                const segCoords = item.segment.coordinates;
+                const start = segCoords[0];
+                const end = segCoords[segCoords.length - 1];
 
-    const bounds = map.getBounds();
-    const mapCenter = map.getCenter();
+                const startKey = getCoordKey(start);
+                if (!uniqueCoordsMap.has(startKey)) {
+                    uniqueCoordsMap.set(startKey, uniqueCoordsArray.length);
+                    uniqueCoordsArray.push(start);
+                }
 
-    // Determine viewport cell bounds with 1-cell prefetch padding
-    const w = bounds.getWest() - GRID_SIZE;
-    const e = bounds.getEast() + GRID_SIZE;
-    const s = bounds.getSouth() - GRID_SIZE;
-    const n = bounds.getNorth() + GRID_SIZE;
-
-    const minCx = Math.floor(w / GRID_SIZE);
-    const maxCx = Math.floor(e / GRID_SIZE);
-    const minCy = Math.floor(s / GRID_SIZE);
-    const maxCy = Math.floor(n / GRID_SIZE);
-
-    const newTasks = [];
-
-    for (let cx = minCx; cx <= maxCx; cx++) {
-        for (let cy = minCy; cy <= maxCy; cy++) {
-            const key = `${cx},${cy}`;
-            if (!processedCells.has(key) && !activeQueue.some(t => t.key === key)) {
-                const cellLng = (cx + 0.5) * GRID_SIZE;
-                const cellLat = (cy + 0.5) * GRID_SIZE;
-                const dist = getDistance([cellLng, cellLat], [mapCenter.lng, mapCenter.lat]);
-                newTasks.push({ key, cx, cy, dist });
+                const endKey = getCoordKey(end);
+                if (!uniqueCoordsMap.has(endKey)) {
+                    uniqueCoordsMap.set(endKey, uniqueCoordsArray.length);
+                    uniqueCoordsArray.push(end);
+                }
             }
-        }
-    }
 
-    if (newTasks.length > 0) {
-        activeQueue.push(...newTasks);
-        runProgressiveLoadQueue();
+            const uniqueElevations = await getHighResElevation(uniqueCoordsArray);
+
+            // Assign elevations and compute grades
+            for (const item of newSegmentsToResolve) {
+                const segCoords = item.segment.coordinates;
+                const start = segCoords[0];
+                const end = segCoords[segCoords.length - 1];
+
+                const startKey = getCoordKey(start);
+                const endKey = getCoordKey(end);
+
+                const elevStart = uniqueElevations[uniqueCoordsMap.get(startKey)];
+                const elevEnd = uniqueElevations[uniqueCoordsMap.get(endKey)];
+
+                if (elevStart !== null && elevEnd !== null) {
+                    const rise = Math.abs(elevEnd - elevStart);
+                    const run = item.segment.distance;
+                    const gradeVal = run > 0 ? (rise / run) * 100 : 0;
+
+                    item.segment.gradePercent = gradeVal;
+                    item.segment.grade = Math.min(gradeVal, 20); // Clamp to 20% for coloring interpolation
+
+                    // Reverse coordinate order if downhill so that LineString geometry always points uphill
+                    if (elevStart > elevEnd) {
+                        item.segment.coordinates.reverse();
+                    }
+                } else {
+                    item.segment.gradePercent = 0;
+                    item.segment.grade = 0;
+                }
+            }
+
+            updateMapData();
+        }
+    } catch (err) {
+        console.error('Error fetching viewport data:', err);
+    } finally {
+        isFetching = false;
+        loading.style.display = 'none';
     }
 }
 
@@ -1094,3 +702,4 @@ const storedExaggeration = localStorage.getItem('route_exaggeration') || '2.0';
 if (document.getElementById('terrain-exaggeration')) {
     document.getElementById('terrain-exaggeration').value = storedExaggeration;
 }
+

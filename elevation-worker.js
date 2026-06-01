@@ -21,7 +21,7 @@ function decodePixel(tile, ix, iy) {
     const x = Math.min(Math.max(Math.round(ix), 0), 255);
     const y = Math.min(Math.max(Math.round(iy), 0), 255);
     const p = (y * 256 + x) * 4;
-    const r = data[p], g = data[p+1], b = data[p+2], a = data[p+3];
+    const r = data[p], g = data[p + 1], b = data[p + 2], a = data[p + 3];
     if (a < 128) return null;
 
     if (format === 'mapbox') {
@@ -60,8 +60,8 @@ function sampleElevationSync(tileCache, zoom, tileX, tileY, pxX, pxY) {
     const anyValid = v00 ?? v10 ?? v01 ?? v11;
     if (anyValid === null || anyValid === undefined) return null;
     const safe = v => (v !== null && v !== undefined) ? v : anyValid;
-    return safe(v00)*(1-fx)*(1-fy) + safe(v10)*fx*(1-fy) +
-           safe(v01)*(1-fx)*fy     + safe(v11)*fx*fy;
+    return safe(v00) * (1 - fx) * (1 - fy) + safe(v10) * fx * (1 - fy) +
+        safe(v01) * (1 - fx) * fy + safe(v11) * fx * fy;
 }
 
 self.onmessage = async (e) => {
@@ -100,7 +100,7 @@ self.onmessage = async (e) => {
                 data = ctx.getImageData(0, 0, 256, 256).data;
                 format = 'terrarium';
             }
-        } catch (_) {}
+        } catch (_) { }
 
         if (data) {
             const entry = { data, format };
