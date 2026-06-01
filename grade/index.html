@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Grade Map - Bike Route Planner</title>
+    <link rel="icon" href="../favicon.png">
+    <link rel="stylesheet" href="../style.css?v=4">
+    <!-- MapLibre CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@^5.0.0/dist/maplibre-gl.css" />
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        /* Custom overlays for the Grade Map Mode */
+        .zoom-warning {
+            position: absolute;
+            top: 70px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--bg-panel);
+            color: var(--text-main);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 8px 16px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+            z-index: 1000;
+            pointer-events: none;
+            transition: opacity 0.2s ease-in-out;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .zoom-warning.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        /* Custom map control button styling */
+        .back-btn {
+            background: var(--bg-panel);
+            border: 1px solid var(--border);
+            color: var(--text-main);
+            border-radius: 6px;
+            padding: 6px 12px;
+            font-size: 0.82rem;
+            font-weight: 500;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            text-decoration: none;
+            transition: background 0.2s, border-color 0.2s;
+        }
+
+        .back-btn:hover {
+            background: var(--bg-hover);
+            border-color: var(--primary);
+        }
+
+        /* Grade Legend Panel */
+        .legend-panel {
+            position: absolute;
+            bottom: 24px;
+            left: 24px;
+            background: var(--bg-panel);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px;
+            font-size: 0.8rem;
+            font-weight: 500;
+            color: var(--text-main);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            min-width: 160px;
+        }
+
+        .legend-title {
+            font-weight: 600;
+            font-size: 0.85rem;
+            color: var(--text-main);
+            margin-bottom: 2px;
+        }
+
+        .legend-gradient {
+            height: 10px;
+            background: linear-gradient(to right, #22c55e 0%, #eab308 50%, #ef4444 100%);
+            border-radius: 3px;
+        }
+
+        .legend-labels {
+            display: flex;
+            justify-content: space-between;
+            color: var(--text-muted);
+            font-size: 0.75rem;
+        }
+
+        /* Custom styled MapLibre Popup for Grade Tooltips */
+        .grade-hover-popup,
+        .grade-hover-popup * {
+            pointer-events: none !important;
+        }
+
+        /* Allow clicking inside the popup only when locked */
+        .grade-hover-popup.locked,
+        .grade-hover-popup.locked * {
+            pointer-events: auto !important;
+        }
+
+        .grade-hover-popup .maplibregl-popup-content {
+            background: var(--bg-panel) !important;
+            color: var(--text-main) !important;
+            border-radius: 8px !important;
+            padding: 4px 8px !important;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3) !important;
+            border: 1px solid var(--border) !important;
+        }
+
+        .grade-hover-popup .maplibregl-popup-tip {
+            border-top-color: var(--bg-panel) !important;
+            border-bottom-color: var(--bg-panel) !important;
+        }
+
+        /* Custom range slider matching climate visualizer styling */
+        input[type=range] {
+            -webkit-appearance: none;
+            appearance: none;
+            background: transparent;
+            padding: 0;
+            border: none;
+        }
+
+        input[type=range]::-webkit-slider-runnable-track {
+            height: 4px;
+            background: var(--border);
+            border-radius: 2px;
+        }
+
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 12px;
+            width: 12px;
+            border-radius: 50%;
+            background: var(--text-muted);
+            cursor: pointer;
+            margin-top: -4px;
+            box-shadow: 0 0 5px rgba(0, 0, 0, 0.5);
+            transition: background 0.15s;
+        }
+
+        input[type=range]:hover::-webkit-slider-thumb {
+            background: var(--text-main);
+        }
+    </style>
+</head>
+
+<body>
+    <div id="app">
+        <main id="map-container">
+            <div id="top-bar">
+                <div class="header-brand" style="display: flex; align-items: center; gap: 10px;">
+                    <a href="../index.html"
+                        style="display: flex; align-items: center; text-decoration: none; color: inherit;">
+                        <img src="../logo.png" id="logo" alt="Logo">
+                    </a>
+                    <a href="../index.html" style="text-decoration: none; color: inherit;">
+                        <h1 id="app-title">Grade Map</h1>
+                    </a>
+                </div>
+
+                <div class="icon-btn-divider" style="height: 20px; opacity: 0.5; margin: 0 4px;"></div>
+
+                <a href="../index.html" class="back-btn" title="Return to Route Planner">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="19" y1="12" x2="5" y2="12"></line>
+                        <polyline points="12 19 5 12 12 5"></polyline>
+                    </svg>
+                    <span>Route Planner</span>
+                </a>
+
+                <div id="loading-indicator"
+                    style="display:none; align-items:center; gap:7px; color:var(--text-muted); font-size:0.82rem; margin-left: 12px;">
+                    <svg id="loading-spinner" width="16" height="16" viewBox="0 0 16 16" fill="none"
+                        class="initial-spinner">
+                        <circle cx="8" cy="8" r="6" stroke="var(--border)" stroke-width="2" />
+                        <path d="M8 2a6 6 0 0 1 6 6" stroke="var(--primary)" stroke-width="2" stroke-linecap="round" />
+                    </svg>
+                    <span id="loading-phase">Loading roads…</span>
+                </div>
+
+                <div style="flex-grow: 1;"></div>
+
+                <div class="settings-dropdown" style="position: relative;">
+                    <button id="settings-btn" title="Open settings"
+                        style="background:none; border:none; display:flex; align-items:center; padding: 0 5px; cursor:pointer;"
+                        onclick="toggleSettings(event)">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="3"></circle>
+                            <path
+                                d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z">
+                            </path>
+                        </svg>
+                    </button>
+                    <div id="settings-menu" class="settings-content" style="display: none;">
+                        <div class="setting-row">
+                            <span>Theme</span>
+                            <select id="theme">
+                                <option value="dark">Dark Mode</option>
+                                <option value="light">Light Mode</option>
+                            </select>
+                        </div>
+                        <div class="setting-row">
+                            <span>Basemap</span>
+                            <select id="basemap">
+                                <option value="cyclosm">CyclOSM</option>
+                                <option value="dark">Dark Matter</option>
+                                <option value="topo">Topography</option>
+                                <option value="light">Clean Light Map</option>
+                                <option value="osm">Open Street Map</option>
+                                <option value="satellite">Satellite</option>
+                            </select>
+                        </div>
+                        <div class="setting-row">
+                            <span>Projection</span>
+                            <select id="projection">
+                                <option value="globe">Globe</option>
+                                <option value="mercator">Flat</option>
+                            </select>
+                        </div>
+                        <div class="setting-row">
+                            <span>Terrain</span>
+                            <select id="hillshade-select">
+                                <option value="off">Off</option>
+                                <option value="hillshade">Hillshade</option>
+                                <option value="terrain">3D Terrain</option>
+                            </select>
+                        </div>
+                        <div class="setting-row">
+                            <span>3D Exaggeration</span>
+                            <input type="number" id="terrain-exaggeration" step="0.1" min="0" max="20" value="2.0"
+                                style="width: 60px; background:var(--bg-panel); color:var(--text-main); border:1px solid var(--border); border-radius:4px; padding:2px 5px;">
+                        </div>
+                        <div class="setting-row">
+                            <span>Line Opacity</span>
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <input type="range" id="line-opacity-range" min="10" max="100" step="5" value="80"
+                                    style="width: 120px; min-width: 120px; flex-shrink: 0; accent-color: var(--primary);">
+                                <span id="line-opacity-val"
+                                    style="font-size: 0.8rem; color: var(--text-muted); min-width: 28px;">80%</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div id="map"></div>
+
+            <!-- Zoom level warning -->
+            <div id="zoom-warning" class="zoom-warning hidden">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                    stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <line x1="12" y1="8" x2="12" y2="12"></line>
+                    <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                </svg>
+                <span>Zoom in to load road grade details</span>
+            </div>
+
+            <!-- Legend Panel -->
+            <div class="legend-panel">
+                <div class="legend-title">Slope Grade</div>
+                <div class="legend-gradient"></div>
+                <div class="legend-labels">
+                    <span>Flat (0%)</span>
+                    <span>10%</span>
+                    <span>20%+</span>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- MapLibre JS -->
+    <script src="https://unpkg.com/maplibre-gl@^5.0.0/dist/maplibre-gl.js"></script>
+    <script src="script.js?v=5"></script>
+    <script>
+        // Inline settings toggler helper matching style.css logic
+        function toggleSettings(e) {
+            e.stopPropagation();
+            const menu = document.getElementById('settings-menu');
+            menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
+        }
+        document.addEventListener('click', () => {
+            const menu = document.getElementById('settings-menu');
+            if (menu) menu.style.display = 'none';
+        });
+        const menu = document.getElementById('settings-menu');
+        if (menu) {
+            menu.addEventListener('click', (e) => e.stopPropagation());
+        }
+    </script>
+</body>
+
+</html>
