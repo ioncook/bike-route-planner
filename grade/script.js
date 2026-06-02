@@ -432,6 +432,7 @@ map.on('style.load', () => {
     setupGradeLayers();
     applyTerrain();
     updateMapData();
+    fetchAndProcessViewport();
 });
 
 // Update the map line layer with cached features
@@ -471,7 +472,7 @@ async function fetchAndProcessViewport() {
     const warning = document.getElementById('zoom-warning');
     const loading = document.getElementById('loading-indicator');
 
-    if (zoom < 13) {
+    if (zoom < 11) {
         warning.classList.remove('hidden');
         return;
     } else {
@@ -484,7 +485,22 @@ async function fetchAndProcessViewport() {
 
     try {
         const bounds = map.getBounds();
-        const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
+        let s = bounds.getSouth();
+        let w = bounds.getWest();
+        let n = bounds.getNorth();
+        let e = bounds.getEast();
+
+        // Clamp bounding box when zoomed out to avoid overloading Overpass API
+        if (zoom < 13) {
+            const mapCenter = map.getCenter();
+            const maxRadius = 0.08; // ~11 miles max span centered on camera
+            s = Math.max(s, mapCenter.lat - maxRadius);
+            w = Math.max(w, mapCenter.lng - maxRadius);
+            n = Math.min(n, mapCenter.lat + maxRadius);
+            e = Math.min(e, mapCenter.lng + maxRadius);
+        }
+
+        const bbox = `${s},${w},${n},${e}`;
 
         // Exclude footways, pedestrian paths, steps, service roads/driveways, tracks, paths, bridleways (keep cycleways)
         const query = `[out:json][timeout:25];way[highway]["highway"!~"footway|pedestrian|steps|construction|proposed|abandoned|service|track|corridor|elevator|platform|path|bridleway"](${bbox});out geom;`;
@@ -594,6 +610,13 @@ map.on('moveend', () => {
     }, 300);
 });
 
+map.on('zoomend', () => {
+    clearTimeout(moveendDebounceTimer);
+    moveendDebounceTimer = setTimeout(() => {
+        fetchAndProcessViewport();
+    }, 300);
+});
+
 // Initial fetch
 map.on('load', () => {
     fetchAndProcessViewport();
@@ -695,6 +718,14 @@ document.getElementById('line-opacity-val').textContent = storedOpacity + '%';
 
 // Sync terrain settings on load
 const storedHillshade = localStorage.getItem('route_hillshade') || 'off';
+if (document.getElementById('hillshade-select')) {
+    document.getElementById('hillshade-select').value = storedHillshade;
+}
+const storedExaggeration = localStorage.getItem('route_exaggeration') || '2.0';
+if (document.getElementById('terrain-exaggeration')) {
+    document.getElementById('terrain-exaggeration').value = storedExaggeration;
+}
+
 if (document.getElementById('hillshade-select')) {
     document.getElementById('hillshade-select').value = storedHillshade;
 }
