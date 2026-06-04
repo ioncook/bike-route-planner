@@ -113,8 +113,8 @@ function getDistance(coord1, coord2) {
     return R * c;
 }
 
-// Split way into segments under 1/4 mile (402.336 meters)
-function splitWayIntoSegments(coords, wayId, maxLen = 402.336) {
+// Split way into segments under 80 meters to accurately catch steep climbs without averaging them out
+function splitWayIntoSegments(coords, wayId, maxLen = 80.0) {
     const segments = [];
     if (coords.length < 2) return segments;
 
@@ -718,14 +718,6 @@ document.getElementById('line-opacity-val').textContent = storedOpacity + '%';
 
 // Sync terrain settings on load
 const storedHillshade = localStorage.getItem('route_hillshade') || 'off';
-if (document.getElementById('hillshade-select')) {
-    document.getElementById('hillshade-select').value = storedHillshade;
-}
-const storedExaggeration = localStorage.getItem('route_exaggeration') || '2.0';
-if (document.getElementById('terrain-exaggeration')) {
-    document.getElementById('terrain-exaggeration').value = storedExaggeration;
-}
-
 if (document.getElementById('hillshade-select')) {
     document.getElementById('hillshade-select').value = storedHillshade;
 }
