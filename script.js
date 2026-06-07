@@ -75,6 +75,7 @@ const map = new maplibregl.Map({
     antialias: false,
     fadeDuration: 0,
     trackResize: true,
+    clickTolerance: 8,
     transformRequest: (url, resourceType) => {
         // No custom headers to avoid CORS preflight failures on tile servers
     }
@@ -523,9 +524,9 @@ function updateTurnaroundJoins() {
         while (d < -180) d += 360;
 
         // Draw a visual bridging staple ONLY for sharp left turns (where offset is on the outside, d < -100)
-        // or complete 180-degree turnarounds (where the path reverses direction completely, |d| > 135).
+        // or complete 180-degree right-hand turnarounds (where the path reverses direction completely, d > 160).
         // Sharp right turns do not need a visual bridge.
-        if (d < -100 || Math.abs(d) > 135) {
+        if (d < -100 || d > 160) {
             const pCenter = map.project(coords[i]);
             const pIn = map.project(coords[prevIdx]);
             const pOut = map.project(coords[nextIdx]);
@@ -811,7 +812,7 @@ function setupRouteLayers() {
         const pinEl = document.createElement('div');
         pinEl.style.cssText = 'pointer-events:none; opacity:0.5;';
         pinEl.innerHTML = pinSvg('#4b5563', '', 0); // Remove border (strokeWidth=0), Dark Grey
-        window._dragPreviewMarker = new maplibregl.Marker({ element: pinEl, anchor: 'bottom', offset: [0, 2] })
+        window._dragPreviewMarker = new maplibregl.Marker({ element: pinEl, anchor: 'bottom', offset: [0, 8] })
             .setLngLat([0, 0]);
         // Don't add to map yet — added on first drag
         window._dragPreviewMarker._pinEl = pinEl;
@@ -1585,7 +1586,7 @@ map.on('mouseup', (e) => {
     // Only show popup if cursor barely moved (i.e. it was a click, not a pan)
     const dx = e.originalEvent.clientX - middleClickStartX;
     const dy = e.originalEvent.clientY - middleClickStartY;
-    if (Math.hypot(dx, dy) < 6) showWeatherPopup(e.lngLat);
+    if (Math.hypot(dx, dy) < 8) showWeatherPopup(e.lngLat);
 });
 
 // Prevent browser context menu on right-click so rotate works cleanly
@@ -1999,7 +2000,7 @@ function getFitBoundsPadding() {
             return;
         }
         const rect = panel.getBoundingClientRect();
-        
+
         // Relative coordinates to map container
         const panelLeft = rect.left - mapRect.left;
         const panelRight = rect.right - mapRect.left;
@@ -2009,7 +2010,7 @@ function getFitBoundsPadding() {
         // Check if it overlaps the map container
         if (rect.bottom >= mapRect.top && rect.top <= mapRect.bottom &&
             rect.right >= mapRect.left && rect.left <= mapRect.right) {
-            
+
             const isFullWidth = rect.width >= mapRect.width * 0.85;
             const isFullHeight = rect.height >= mapRect.height * 0.85;
 

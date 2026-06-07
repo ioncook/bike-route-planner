@@ -55,7 +55,8 @@ const map = new maplibregl.Map({
     projection: { type: localStorage.getItem('route_projection') || 'mercator' },
     antialias: false,
     fadeDuration: 0,
-    trackResize: true
+    trackResize: true,
+    clickTolerance: 8
 });
 
 map.dragRotate.enable();
