@@ -174,6 +174,7 @@ const DEFAULT_KEYBINDINGS = {
     reverse: 'v',
     deleteLast: 'backspace',
     resetOrientation: 'n',
+    centerLocation: 'c',
 };
 let currentKeybindings = { ...DEFAULT_KEYBINDINGS };
 let activeCaptureKey = null;
@@ -2392,6 +2393,9 @@ window.addEventListener('keydown', (e) => {
     } else if (key === currentKeybindings.resetOrientation) {
         e.preventDefault();
         map.flyTo({ bearing: 0, pitch: 0 });
+    } else if (key === currentKeybindings.centerLocation) {
+        e.preventDefault();
+        requestLocation(true);
     }
 }, true);
 
@@ -2931,20 +2935,20 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
     if (smoothedSegmentGrades && smoothedSegmentGrades.length > 0) {
         let upSum = 0, upCount = 0;
         let downSum = 0, downCount = 0;
-        let maxUpGrade = 0;
-        let maxDownGrade = 0;
+        let maxUpGrade = -Infinity;
+        let maxDownGrade = Infinity;
 
         for (let i = 0; i < smoothedSegmentGrades.length; i++) {
             const grade = smoothedSegmentGrades[i];
             if (grade > 0.5) {
                 upSum += grade;
                 upCount++;
-                if (grade > maxUpGrade) maxUpGrade = grade;
             } else if (grade < -0.5) {
                 downSum += grade;
                 downCount++;
-                if (grade < maxDownGrade) maxDownGrade = grade;
             }
+            if (grade > maxUpGrade) maxUpGrade = grade;
+            if (grade < maxDownGrade) maxDownGrade = grade;
         }
         const avgUpVal = upCount > 0 ? (upSum / upCount) : 0;
         const avgDownVal = downCount > 0 ? (downSum / downCount) : 0;
@@ -2955,10 +2959,10 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
         downEl.textContent = `${avgDownVal.toFixed(1)}%`;
         downEl.style.color = getColorForGrade(avgDownVal);
 
-        maxUpEl.textContent = `+${maxUpGrade.toFixed(1)}%`;
+        maxUpEl.textContent = (maxUpGrade >= 0 ? '+' : '') + maxUpGrade.toFixed(1) + '%';
         maxUpEl.style.color = getColorForGrade(maxUpGrade);
 
-        maxDownEl.textContent = `${maxDownGrade.toFixed(1)}%`;
+        maxDownEl.textContent = (maxDownGrade >= 0 ? '+' : '') + maxDownGrade.toFixed(1) + '%';
         maxDownEl.style.color = getColorForGrade(maxDownGrade);
     } else {
         upEl.textContent = '--'; upEl.style.color = '';
@@ -3436,6 +3440,13 @@ function initChart() {
         const rect = ctx.canvas.getBoundingClientRect();
         const canvasX = clientX - rect.left;
 
+        if (chart.chartArea) {
+            if (canvasX < chart.chartArea.left || canvasX > chart.chartArea.right) {
+                clearHover();
+                return;
+            }
+        }
+
         // canvasX is in CSS pixels; Chart.js scales use the same coordinate space.
         const xValue = chart.scales.x?.getValueForPixel(canvasX);
         if (xValue == null) return;
@@ -3666,7 +3677,24 @@ async function updateElevationProfile() {
             if (v == null) return null;
             let sum = 0, weight = 0;
             for (let k = -WIN_HALF; k <= WIN_HALF; k++) {
-                const e = elevations[i + k];
+                let idx = i + k;
+                let e = null;
+                if (idx >= 0 && idx < elevations.length) {
+                    e = elevations[idx];
+                } else if (idx < 0) {
+                    // Start boundary reflection
+                    const reflectedIdx = -idx;
+                    if (reflectedIdx < elevations.length && elevations[0] != null && elevations[reflectedIdx] != null) {
+                        e = 2 * elevations[0] - elevations[reflectedIdx];
+                    }
+                } else {
+                    // End boundary reflection
+                    const reflectedIdx = 2 * elevations.length - 2 - idx;
+                    if (reflectedIdx >= 0 && elevations[elevations.length - 1] != null && elevations[reflectedIdx] != null) {
+                        e = 2 * elevations[elevations.length - 1] - elevations[reflectedIdx];
+                    }
+                }
+                
                 if (e != null) {
                     const w = GAUSS[k + WIN_HALF];
                     sum += e * w;
@@ -3681,14 +3709,57 @@ async function updateElevationProfile() {
         // Step 2: Prepare chart data and calculate grades
         const filteredChartData = [];
         const pointGrades = elevations.map((v, i) => {
-            if (v == null) return 0;
-            const prev = elevations[i - 1];
-            const next = elevations[i + 1];
-            const d1 = i > 0 ? haversineDistance(coords[i - 1], coords[i]) : 0;
-            const d2 = i < coords.length - 1 ? haversineDistance(coords[i], coords[i + 1]) : 0;
-            if (i === 0) return d2 > 0 ? (next - v) / d2 * 100 : 0;
-            if (i === coords.length - 1) return d1 > 0 ? (v - prev) / d1 * 100 : 0;
-            return (d1 + d2 > 0) ? (next - prev) / (d1 + d2) * 100 : 0;
+            if (v == null) return null;
+            
+            let prevVal = null;
+            let d1 = 0;
+            for (let j = i - 1; j >= 0; j--) {
+                if (elevations[j] != null) {
+                    const dist = haversineDistance(coords[j], coords[i]);
+                    if (dist > 2.0) {
+                        prevVal = elevations[j];
+                        d1 = dist;
+                        break;
+                    }
+                }
+            }
+            if (prevVal === null && i > 0 && elevations[i - 1] != null) {
+                prevVal = elevations[i - 1];
+                d1 = haversineDistance(coords[i - 1], coords[i]);
+            }
+
+            let nextVal = null;
+            let d2 = 0;
+            for (let j = i + 1; j < elevations.length; j++) {
+                if (elevations[j] != null) {
+                    const dist = haversineDistance(coords[i], coords[j]);
+                    if (dist > 2.0) {
+                        nextVal = elevations[j];
+                        d2 = dist;
+                        break;
+                    }
+                }
+            }
+            if (nextVal === null && i < elevations.length - 1 && elevations[i + 1] != null) {
+                nextVal = elevations[i + 1];
+                d2 = haversineDistance(coords[i], coords[i + 1]);
+            }
+
+            if (i === 0) {
+                return (nextVal != null && d2 > 0) ? (nextVal - v) / d2 * 100 : null;
+            }
+            if (i === coords.length - 1) {
+                return (prevVal != null && d1 > 0) ? (v - prevVal) / d1 * 100 : null;
+            }
+
+            if (prevVal != null && nextVal != null && (d1 + d2) > 0) {
+                return (nextVal - prevVal) / (d1 + d2) * 100;
+            } else if (prevVal != null && d1 > 0) {
+                return (v - prevVal) / d1 * 100;
+            } else if (nextVal != null && d2 > 0) {
+                return (nextVal - v) / d2 * 100;
+            }
+            return null;
         });
 
         let filteredDist = 0;
@@ -3746,24 +3817,45 @@ async function updateElevationProfile() {
             let sum = 0, count = 0;
             let distBack = 0, distFwd = 0;
 
-            // Average current point
-            sum += smoothingGrades[i]; count++;
+            if (smoothingGrades[i] != null) {
+                sum += smoothingGrades[i];
+                count++;
+            }
 
-            // Scan backward up to targetWindowMeters / 2
             for (let j = i - 1; j >= 0; j--) {
                 const d = haversineDistance(coords[j], coords[j + 1]);
                 distBack += d;
                 if (distBack > targetWindowMeters / 2) break;
-                sum += smoothingGrades[j]; count++;
+                if (smoothingGrades[j] != null) {
+                    sum += smoothingGrades[j];
+                    count++;
+                }
             }
-            // Scan forward up to targetWindowMeters / 2
+
             for (let j = i; j < smoothingGrades.length - 1; j++) {
                 const d = haversineDistance(coords[j], coords[j + 1]);
                 distFwd += d;
                 if (distFwd > targetWindowMeters / 2) break;
-                sum += smoothingGrades[j + 1]; count++;
+                if (smoothingGrades[j + 1] != null) {
+                    sum += smoothingGrades[j + 1];
+                    count++;
+                }
             }
-            smoothedSegmentGrades.push(sum / count);
+
+            if (count > 0) {
+                smoothedSegmentGrades.push(sum / count);
+            } else {
+                let fallback = 0;
+                for (let j = i; j >= 0; j--) {
+                    if (smoothingGrades[j] != null) { fallback = smoothingGrades[j]; break; }
+                }
+                if (fallback === 0) {
+                    for (let j = i; j < smoothingGrades.length; j++) {
+                        if (smoothingGrades[j] != null) { fallback = smoothingGrades[j]; break; }
+                    }
+                }
+                smoothedSegmentGrades.push(fallback);
+            }
         }
         // Build smoothedGrades for map/chart coloring: length N.
         const smoothedGrades = smoothedSegmentGrades;
@@ -3841,23 +3933,20 @@ async function updateElevationProfile() {
             elevationChart.update('none');
         } catch (e) { }
 
-        let maxUpGrade = 0;
-        let maxDownGrade = 0;
+        let maxUpGrade = -Infinity;
+        let maxDownGrade = Infinity;
         let maxUpIdx = 0;
         let maxDownIdx = 0;
 
         for (let i = 0; i < smoothedSegmentGrades.length; i++) {
             const grade = smoothedSegmentGrades[i];
-            if (grade > 0.5) {
-                if (grade > maxUpGrade) {
-                    maxUpGrade = grade;
-                    maxUpIdx = i;
-                }
-            } else if (grade < -0.5) {
-                if (grade < maxDownGrade) {
-                    maxDownGrade = grade;
-                    maxDownIdx = i;
-                }
+            if (grade > maxUpGrade) {
+                maxUpGrade = grade;
+                maxUpIdx = i;
+            }
+            if (grade < maxDownGrade) {
+                maxDownGrade = grade;
+                maxDownIdx = i;
             }
         }
 
@@ -3990,54 +4079,52 @@ function removeInitialCover() {
 }
 
 function requestLocation(fly = false) {
-    const isLocalhost = ['localhost', '127.0.0.1', '0.0.0.0'].includes(window.location.hostname) ||
-        window.location.hostname.startsWith('192.168.') ||
-        window.location.hostname.startsWith('10.') ||
-        window.location.hostname.startsWith('172.') ||
-        !("geolocation" in navigator);
-    if (isLocalhost) {
-        const options = {
-            center: [-122.4018, 37.7885],
-            zoom: 13,
-            speed: 1.5,
-            curve: 1.2
-        };
+    const fallbackOptions = {
+        center: [-122.4018, 37.7885],
+        zoom: 13,
+        speed: 1.5,
+        curve: 1.2
+    };
+
+    if (!("geolocation" in navigator)) {
         if (fly) {
-            map.flyTo(options);
+            map.flyTo(fallbackOptions);
         } else {
-            map.jumpTo({ center: options.center, zoom: options.zoom });
+            map.jumpTo({ center: fallbackOptions.center, zoom: fallbackOptions.zoom });
         }
         return;
     }
 
-    if (!("geolocation" in navigator)) return;
     navigator.geolocation.getCurrentPosition(
         (pos) => {
             const freshLng = pos.coords.longitude;
             const freshLat = pos.coords.latitude;
             const currentCenter = map.getCenter();
 
-            // Check if fresh coordinates differ significantly from current center (~500 meters)
-            const diffLng = Math.abs(currentCenter.lng - freshLng);
-            const diffLat = Math.abs(currentCenter.lat - freshLat);
-
             const options = {
                 center: [freshLng, freshLat],
                 zoom: 13,
-                speed: 1.5, // fast flyTo speed
+                speed: 1.5,
                 curve: 1.2
             };
 
-            if (diffLng > 0.005 || diffLat > 0.005) {
-                if (fly) {
-                    map.flyTo(options);
-                } else {
+            if (fly) {
+                map.flyTo(options);
+            } else {
+                const diffLng = Math.abs(currentCenter.lng - freshLng);
+                const diffLat = Math.abs(currentCenter.lat - freshLat);
+                if (diffLng > 0.005 || diffLat > 0.005) {
                     map.jumpTo({ center: options.center, zoom: options.zoom });
                 }
             }
         },
-        () => {
-            // Keep current location if fetch fails
+        (err) => {
+            console.warn("Geolocation failed or denied, falling back to San Francisco:", err);
+            if (fly) {
+                map.flyTo(fallbackOptions);
+            } else {
+                map.jumpTo({ center: fallbackOptions.center, zoom: fallbackOptions.zoom });
+            }
         },
         { timeout: 5000, enableHighAccuracy: true }
     );
@@ -4333,7 +4420,8 @@ const ACTION_NAMES = {
     toggleStats: 'Toggle Route Statistics',
     reverse: 'Reverse Entire Route',
     deleteLast: 'Delete Last Point / Clear Route (Ctrl)',
-    resetOrientation: 'Reset Map Orientation'
+    resetOrientation: 'Reset Map Orientation',
+    centerLocation: 'Center on Current Location'
 };
 
 function renderKeybindings() {
