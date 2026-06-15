@@ -76,15 +76,21 @@ const map = new maplibregl.Map({
     fadeDuration: 0,
     trackResize: true,
     clickTolerance: 8,
+    aroundCenter: false,
     transformRequest: (url, resourceType) => {
         // No custom headers to avoid CORS preflight failures on tile servers
     }
 });
 
-// Double right-click capture to reset orientation
+// Double right-click capture to reset orientation and right-click drag cursor (grabbing hand)
 let lastRightClickTime = 0;
+let isRightClickDragging = false;
+
 map.getCanvasContainer().addEventListener('mousedown', (e) => {
     if (e.button === 2) { // Right mouse button
+        isRightClickDragging = true;
+        document.body.classList.add('right-click-dragging');
+
         const now = Date.now();
         if (now - lastRightClickTime < 350) {
             e.preventDefault();
@@ -97,9 +103,18 @@ map.getCanvasContainer().addEventListener('mousedown', (e) => {
     }
 }, true);
 
+window.addEventListener('mouseup', (e) => {
+    if (isRightClickDragging) {
+        isRightClickDragging = false;
+        document.body.classList.remove('right-click-dragging');
+    }
+}, true);
+
+
 // Enable native right-click tilt/rotate controls (MapLibre's built-in dragRotate is highly optimized)
 map.dragRotate.enable();
 map.touchZoomRotate.enable(); // No 'around: center' — use finger midpoint for pinch zoom/rotate
+map.scrollZoom.enable({ around: 'center' }); // Zoom around center to bypass expensive 3D terrain raycast intersections on scroll
 
 // Middle-click popup helper
 let middleClickStartX = null, middleClickStartY = null;
@@ -207,6 +222,7 @@ let isUpdatingElevation = false;
 let lastHoverIdx = -1;
 let currentHoverDispDist = null;
 let isZooming = false;
+let routeScreenPtsDirty = true;
 let bestCiGlobal = -1; // Exported from mousemove for use in dragging
 let waypointPathIndices = []; // Indices in currentRouteGeoJSON.coordinates where waypoints reside
 let lastSegIdx = -1;
@@ -400,6 +416,48 @@ let _routeGradStops = null;
 function rebuildMapGradient() {
     if (!currentRouteGeoJSON) return;
     const coords = currentRouteGeoJSON.coordinates;
+
+    if (coords.length > 250) {
+        // Skip mitering for long routes to ensure top performance
+        rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
+        displayIndexToRawIndex = coords.map((_, i) => i);
+        currentDisplayCoords = coords;
+
+        displayMercatorDistances = [0];
+        let dAcc = 0;
+        for (let i = 1; i < coords.length; i++) {
+            dAcc += getMercatorDistance(coords[i - 1], coords[i]);
+            displayMercatorDistances.push(dAcc);
+        }
+        displayMercTotalDist = dAcc;
+
+        const gradSrc = map.getSource('route-gradient');
+        if (gradSrc) gradSrc.setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } });
+        routeScreenPtsDirty = true;
+
+        const grades = routeGrades;
+        if (!grades || !routeMercatorDistances || routeMercTotalDist <= 0) {
+            if (map.getLayer('route-gradient-layer'))
+                map.setPaintProperty('route-gradient-layer', 'line-gradient',
+                    ['interpolate', ['linear'], ['line-progress'], 0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)']);
+            return;
+        }
+        const gradStops = [];
+        let lastFrac = -1;
+        for (let i = 0; i < coords.length; i++) {
+            const frac = Math.min(Math.max(displayMercatorDistances[i] / (displayMercTotalDist || 1), 0), 1);
+            if (frac <= lastFrac) continue;
+            lastFrac = frac;
+            gradStops.push(frac, getColorForGrade(grades[Math.min(i + 1, grades.length - 1)] ?? 0));
+        }
+        if (map.getLayer('route-gradient-layer'))
+            map.setPaintProperty('route-gradient-layer', 'line-gradient',
+                ['interpolate', ['linear'], ['line-progress'], ...gradStops]);
+        // Clean up turnaround layer on long routes
+        updateTurnaroundJoins();
+        return;
+    }
+
     // Using miter-corrected coordinates for the map display.
     const displayCoords = miterInsideCorners(coords);
     currentDisplayCoords = displayCoords; // Store for hover snap engine
@@ -415,7 +473,7 @@ function rebuildMapGradient() {
 
     const gradSrc = map.getSource('route-gradient');
     if (gradSrc) gradSrc.setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: displayCoords } });
-    rebuildRouteScreenPts(); // Snap engine must reflect the new display line
+    routeScreenPtsDirty = true; // Snap engine must reflect the new display line
 
     const grades = routeGrades;
     if (!grades || !routeMercatorDistances || routeMercTotalDist <= 0) {
@@ -492,15 +550,15 @@ function showHoverSegment(ci) {
 function updateTurnaroundJoins() {
     if (!currentRouteGeoJSON || !map.getSource('turnarounds')) return;
 
-    const turns = [];
     const coords = currentRouteGeoJSON.coordinates;
     const pxOffset = getPixelOffset(map.getZoom());
 
-    if (pxOffset < 0.5) {
+    if (pxOffset < 0.5 || coords.length > 250) {
         map.getSource('turnarounds').setData({ type: 'FeatureCollection', features: [] });
         return;
     }
 
+    const turns = [];
     for (let i = 1; i < coords.length - 1; i++) {
         // Find preceding coordinate at least 1 meter away from coords[i]
         let prevIdx = i - 1;
@@ -618,13 +676,22 @@ hoverInfoEl.style.cssText = [
 ].join(';');
 document.getElementById('map').appendChild(hoverInfoEl);
 
+// Lightweight DOM-based hover circle element to avoid WebGL state flushes
+const hoverCircleEl = document.createElement('div');
+hoverCircleEl.id = 'hover-circle-dom';
+document.getElementById('map').appendChild(hoverCircleEl);
+
 function showHoverMarker(lngLat, info) {
-    const src = map.getSource('hover-point');
     const coords = Array.isArray(lngLat) ? lngLat : [lngLat.lng, lngLat.lat];
-    if (src) src.setData({ type: 'Feature', geometry: { type: 'Point', coordinates: coords }, properties: {} });
+    const pt = map.project(coords);
+
+    // Position DOM hover circle
+    hoverCircleEl.style.left = pt.x + 'px';
+    hoverCircleEl.style.top = pt.y + 'px';
+    hoverCircleEl.style.display = 'block';
+
     // Position the info label
     if (info) {
-        const pt = map.project(coords);
         hoverInfoEl.innerHTML = info;
         hoverInfoEl.style.left = pt.x + 'px';
         hoverInfoEl.style.top = pt.y + 'px';
@@ -632,18 +699,23 @@ function showHoverMarker(lngLat, info) {
     }
 }
 function hideHoverMarker() {
-    const src = map.getSource('hover-point');
-    if (src) src.setData({ type: 'FeatureCollection', features: [] });
+    // Exit early if hover elements are already hidden to prevent expensive flushes on drag/pan/zoom start
+    if (hoverCircleEl.style.display === 'none' && hoverInfoEl.style.display === 'none') {
+        return;
+    }
     currentHoverDispDist = null;
     if (elevationChart) {
-        elevationChart.setActiveElements([]);
-        if (elevationChart.tooltip) elevationChart.tooltip.setActiveElements([]);
-        elevationChart.update('none');
+        try {
+            elevationChart.setActiveElements([]);
+            if (elevationChart.tooltip) elevationChart.tooltip.setActiveElements([]);
+            elevationChart.update('none');
+        } catch (err) { }
     }
     lastSegIdx = -1;
     map.getSource('hover-segment')?.setData({ type: 'FeatureCollection', features: [] });
     map.setFilter('turnaround-highlight-layer', ['==', ['get', 'idx'], -1]);
     map.setFilter('turnaround-layer', null);
+    hoverCircleEl.style.display = 'none';
     hoverInfoEl.style.display = 'none';
 }
 
@@ -701,9 +773,9 @@ function setupRouteLayers() {
     const terrainEncoding = 'terrarium';
 
     if (!map.getSource('terrain-source'))
-        map.addSource('terrain-source', { type: 'raster-dem', tiles: terrainTiles, tileSize: 256, encoding: terrainEncoding, maxzoom: 12 });
+        map.addSource('terrain-source', { type: 'raster-dem', tiles: terrainTiles, tileSize: 256, encoding: terrainEncoding, maxzoom: 11 });
 
-    // Hillshade can use the same source as terrain to save memory and network
+    // Hillshade shares the same source as terrain to save decoding overhead and avoid main-thread performance blocks
     if (!map.getLayer('hillshade-layer'))
         map.addLayer({ id: 'hillshade-layer', type: 'hillshade', source: 'terrain-source', paint: { 'hillshade-exaggeration': 0.5, 'hillshade-shadow-color': 'rgba(0,0,0,0.5)', 'hillshade-highlight-color': 'rgba(255,255,255,0.1)' }, layout: { visibility: 'none' } });
 
@@ -819,22 +891,7 @@ function setupRouteLayers() {
         window._dragPreviewMarker._pinEl = pinEl;
     }
 
-    // Hover circle (Single grey circle with white stroke to match chart style)
-    if (!map.getSource('hover-point'))
-        map.addSource('hover-point', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
-    if (!map.getLayer('hover-circle'))
-        map.addLayer({
-            id: 'hover-circle',
-            type: 'circle',
-            source: 'hover-point',
-            paint: {
-                'circle-radius': 6,
-                'circle-color': '#4b5563',
-                'circle-stroke-width': 1.5,
-                'circle-stroke-color': '#ffffff',
-                'circle-pitch-alignment': 'map'
-            }
-        });
+    // Hover circle is handled via lightweight DOM elements to avoid WebGL state flushes
 
 
     // Re-upload route data if already computed (e.g. after a style swap)
@@ -856,15 +913,20 @@ map.on('style.load', () => {
         isFirstLoad = false;
     }
 
+    let lastZoom = map.getZoom();
     const updateView = () => {
-        rebuildRouteScreenPts();
-        updateTurnaroundJoins();
-        rebuildMapGradient(); // Miter point depends on zoom — refresh display coords
+        routeScreenPtsDirty = true;
+        const currentZoom = map.getZoom();
+        if (currentZoom !== lastZoom) {
+            lastZoom = currentZoom;
+            updateTurnaroundJoins();
+            rebuildMapGradient(); // Miter point depends on zoom — refresh display coords
+        }
 
         try {
             const center = map.getCenter();
             localStorage.setItem('last_map_center', JSON.stringify([center.lng, center.lat]));
-            localStorage.setItem('last_map_zoom', map.getZoom().toString());
+            localStorage.setItem('last_map_zoom', currentZoom.toString());
         } catch (_) { }
     };
     map.on('moveend', updateView);
@@ -906,6 +968,10 @@ map.on('mouseleave', 'route-line', () => {
 // Throttled Hover Logic: Only runs when mouse is near the route
 let lastHoverTime = 0;
 function findClosestPointOnLine(mousePt) {
+    if (routeScreenPtsDirty) {
+        rebuildRouteScreenPts();
+        routeScreenPtsDirty = false;
+    }
     if (!currentRouteGeoJSON || !routeScreenPts) return { bestCi: -1 };
     const currentOffset = getPixelOffset(map.getZoom());
     let bestDistSq = Infinity;
@@ -952,6 +1018,10 @@ map.on('mousemove', 'route-line', (e) => {
     if (map.isMoving() || map.isZooming() || map.isRotating()) {
         clearHoverHighlight();
         return;
+    }
+    if (routeScreenPtsDirty) {
+        rebuildRouteScreenPts();
+        routeScreenPtsDirty = false;
     }
     const now = performance.now();
     if (now - lastHoverTime < 16) return; // 60fps throttle
@@ -1075,16 +1145,6 @@ function clearHoverHighlight() {
         lastSegIdx = -1;
         currentHoverDispDist = null; // Clear chart hover line
         hideHoverMarker();
-        map.getSource('hover-segment')?.setData({ type: 'FeatureCollection', features: [] });
-        map.setFilter('turnaround-highlight-layer', ['==', ['get', 'idx'], -1]);
-        map.setFilter('turnaround-layer', null);
-        if (elevationChart) {
-            try {
-                elevationChart.setActiveElements([]);
-                if (elevationChart.tooltip) elevationChart.tooltip.setActiveElements([]);
-                elevationChart.update('none');
-            } catch (err) { }
-        }
     }
 }
 
@@ -1278,6 +1338,9 @@ let isDraggingMarker = false;
 let draggedWaypointIndex = -1;
 
 function cancelDraggingGestures() {
+    if (!isDraggingLine && !isDraggingMarker && !window._currentlyDraggingMarker) {
+        return;
+    }
     console.log('[Antigravity] cancelDraggingGestures triggered. isDraggingLine:', isDraggingLine, 'isDraggingMarker:', isDraggingMarker);
     if (isDraggingLine && typeof window._activeLineDragCleanup === 'function') {
         console.log('[Antigravity] Cancelling active line drag...');
@@ -1310,10 +1373,6 @@ function cancelDraggingGestures() {
         }, 50);
     }
 
-    console.log('[Antigravity] Dispatching mouseup and touchend to window...');
-    window.dispatchEvent(new Event('mouseup', { bubbles: true, cancelable: true }));
-    window.dispatchEvent(new Event('touchend', { bubbles: true, cancelable: true }));
-
     isDraggingMarker = false;
     window._currentlyDraggingMarker = null;
     window._currentlyDraggingMarkerOriginalLngLat = null;
@@ -1324,6 +1383,14 @@ function cancelDraggingGestures() {
 map.on('rotatestart', () => { console.log('[Antigravity] map rotatestart'); cancelDraggingGestures(); });
 map.on('pitchstart', () => { console.log('[Antigravity] map pitchstart'); cancelDraggingGestures(); });
 map.on('zoomstart', () => { console.log('[Antigravity] map zoomstart'); cancelDraggingGestures(); });
+map.on('rotateend', () => {
+    isRightClickDragging = false;
+    document.body.classList.remove('right-click-dragging');
+});
+map.on('pitchend', () => {
+    isRightClickDragging = false;
+    document.body.classList.remove('right-click-dragging');
+});
 
 // Intercept touch events on capture phase before MapLibre GL stops propagation
 const handleMultiTouch = (e) => {
@@ -1878,7 +1945,7 @@ async function updateRoute() {
 
     if (map.getSource('route')) map.getSource('route').setData(currentRouteGeoJSON);
     rebuildMapGradient();
-    if (typeof rebuildRouteScreenPts === 'function') rebuildRouteScreenPts();
+    routeScreenPtsDirty = true;
     updateDistanceUI();
     // Calculate waypoint distances for the chart
     let dSum = 0;
@@ -2568,8 +2635,8 @@ function applyTerrain() {
         map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', 0.5);
         if (map.getTerrain()) map.setTerrain(null);
     } else if (val === 'terrain') {
-        map.setLayoutProperty('hillshade-layer', 'visibility', 'visible');
-        map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', 0.5);
+        // Set hillshade to none when 3D terrain is active to prevent shared-source warning and lag
+        map.setLayoutProperty('hillshade-layer', 'visibility', 'none');
         map.setTerrain({ source: 'terrain-source', exaggeration: exVal });
     }
 
@@ -3911,7 +3978,7 @@ async function updateElevationProfile() {
         routeMercTotalDist = mercDist;
 
         rebuildMapGradient();
-        rebuildRouteScreenPts();
+        routeScreenPtsDirty = true;
 
         if (!initialBasemapCycled) {
             initialBasemapCycled = true;

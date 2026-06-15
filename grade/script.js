@@ -56,16 +56,32 @@ const map = new maplibregl.Map({
     antialias: false,
     fadeDuration: 0,
     trackResize: true,
-    clickTolerance: 8
+    clickTolerance: 8,
+    aroundCenter: false
 });
 
 map.dragRotate.enable();
 map.touchZoomRotate.enable();
+map.scrollZoom.enable({ around: 'center' }); // Zoom around center to bypass expensive 3D terrain raycast intersections on scroll
 
-// Double right-click to reset orientation
+map.on('rotateend', () => {
+    isRightClickDragging = false;
+    document.body.classList.remove('right-click-dragging');
+});
+map.on('pitchend', () => {
+    isRightClickDragging = false;
+    document.body.classList.remove('right-click-dragging');
+});
+
+// Double right-click capture to reset orientation and right-click drag cursor (grabbing hand)
 let lastRightClickTime = 0;
+let isRightClickDragging = false;
+
 map.getCanvasContainer().addEventListener('mousedown', (e) => {
-    if (e.button === 2) {
+    if (e.button === 2) { // Right mouse button
+        isRightClickDragging = true;
+        document.body.classList.add('right-click-dragging');
+
         const now = Date.now();
         if (now - lastRightClickTime < 350) {
             e.preventDefault();
@@ -75,6 +91,13 @@ map.getCanvasContainer().addEventListener('mousedown', (e) => {
             return;
         }
         lastRightClickTime = now;
+    }
+}, true);
+
+window.addEventListener('mouseup', (e) => {
+    if (isRightClickDragging) {
+        isRightClickDragging = false;
+        document.body.classList.remove('right-click-dragging');
     }
 }, true);
 
@@ -217,7 +240,7 @@ function setupGradeLayers() {
             tiles: terrainTiles,
             tileSize: 256,
             encoding: terrainEncoding,
-            maxzoom: 12
+            maxzoom: 11
         });
     }
 
@@ -300,8 +323,13 @@ function setupGradeLayers() {
             anchor: 'bottom'
         });
 
+        let lastHoverTime = 0;
         map.on('mousemove', 'grade-roads-hover-sensor', (e) => {
             if (stickySegmentId) return; // Ignore hover updates when locked
+
+            const now = performance.now();
+            if (now - lastHoverTime < 30) return; // Throttle to ~30fps to avoid blocking main thread
+            lastHoverTime = now;
 
             const features = map.queryRenderedFeatures(e.point, { layers: ['grade-roads-hover-sensor'] });
             if (features.length > 0) {
@@ -684,8 +712,8 @@ function applyTerrain() {
         map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', 0.5);
         if (map.getTerrain()) map.setTerrain(null);
     } else if (val === 'terrain') {
-        map.setLayoutProperty('hillshade-layer', 'visibility', 'visible');
-        map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', 0.5);
+        // Disable hillshade overlay when 3D terrain is active to improve performance and prevent warnings
+        map.setLayoutProperty('hillshade-layer', 'visibility', 'none');
         map.setTerrain({ source: 'terrain-source', exaggeration: exVal });
     }
 }
