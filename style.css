@@ -1234,3 +1234,9 @@ body.right-click-dragging #map canvas {
     z-index: 9;
     transform: translate(-50%, -50%);
 }
+
+/* Hide markers completely when they are behind 3D terrain/horizon */
+.maplibregl-marker.maplibregl-marker-covered {
+    opacity: 0 !important;
+    pointer-events: none !important;
+}
