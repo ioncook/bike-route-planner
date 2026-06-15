@@ -540,8 +540,16 @@ function showHoverSegment(ci) {
     } else {
         stops.push(0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)');
     }
+    if (map.getLayer('hover-segment-layer')) {
+        map.setLayoutProperty('hover-segment-layer', 'visibility', 'none');
+    }
     map.getSource('hover-segment')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: subCoords } });
     map.setPaintProperty('hover-segment-layer', 'line-gradient', stops);
+    requestAnimationFrame(() => {
+        if (map.getLayer('hover-segment-layer')) {
+            map.setLayoutProperty('hover-segment-layer', 'visibility', 'visible');
+        }
+    });
     // Exclusive-start range: corner at a waypoint boundary (idx==endIndex) is included in the
     // approach segment but excluded from the departure segment — avoids double-bolding.
     map.setFilter('turnaround-highlight-layer', ['all', ['>', ['get', 'idx'], startIndex], ['<=', ['get', 'idx'], endIndex]]);
@@ -1632,39 +1640,40 @@ function showWeatherPopup(lngLat) {
         `)
         .addTo(map);
 
+    const popupNode = currentInfoPopup.getElement();
+    const targetElevEl = popupNode ? popupNode.querySelector('#weather-elev-val') : null;
+    const targetTempEl = popupNode ? popupNode.querySelector('#weather-temp') : null;
+    const targetWindEl = popupNode ? popupNode.querySelector('#weather-wind') : null;
+    const targetIconEl = popupNode ? popupNode.querySelector('#weather-icon') : null;
+    const targetArrowEl = popupNode ? popupNode.querySelector('#wind-arrow') : null;
+
     // Fetch and display elevation using the settings units
     getHighResElevation([[lng, lat]]).then(elevs => {
         const elevVal = elevs[0];
-        const elevEl = document.getElementById('weather-elev-val');
-        if (elevEl) {
+        if (targetElevEl) {
             if (elevVal != null) {
                 const converted = currentUnits === 'imperial' ? elevVal * 3.28084 : elevVal;
                 const unitLabel = currentUnits === 'imperial' ? ' ft' : ' m';
-                elevEl.innerText = `${converted.toFixed(1)}${unitLabel}`;
+                targetElevEl.innerText = `${converted.toFixed(1)}${unitLabel}`;
             } else {
-                elevEl.innerText = 'No data';
+                targetElevEl.innerText = 'No data';
             }
         }
     }).catch(err => {
         console.error('Elevation query error:', err);
-        const elevEl = document.getElementById('weather-elev-val');
-        if (elevEl) elevEl.innerText = 'No data';
+        if (targetElevEl) targetElevEl.innerText = 'No data';
     });
 
     fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,wind_speed_10m,weather_code,wind_direction_10m&temperature_unit=${units}&wind_speed_unit=${windUnits}`)
         .then(r => r.json())
         .then(data => {
-            const tempEl = document.getElementById('weather-temp');
-            const windEl = document.getElementById('weather-wind');
-            const iconEl = document.getElementById('weather-icon');
-            const arrowEl = document.getElementById('wind-arrow');
-            if (tempEl) tempEl.innerText = `${Math.round(data.current.temperature_2m)}${tempLabel}`;
-            if (windEl) windEl.innerText = `${Math.round(data.current.wind_speed_10m)}${windLabel}`;
-            if (iconEl) iconEl.innerHTML = getWeatherIcon(data.current.weather_code);
-            if (arrowEl && data.current.wind_direction_10m !== undefined) {
-                arrowEl.style.display = 'inline-block';
+            if (targetTempEl) targetTempEl.innerText = `${Math.round(data.current.temperature_2m)}${tempLabel}`;
+            if (targetWindEl) targetWindEl.innerText = `${Math.round(data.current.wind_speed_10m)}${windLabel}`;
+            if (targetIconEl) targetIconEl.innerHTML = getWeatherIcon(data.current.weather_code);
+            if (targetArrowEl && data.current.wind_direction_10m !== undefined) {
+                targetArrowEl.style.display = 'inline-block';
                 // Meteorological wind is 'from' direction. We add 180 to point the arrow 'towards' the flow.
-                arrowEl.style.transform = `rotate(${data.current.wind_direction_10m + 180}deg)`;
+                targetArrowEl.style.transform = `rotate(${data.current.wind_direction_10m + 180}deg)`;
             }
         }).catch(err => console.error('Weather fetch error:', err));
 }
@@ -1753,6 +1762,25 @@ let _elevRetryScheduled = false;
 let forceMode = false; // straight-line mode — skips OSRM routing
 let segmentModes = []; // 'routed' | 'direct' | 'gpx' for each segment between consecutive waypoints
 let segmentGPXPaths = []; // stores raw coordinates arrays for segments with mode === 'gpx'
+
+// --- Toast notification system ---
+function showToast(message, type = 'error') {
+    let toast = document.getElementById('app-toast');
+    if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'app-toast';
+        toast.className = 'toast-notification';
+        document.body.appendChild(toast);
+    }
+    toast.textContent = message;
+    toast.className = `toast-notification ${type} show`;
+    
+    // Auto-hide after 4 seconds
+    clearTimeout(toast.timeoutId);
+    toast.timeoutId = setTimeout(() => {
+        toast.classList.remove('show');
+    }, 4000);
+}
 
 // --- Loading status indicator ---
 function setStatus(phase) {
@@ -1886,7 +1914,7 @@ async function fetchOneSegment(from, to, mode, avoidUnpaved, excludeParam, signa
     } catch (e) {
         if (e.name === 'AbortError') throw e;
     }
-    return { coords: [from, to], dist: turf_distance(from, to) };
+    return { coords: [from, to], dist: turf_distance(from, to), failed: true };
 }
 
 let currentAbortController = null;
@@ -1933,11 +1961,19 @@ async function updateRoute() {
         }
         segments = await Promise.all(segmentPromises);
         if (signal.aborted) return;
+
+        // Warn if any routed segment had to fall back to a straight line due to API failures
+        const anyFailed = segments.some(seg => seg.failed);
+        if (anyFailed) {
+            showToast("Could not find route. Using straight-line fallback.", "warning");
+        }
     } catch (e) {
+        clearStatus();
         if (e.name === 'AbortError') {
             console.log('Routing aborted');
             return;
         }
+        showToast("Routing failed. Please check your internet connection.");
         throw e;
     }
 
