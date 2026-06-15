@@ -219,6 +219,7 @@ loadKeybindings();
 // map.on('load') fires and immediately triggers updateElevationProfile
 let elevationChart = null;
 let isUpdatingElevation = false;
+let currentElevationQueryId = 0;
 let lastHoverIdx = -1;
 let currentHoverDispDist = null;
 let isZooming = false;
@@ -3653,7 +3654,7 @@ function initChart() {
 
 
 async function updateElevationProfile() {
-    if (isUpdatingElevation) return;
+    const queryId = ++currentElevationQueryId;
     if (!elevationChart) initChart();
 
     if (!currentRouteGeoJSON || !needsElevationUpdate) {
@@ -3683,6 +3684,8 @@ async function updateElevationProfile() {
         // Fetch highest-res Mapzen Terrarium elevation data
         setStatus('Fetching elevation…');
         const elevations = await getHighResElevation(coords);
+        if (queryId !== currentElevationQueryId) return; // Stale query, abort!
+
         setStatus('Processing…');
 
         // Null check: if samples are null, tiles might still be loading.
