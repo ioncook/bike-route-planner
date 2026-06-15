@@ -775,9 +775,11 @@ function setupRouteLayers() {
     if (!map.getSource('terrain-source'))
         map.addSource('terrain-source', { type: 'raster-dem', tiles: terrainTiles, tileSize: 256, encoding: terrainEncoding, maxzoom: 11 });
 
-    // Hillshade shares the same source as terrain to save decoding overhead and avoid main-thread performance blocks
+    if (!map.getSource('hillshade-source'))
+        map.addSource('hillshade-source', { type: 'raster-dem', tiles: terrainTiles, tileSize: 256, encoding: terrainEncoding, maxzoom: 11 });
+
     if (!map.getLayer('hillshade-layer'))
-        map.addLayer({ id: 'hillshade-layer', type: 'hillshade', source: 'terrain-source', paint: { 'hillshade-exaggeration': 0.5, 'hillshade-shadow-color': 'rgba(0,0,0,0.5)', 'hillshade-highlight-color': 'rgba(255,255,255,0.1)' }, layout: { visibility: 'none' } });
+        map.addLayer({ id: 'hillshade-layer', type: 'hillshade', source: 'hillshade-source', paint: { 'hillshade-exaggeration': 0.5, 'hillshade-shadow-color': 'rgba(0,0,0,0.5)', 'hillshade-highlight-color': 'rgba(255,255,255,0.1)' }, layout: { visibility: 'none' } });
 
     // Route sources (Removed tolerance:0 to allow MapLibre to simplify geometry based on zoom level)
     if (!map.getSource('route'))
@@ -2665,8 +2667,9 @@ function applyTerrain() {
         map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', 0.5);
         if (map.getTerrain()) map.setTerrain(null);
     } else if (val === 'terrain') {
-        // Set hillshade to none when 3D terrain is active to prevent shared-source warning and lag
-        map.setLayoutProperty('hillshade-layer', 'visibility', 'none');
+        // Keep hillshade visible along with 3D terrain using separate sources to prevent warnings
+        map.setLayoutProperty('hillshade-layer', 'visibility', 'visible');
+        map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', 0.5);
         map.setTerrain({ source: 'terrain-source', exaggeration: exVal });
     }
 
