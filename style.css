@@ -740,7 +740,7 @@ body.light-mode .custom-tooltip {
     background: var(--bg-panel) !important;
     color: var(--text-main) !important;
     border-radius: 12px !important;
-    padding: 8px 12px 12px !important;
+    padding: 6px 10px 10px !important;
     box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4) !important;
     border: 1px solid var(--border) !important;
 }

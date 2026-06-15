@@ -1590,8 +1590,8 @@ function showWeatherPopup(lngLat) {
     currentInfoPopup = new maplibregl.Popup({ closeButton: true, className: 'weather-popup', anchor: 'bottom' })
         .setLngLat(lngLat)
         .setHTML(`
-            <div style="font-family: 'Inter', sans-serif; min-width: 160px; padding: 4px;">
-                <div style="margin-top: 0;">
+            <div style="font-family: 'Inter', sans-serif; padding: 0; white-space: nowrap;">
+                <div style="margin-top: 0; padding-right: 20px;">
                     <a href="https://www.google.com/maps/search/?api=1&query=${lat},${lng}" target="_blank" 
                        style="display: flex; align-items: center; color: #3b82f6; text-decoration: underline; text-underline-offset: 2px; font-size: 14px; font-weight: 600; margin-bottom: 8px;">
                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 6px; flex-shrink: 0;">
@@ -1605,9 +1605,15 @@ function showWeatherPopup(lngLat) {
                        ${lat.toFixed(2)}, ${lng.toFixed(2)}
                     </a>
                 </div>
+                <div style="display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-muted); margin-bottom: 8px;">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink: 0; opacity: 0.7;">
+                        <path d="m8 3 4 8 5-5 5 15H2L8 3z"/>
+                    </svg>
+                    <span>Elev: <span id="weather-elev-val" style="font-weight: 600; color: var(--text-main);">Fetching...</span></span>
+                </div>
                 <div id="weather-info">
                     <a href="https://www.windy.com/${lat}/${lng}?${lat},${lng},11" target="_blank" style="text-decoration: none; color: inherit; display: block;">
-                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <div style="display: flex; justify-content: flex-start; align-items: center; gap: 14px;">
                             <div style="display: flex; align-items: center; gap: 8px;">
                                 <span id="weather-icon" style="display: flex; align-items: center; color: #888;"></span>
                                 <span id="weather-temp" style="font-weight: 700; font-size: 16px; text-decoration: underline; text-underline-offset: 2px;">...</span>
@@ -1622,6 +1628,25 @@ function showWeatherPopup(lngLat) {
             </div>
         `)
         .addTo(map);
+
+    // Fetch and display elevation using the settings units
+    getHighResElevation([[lng, lat]]).then(elevs => {
+        const elevVal = elevs[0];
+        const elevEl = document.getElementById('weather-elev-val');
+        if (elevEl) {
+            if (elevVal != null) {
+                const converted = currentUnits === 'imperial' ? elevVal * 3.28084 : elevVal;
+                const unitLabel = currentUnits === 'imperial' ? ' ft' : ' m';
+                elevEl.innerText = `${converted.toFixed(1)}${unitLabel}`;
+            } else {
+                elevEl.innerText = 'No data';
+            }
+        }
+    }).catch(err => {
+        console.error('Elevation query error:', err);
+        const elevEl = document.getElementById('weather-elev-val');
+        if (elevEl) elevEl.innerText = 'No data';
+    });
 
     fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,wind_speed_10m,weather_code,wind_direction_10m&temperature_unit=${units}&wind_speed_unit=${windUnits}`)
         .then(r => r.json())
@@ -2513,6 +2538,11 @@ document.getElementById('units').addEventListener('change', (e) => {
     // Force chart to re-render with new units (elevation data is cached in the worker tile cache)
     needsElevationUpdate = true;
     if (typeof updateElevationProfile === 'function') updateElevationProfile();
+    
+    // Dynamically refresh the weather & elevation popup if it is currently open
+    if (currentInfoPopup && currentInfoPopup.isOpen()) {
+        showWeatherPopup(currentInfoPopup.getLngLat());
+    }
 });
 
 document.getElementById('projection').addEventListener('change', (e) => {
