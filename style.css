@@ -222,6 +222,7 @@ body {
     opacity: 1;
     pointer-events: auto;
     margin-left: 4px;
+    overflow: visible;
 }
 
 #map-search {
@@ -293,6 +294,10 @@ body {
 
 .icon-btn-group.active {
     border-color: var(--primary);
+}
+
+.icon-btn-group:has(.search-wrapper).active {
+    overflow: visible;
 }
 
 .icon-btn-group.active .icon-btn {

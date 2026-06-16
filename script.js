@@ -2297,7 +2297,7 @@ document.getElementById('reset-orientation-btn')?.addEventListener('click', () =
 
     function selectResult(item) {
         // Fly to location only — do NOT add a waypoint
-        map.flyTo({ center: [parseFloat(item.lon), parseFloat(item.lat)], zoom: 14 });
+        map.flyTo({ center: [parseFloat(item.lon), parseFloat(item.lat)], zoom: 12, speed: 2.4 });
         collapseSearch();
     }
 
@@ -2378,7 +2378,7 @@ document.getElementById('reset-orientation-btn')?.addEventListener('click', () =
                                 row.className = 'search-result-row';
                                 row.textContent = item.display_name;
                                 row.addEventListener('click', () => {
-                                    map.flyTo({ center: [parseFloat(item.lon), parseFloat(item.lat)], zoom: 14 });
+                                    map.flyTo({ center: [parseFloat(item.lon), parseFloat(item.lat)], zoom: 12, speed: 2.4 });
                                     closeMobileSearch();
                                 });
                                 mobileDropdown.appendChild(row);
