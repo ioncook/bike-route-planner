@@ -563,7 +563,7 @@ function updateTurnaroundJoins() {
     const coords = currentRouteGeoJSON.coordinates;
     const pxOffset = getPixelOffset(map.getZoom());
 
-    if (pxOffset < 0.5 || coords.length > 250) {
+    if (pxOffset < 0.5) {
         map.getSource('turnarounds').setData({ type: 'FeatureCollection', features: [] });
         return;
     }
@@ -592,31 +592,44 @@ function updateTurnaroundJoins() {
         while (d > 180) d -= 360;
         while (d < -180) d += 360;
 
-        // Draw a visual bridging staple ONLY for sharp left turns (where offset is on the outside, d < -100)
-        // or complete 180-degree right-hand turnarounds (where the path reverses direction completely, d > 160).
-        // Sharp right turns do not need a visual bridge.
-        if (d < -100 || d > 160) {
-            const pCenter = map.project(coords[i]);
-            const pIn = map.project(coords[prevIdx]);
-            const pOut = map.project(coords[nextIdx]);
+        // Fast bearing check: only evaluate side-switching on true turnarounds (> 160 degrees)
+        // This avoids calling expensive map.project() and completely removes staples/lumps on normal corners.
+        if (Math.abs(d) <= 160) continue;
 
-            // Right-hand normal vectors for in/out segments
-            const vInX = pCenter.x - pIn.x, vInY = pCenter.y - pIn.y;
-            const lIn = Math.sqrt(vInX * vInX + vInY * vInY);
-            if (lIn < 0.1) continue;
-            const nInX = -vInY / lIn, nInY = vInX / lIn;
+        const pCenter = map.project(coords[i]);
+        const pIn = map.project(coords[prevIdx]);
+        const pOut = map.project(coords[nextIdx]);
 
-            const vOutX = pOut.x - pCenter.x, vOutY = pOut.y - pCenter.y;
-            const lOut = Math.sqrt(vOutX * vOutX + vOutY * vOutY);
-            if (lOut < 0.1) continue;
-            const nOutX = -vOutY / lOut, nOutY = vOutX / lOut;
+        // Right-hand normal vectors for in/out segments
+        const vInX = pCenter.x - pIn.x, vInY = pCenter.y - pIn.y;
+        const lIn = Math.sqrt(vInX * vInX + vInY * vInY);
+        if (lIn < 0.1) continue;
+        const nInX = -vInY / lIn, nInY = vInX / lIn;
 
-            // Offset points are on the right side (positive normal)
-            const p1xy = [pCenter.x + nInX * pxOffset, pCenter.y + nInY * pxOffset];
-            const p2xy = [pCenter.x + nOutX * pxOffset, pCenter.y + nOutY * pxOffset];
+        const vOutX = pOut.x - pCenter.x, vOutY = pOut.y - pCenter.y;
+        const lOut = Math.sqrt(vOutX * vOutX + vOutY * vOutY);
+        if (lOut < 0.1) continue;
+        const nOutX = -vOutY / lOut, nOutY = vOutX / lOut;
 
-            if (isNaN(p1xy[0]) || isNaN(p1xy[1]) || isNaN(p2xy[0]) || isNaN(p2xy[1])) continue;
+        // Offset points are on the right side (positive normal)
+        const p1xy = [pCenter.x + nInX * pxOffset, pCenter.y + nInY * pxOffset];
+        const p2xy = [pCenter.x + nOutX * pxOffset, pCenter.y + nOutY * pxOffset];
 
+        if (isNaN(p1xy[0]) || isNaN(p1xy[1]) || isNaN(p2xy[0]) || isNaN(p2xy[1])) continue;
+
+        // Vector for incoming segment in screen space
+        const dx = pCenter.x - pIn.x;
+        const dy = pCenter.y - pIn.y;
+
+        // Cross products to determine which side of the incoming segment the offset points are on
+        const side1 = dx * (p1xy[1] - pIn.y) - dy * (p1xy[0] - pIn.x);
+        const side2 = dx * (p2xy[1] - pIn.y) - dy * (p2xy[0] - pIn.x);
+
+        // If they are on opposite sides, the offset line has switched sides of the street
+        // We use a small threshold (0.01) to ignore floating point boundary noise
+        const switchesSides = (side1 > 0.01 && side2 < -0.01) || (side1 < -0.01 && side2 > 0.01);
+
+        if (switchesSides) {
             const p1 = map.unproject(p1xy);
             const p2 = map.unproject(p2xy);
 
@@ -855,7 +868,7 @@ function setupRouteLayers() {
             id: 'route-gradient-layer',
             type: 'line',
             source: 'route-gradient',
-            layout: { 'line-join': 'round', 'line-cap': 'round' },
+            layout: { 'line-join': 'miter', 'line-cap': 'round' },
             paint: {
                 'line-color': 'rgb(34,197,94)',
                 'line-width': 5,
@@ -910,7 +923,7 @@ function setupRouteLayers() {
             id: 'hover-segment-layer',
             type: 'line',
             source: 'hover-segment',
-            layout: { 'line-join': 'round', 'line-cap': 'round' },
+            layout: { 'line-join': 'miter', 'line-cap': 'round' },
             paint: {
                 'line-width': 10,
                 'line-opacity': 1.0,
@@ -1009,6 +1022,13 @@ map.on('style.load', () => {
         } catch (_) { }
     };
     map.on('moveend', updateView);
+    map.on('zoom', () => {
+        const currentZoom = map.getZoom();
+        if (currentZoom !== lastZoom) {
+            lastZoom = currentZoom;
+            updateTurnaroundJoins();
+        }
+    });
     map.on('zoomend', () => { isZooming = false; updateView(); updateDistanceMarkers(); });
     map.on('zoomstart', () => { isZooming = true; });
     const updateCompass = () => {
