@@ -71,6 +71,7 @@ const map = new maplibregl.Map({
     zoom: initialZoom,
     maxZoom: 20,
     maxPitch: 85,
+    centerClampedToGround: false,
     projection: { type: localStorage.getItem('route_projection') || 'mercator' },
     antialias: false,
     fadeDuration: 0,
@@ -185,7 +186,7 @@ const DEFAULT_KEYBINDINGS = {
     fitRoute: 'f',
     toggleSettings: 't',
     search: 's',
-    toggleStats: 'm',
+    toggleStats: 'r',
     reverse: 'v',
     deleteLast: 'backspace',
     resetOrientation: 'n',
@@ -643,20 +644,40 @@ function getBearing(from, to) {
     return Math.atan2(y, x) * 180 / Math.PI;
 }
 
-const pinSvg = (color, text = '', strokeWidth = 1) => {
+const pinSvg = (color, text = '', strokeWidth = 1, height = 34) => {
     const path = text
         ? `M12 0C5.37 0 0 5.37 0 12c0 9 12 20 12 20s12-11 12-20c0-6.63-5.37-12-12-12z`
         : `M12 0C5.37 0 0 5.37 0 12c0 9 12 20 12 20s12-11 12-20c0-6.63-5.37-12-12-12zm0 18c-3.31 0-6-2.69-6-6s2.69-6 6-6 6 2.69 6 6-2.69 6-6 6z`;
-    return `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="34" viewBox="-1 -1 26 35">
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="${height}" viewBox="-1 -1 26 ${height + 1}">
     <path d="${path}" fill="${color}" fill-rule="evenodd" stroke="black" stroke-opacity="0.6" stroke-width="${strokeWidth}" />
     <text x="12" y="12.5" text-anchor="middle" dominant-baseline="central" fill="white" font-size="13px" font-family="Arial, sans-serif" font-weight="bold">${text}</text>
 </svg>`;
 };
 
+const circleSvg = (color, text = '', strokeWidth = 1, height = 22) => {
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="22" height="${height}" viewBox="0 0 22 ${height}">
+    <circle cx="11" cy="11" r="8.5" fill="${color}" stroke="white" stroke-width="${strokeWidth}" />
+    ${text ? `<text x="11" y="10.5" text-anchor="middle" dominant-baseline="central" fill="white" font-size="11px" font-family="Arial, sans-serif" font-weight="bold">${text}</text>` : ''}
+</svg>`;
+};
+
 function createMarkerIcon(index, total) {
-    if (index === 0) return pinSvg('#22c55e'); // Green Start
-    if (index === total - 1) return pinSvg('#ef4444'); // Red Finish
-    return pinSvg('#4b5563', index); // Dark Grey Numbered Pin
+    const waypointStyle = localStorage.getItem('route_waypoint_style') || 'pin';
+    if (waypointStyle === 'circle') {
+        if (index === 0) return circleSvg('#22c55e', '', 1); // Green Start
+        if (index === total - 1) return circleSvg('#ef4444', '', 1); // Red Finish
+        return circleSvg('#4b5563', index, 1); // Grey Numbered Circle
+    } else {
+        if (index === 0) return pinSvg('#22c55e'); // Green Start
+        if (index === total - 1) return pinSvg('#ef4444'); // Red Finish
+        return pinSvg('#4b5563', index); // Dark Grey Numbered Pin
+    }
+}
+
+function clearWpIconsCache() {
+    for (const key in wpIcons) {
+        delete wpIcons[key];
+    }
 }
 
 const wpIcons = {}; // Cache for Chart.js waypoint icons
@@ -665,7 +686,26 @@ function getWpIconImage(index, total) {
     const key = `${index}-${total}`;
     if (wpIcons[key] && !wpIcons[key].complete === false) return wpIcons[key];
     const img = new Image();
-    const svg = createMarkerIcon(index, total);
+    
+    const waypointStyle = localStorage.getItem('route_waypoint_style') || 'pin';
+    let svg;
+    if (waypointStyle === 'circle') {
+        svg = circleSvg(
+            index === 0 ? '#22c55e' : (index === total - 1 ? '#ef4444' : '#4b5563'),
+            index === 0 || index === total - 1 ? '' : index,
+            1, // 1px white stroke
+            48 // Height of 48px offsets the 11px radius circle up by 13px (radius + 2px)
+        );
+    } else {
+        // Standard pin with height 72px offsets the 34px pin up by 19px (17px + 2px)
+        svg = pinSvg(
+            index === 0 ? '#22c55e' : (index === total - 1 ? '#ef4444' : '#4b5563'),
+            index === 0 || index === total - 1 ? '' : index,
+            1,
+            72
+        );
+    }
+    
     img.src = 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
     wpIcons[key] = img;
     return img;
@@ -890,13 +930,40 @@ function setupRouteLayers() {
             paint: { 'line-color': '#9ca3af', 'line-width': 2, 'line-opacity': 0.85 }
         });
 
+    // Distance markers layer
+    if (!map.getSource('distance-markers-source')) {
+        map.addSource('distance-markers-source', {
+            type: 'geojson',
+            data: { type: 'FeatureCollection', features: [] }
+        });
+    }
+    if (!map.getLayer('distance-markers-layer')) {
+        map.addLayer({
+            id: 'distance-markers-layer',
+            type: 'symbol',
+            source: 'distance-markers-source',
+            layout: {
+                'text-field': ['get', 'text'],
+                'text-size': 11,
+                'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+                'text-allow-overlap': false,
+                'text-ignore-placement': false
+            },
+            paint: {
+                'text-color': '#ffffff',
+                'text-halo-color': '#000000',
+                'text-halo-width': 1
+            }
+        });
+    }
+
     // Preview pin created as an HTML Marker using the same pinSvg shape.
     // Instantiated once and shown/hidden during drag.
     if (!window._dragPreviewMarker) {
         const pinEl = document.createElement('div');
         pinEl.style.cssText = 'pointer-events:none; opacity:0.5;';
         pinEl.innerHTML = pinSvg('#4b5563', '', 0); // Remove border (strokeWidth=0), Dark Grey
-        window._dragPreviewMarker = new maplibregl.Marker({ element: pinEl, anchor: 'bottom', offset: [0, 8] })
+        window._dragPreviewMarker = new maplibregl.Marker({ element: pinEl, anchor: 'center' })
             .setLngLat([0, 0]);
         // Don't add to map yet — added on first drag
         window._dragPreviewMarker._pinEl = pinEl;
@@ -912,6 +979,7 @@ function setupRouteLayers() {
         // Gradient source uses decimated coords to avoid WebGL vertex limit (65535)
         map.getSource('route-gradient').setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: decimateLine(coords, PERF_MAP_POINTS) } });
         rebuildMapGradient();
+        updateDistanceMarkers();
     }
 }
 let isFirstLoad = true;
@@ -941,7 +1009,7 @@ map.on('style.load', () => {
         } catch (_) { }
     };
     map.on('moveend', updateView);
-    map.on('zoomend', () => { isZooming = false; updateView(); });
+    map.on('zoomend', () => { isZooming = false; updateView(); updateDistanceMarkers(); });
     map.on('zoomstart', () => { isZooming = true; });
     const updateCompass = () => {
         const compass = document.getElementById('compass-needle-svg');
@@ -1160,10 +1228,19 @@ function clearHoverHighlight() {
 }
 
 map.on('mouseleave', clearHoverHighlight);
+map.on('movestart', clearHoverHighlight);
+map.on('touchstart', () => {
+    clearHoverHighlight();
+    document.activeElement?.blur();
+});
+map.on('mousedown', () => {
+    clearHoverHighlight();
+    document.activeElement?.blur();
+});
 window.addEventListener('blur', clearHoverHighlight);
 
 // Explicitly clear hover when moving into UI overlays
-['top-bar', 'elevation-panel'].forEach(id => {
+['top-bar', 'elevation-panel', 'right-panel', 'search-container'].forEach(id => {
     document.getElementById(id)?.addEventListener('mouseenter', () => {
         lastHoverIdx = -1;
         hideHoverMarker();
@@ -1187,11 +1264,17 @@ function invalidateGPXSegment(idx) {
 
 function createMarker(lngLat, index, initialMode) {
     const el = document.createElement('div');
-    el.style.width = '24px';
-    el.style.height = '34px';
+    const waypointStyle = localStorage.getItem('route_waypoint_style') || 'pin';
+    if (waypointStyle === 'circle') {
+        el.style.width = '22px';
+        el.style.height = '22px';
+    } else {
+        el.style.width = '24px';
+        el.style.height = '34px';
+    }
     el.style.cursor = 'pointer';
     el.style.filter = 'drop-shadow(0 2px 2px rgba(0,0,0,0.4))';
-    el.innerHTML = pinSvg('#4b5563');
+    el.innerHTML = '';
 
     const marker = new maplibregl.Marker({ element: el, anchor: 'center', draggable: true })
         .setLngLat(lngLat)
@@ -1331,16 +1414,36 @@ function createMarker(lngLat, index, initialMode) {
 }
 
 function refreshMarkerIcons() {
+    const waypointStyle = localStorage.getItem('route_waypoint_style') || 'pin';
     markers.forEach((m, i) => {
         const el = m.getElement();
-        const isEndpoint = (i === 0 || i === markers.length - 1);
-        el.style.width = '24px';
-        el.style.height = '34px'; // All markers are now pins
-        el.innerHTML = createMarkerIcon(i, markers.length);
-
-        // All markers are pins, so all use the same 'bottom' simulation
-        m.setOffset([0, -17]);
+        if (waypointStyle === 'circle') {
+            el.style.width = '22px';
+            el.style.height = '22px';
+            el.innerHTML = createMarkerIcon(i, markers.length);
+            m.setOffset([0, 0]);
+        } else {
+            el.style.width = '24px';
+            el.style.height = '34px';
+            el.innerHTML = createMarkerIcon(i, markers.length);
+            m.setOffset([0, -17]);
+        }
     });
+
+    if (window._dragPreviewMarker) {
+        const el = window._dragPreviewMarker.getElement();
+        if (waypointStyle === 'circle') {
+            el.style.width = '22px';
+            el.style.height = '22px';
+            el.innerHTML = circleSvg('#4b5563', '', 1, 22); // Grey circle, 1px white stroke
+            window._dragPreviewMarker.setOffset([0, 0]);
+        } else {
+            el.style.width = '24px';
+            el.style.height = '34px';
+            el.innerHTML = pinSvg('#4b5563', '', 0); // Grey pin, no stroke
+            window._dragPreviewMarker.setOffset([0, -17]);
+        }
+    }
 }
 
 let wasDraggingLine = false;
@@ -1774,7 +1877,7 @@ function showToast(message, type = 'error') {
     }
     toast.textContent = message;
     toast.className = `toast-notification ${type} show`;
-    
+
     // Auto-hide after 4 seconds
     clearTimeout(toast.timeoutId);
     toast.timeoutId = setTimeout(() => {
@@ -2296,8 +2399,11 @@ document.getElementById('reset-orientation-btn')?.addEventListener('click', () =
     });
 
     function selectResult(item) {
+        const lng = parseFloat(item.lon);
+        const lat = parseFloat(item.lat);
         // Fly to location only — do NOT add a waypoint
-        map.flyTo({ center: [parseFloat(item.lon), parseFloat(item.lat)], zoom: 12, speed: 2.4 });
+        map.flyTo({ center: [lng, lat], zoom: 12, speed: 2.4 });
+        showWeatherPopup({ lng, lat });
         collapseSearch();
     }
 
@@ -2378,7 +2484,10 @@ document.getElementById('reset-orientation-btn')?.addEventListener('click', () =
                                 row.className = 'search-result-row';
                                 row.textContent = item.display_name;
                                 row.addEventListener('click', () => {
-                                    map.flyTo({ center: [parseFloat(item.lon), parseFloat(item.lat)], zoom: 12, speed: 2.4 });
+                                    const lng = parseFloat(item.lon);
+                                    const lat = parseFloat(item.lat);
+                                    map.flyTo({ center: [lng, lat], zoom: 12, speed: 2.4 });
+                                    showWeatherPopup({ lng, lat });
                                     closeMobileSearch();
                                 });
                                 mobileDropdown.appendChild(row);
@@ -2530,6 +2639,20 @@ window.addEventListener('keydown', (e) => {
     }
 }, true);
 
+document.getElementById('waypoint-style-select')?.addEventListener('change', (e) => {
+    localStorage.setItem('route_waypoint_style', e.target.value);
+    refreshMarkerIcons();
+    clearWpIconsCache();
+    if (elevationChart) {
+        elevationChart.update();
+    }
+});
+
+document.getElementById('show-distance-markers-check')?.addEventListener('change', (e) => {
+    localStorage.setItem('route_show_distance_markers', e.target.checked ? 'true' : 'false');
+    updateDistanceMarkers();
+});
+
 // Settings Handlers
 document.getElementById('theme').addEventListener('change', (e) => {
     localStorage.setItem('route_theme', e.target.value);
@@ -2577,7 +2700,8 @@ document.getElementById('units').addEventListener('change', (e) => {
     // Force chart to re-render with new units (elevation data is cached in the worker tile cache)
     needsElevationUpdate = true;
     if (typeof updateElevationProfile === 'function') updateElevationProfile();
-    
+    updateDistanceMarkers();
+
     // Dynamically refresh the weather & elevation popup if it is currently open
     if (currentInfoPopup && currentInfoPopup.isOpen()) {
         showWeatherPopup(currentInfoPopup.getLngLat());
@@ -3132,7 +3256,17 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
             }
         });
         newEl.addEventListener('mouseleave', clearHoverHighlight);
+
+        newEl.addEventListener('click', () => {
+            const ci = getIdx();
+            if (ci !== undefined && ci >= 0 && currentRouteGeoJSON && currentRouteGeoJSON.coordinates.length > ci) {
+                const coords = currentRouteGeoJSON.coordinates;
+                const lngLat = coords[ci];
+                updateHoverHighlight(ci, 0, lngLat);
+            }
+        });
     });
+    updateDistanceMarkers();
 }
 
 function updateSpeedSettingUI() {
@@ -3233,7 +3367,20 @@ function loadStoredSettings() {
     if (locationEl) {
         locationEl.checked = showLocationVal !== null ? showLocationVal === 'true' : true;
     }
+    const waypointStyle = localStorage.getItem('route_waypoint_style') || 'pin';
+    const wpStyleEl = document.getElementById('waypoint-style-select');
+    if (wpStyleEl) {
+        wpStyleEl.value = waypointStyle;
+    }
+
+    const showDistanceMarkersVal = localStorage.getItem('route_show_distance_markers');
+    const distanceMarkersEl = document.getElementById('show-distance-markers-check');
+    if (distanceMarkersEl) {
+        distanceMarkersEl.checked = showDistanceMarkersVal !== null ? showDistanceMarkersVal === 'true' : false;
+    }
+
     updateUserLocationPin();
+    updateDistanceMarkers();
 
     // Restore stats panel visibility
     const statsVisible = localStorage.getItem('stats_panel_visible');
@@ -3833,7 +3980,7 @@ async function updateElevationProfile() {
                         e = 2 * elevations[elevations.length - 1] - elevations[reflectedIdx];
                     }
                 }
-                
+
                 if (e != null) {
                     const w = GAUSS[k + WIN_HALF];
                     sum += e * w;
@@ -3849,7 +3996,7 @@ async function updateElevationProfile() {
         const filteredChartData = [];
         const pointGrades = elevations.map((v, i) => {
             if (v == null) return null;
-            
+
             let prevVal = null;
             let d1 = 0;
             for (let j = i - 1; j >= 0; j--) {
@@ -4026,8 +4173,8 @@ async function updateElevationProfile() {
                     const d = Math.abs(pt.x - displayWpDist);
                     if (d < minDiff) { minDiff = d; closestY = pt.y; }
                 }
-                // Add a significant offset (25% of chart height) for the taller pins
-                const offset = (maxElev - minElev) * 0.25 || 20;
+                // Offsets are handled visually in SVG padding to be pixel-perfect and avoid scaling issues
+                const offset = 0;
                 wpData.push({ x: displayWpDist, y: closestY + offset });
                 wpStyles.push(getWpIconImage(i, waypoints.length));
             }
@@ -4216,21 +4363,24 @@ function removeInitialCover() {
         clearStatus();
     }
 }
-
 function requestLocation(fly = false) {
-    const fallbackOptions = {
-        center: [-122.4018, 37.7885],
-        zoom: 13,
-        speed: 1.5,
-        curve: 1.2
-    };
+    if (userLocationMarker) {
+        const lngLat = userLocationMarker.getLngLat();
+        const options = {
+            center: [lngLat.lng, lngLat.lat],
+            zoom: 13,
+            speed: 1.5,
+            curve: 1.2
+        };
+        if (fly) {
+            map.flyTo(options);
+        } else {
+            map.jumpTo({ center: options.center, zoom: options.zoom });
+        }
+    }
 
     if (!("geolocation" in navigator)) {
-        if (fly) {
-            map.flyTo(fallbackOptions);
-        } else {
-            map.jumpTo({ center: fallbackOptions.center, zoom: fallbackOptions.zoom });
-        }
+        console.warn("Geolocation not supported by this browser.");
         return;
     }
 
@@ -4247,25 +4397,22 @@ function requestLocation(fly = false) {
                 curve: 1.2
             };
 
-            if (fly) {
-                map.flyTo(options);
-            } else {
-                const diffLng = Math.abs(currentCenter.lng - freshLng);
-                const diffLat = Math.abs(currentCenter.lat - freshLat);
-                if (diffLng > 0.005 || diffLat > 0.005) {
-                    map.jumpTo({ center: options.center, zoom: options.zoom });
+            if (!userLocationMarker) {
+                if (fly) {
+                    map.flyTo(options);
+                } else {
+                    const diffLng = Math.abs(currentCenter.lng - freshLng);
+                    const diffLat = Math.abs(currentCenter.lat - freshLat);
+                    if (diffLng > 0.005 || diffLat > 0.005) {
+                        map.jumpTo({ center: options.center, zoom: options.zoom });
+                    }
                 }
             }
         },
         (err) => {
-            console.warn("Geolocation failed or denied, falling back to San Francisco:", err);
-            if (fly) {
-                map.flyTo(fallbackOptions);
-            } else {
-                map.jumpTo({ center: fallbackOptions.center, zoom: fallbackOptions.zoom });
-            }
+            console.warn("Geolocation failed or denied:", err);
         },
-        { timeout: 5000, enableHighAccuracy: true }
+        { timeout: 5000, enableHighAccuracy: true, maximumAge: 10000 }
     );
 }
 
@@ -4456,11 +4603,13 @@ function stopResize() {
     document.removeEventListener('mouseup', stopResize);
 }
 
-elMinBtn.addEventListener('click', () => {
-    elPanel.style.display = 'none';
-    localStorage.setItem('elevation_panel_visible', 'false');
-    updateElevationToggleBtn();
-});
+if (elMinBtn) {
+    elMinBtn.addEventListener('click', () => {
+        elPanel.style.display = 'none';
+        localStorage.setItem('elevation_panel_visible', 'false');
+        updateElevationToggleBtn();
+    });
+}
 
 const elToggleBtn = document.getElementById('elevation-toggle-btn');
 const elToggleGroup = document.getElementById('elevation-toggle-group');
@@ -4688,7 +4837,15 @@ initCustomTooltips();
         if (!isMobileResizing) return;
         const clientY = e.touches ? e.touches[0].clientY : e.clientY;
         const dy = mobileStartY - clientY;
-        const newH = Math.max(120, Math.min(window.innerHeight * 0.7, mobileStartH + dy));
+        const calculatedH = mobileStartH + dy;
+        if (calculatedH < 50) {
+            elPanel.style.display = 'none';
+            localStorage.setItem('elevation_panel_visible', 'false');
+            updateElevationToggleBtn();
+            stopMobileResize();
+            return;
+        }
+        const newH = Math.max(60, Math.min(window.innerHeight * 0.7, calculatedH));
         elPanel.style.setProperty('height', newH + 'px', 'important');
         if (elevationChart) elevationChart.resize();
         saveWindowState();
@@ -4717,50 +4874,14 @@ function updateUserLocationPin() {
     const isEnabled = showCheck ? showCheck.checked : false;
     localStorage.setItem('route_show_location_check', isEnabled);
 
-    const isLocalhost = ['localhost', '127.0.0.1', '0.0.0.0'].includes(window.location.hostname) ||
-        window.location.hostname.startsWith('192.168.') ||
-        window.location.hostname.startsWith('10.') ||
-        window.location.hostname.startsWith('172.') ||
-        !("geolocation" in navigator);
-
     if (!isEnabled) {
         if (userLocationWatchId !== null) {
-            if (isLocalhost) {
-                clearInterval(userLocationWatchId);
-            } else {
-                navigator.geolocation.clearWatch(userLocationWatchId);
-            }
+            navigator.geolocation.clearWatch(userLocationWatchId);
             userLocationWatchId = null;
         }
         if (userLocationMarker) {
             userLocationMarker.remove();
             userLocationMarker = null;
-        }
-        return;
-    }
-
-    if (isLocalhost) {
-        if (userLocationWatchId === null) {
-            const updateLocalMarker = () => {
-                const lngLat = [-122.4018, 37.7885];
-                if (!userLocationMarker) {
-                    const el = document.createElement('div');
-                    el.style.width = '20px';
-                    el.style.height = '20px';
-                    el.style.backgroundColor = '#3b82f6';
-                    el.style.border = '3px solid #ffffff';
-                    el.style.borderRadius = '50%';
-                    el.style.boxShadow = '0 0 6px rgba(0,0,0,0.4), 0 0 0 4px rgba(59, 130, 246, 0.4)';
-                    el.style.cursor = 'default';
-                    userLocationMarker = new maplibregl.Marker({ element: el, anchor: 'center' })
-                        .setLngLat(lngLat)
-                        .addTo(map);
-                } else {
-                    userLocationMarker.setLngLat(lngLat);
-                }
-            };
-            updateLocalMarker();
-            userLocationWatchId = setInterval(updateLocalMarker, 5000);
         }
         return;
     }
@@ -4808,3 +4929,96 @@ window.addEventListener('orientationchange', syncTopBarHeight);
 syncTopBarHeight();
 setTimeout(syncTopBarHeight, 100);
 setTimeout(syncTopBarHeight, 500);
+
+function getCoordinateAtDistance(meters) {
+    if (!currentRouteGeoJSON || !routePathDistances || routePathDistances.length === 0) return null;
+    if (meters <= 0) return currentRouteGeoJSON.coordinates[0];
+    if (meters >= routeTotalDist) return currentRouteGeoJSON.coordinates[currentRouteGeoJSON.coordinates.length - 1];
+
+    // Binary search to find segment
+    let lo = 0, hi = routePathDistances.length - 1;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (routePathDistances[mid] < meters) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    const idx = lo;
+    if (idx === 0) return currentRouteGeoJSON.coordinates[0];
+
+    const d0 = routePathDistances[idx - 1];
+    const d1 = routePathDistances[idx];
+    const p0 = currentRouteGeoJSON.coordinates[idx - 1];
+    const p1 = currentRouteGeoJSON.coordinates[idx];
+
+    const ratio = (meters - d0) / (d1 - d0);
+    const lng = p0[0] + ratio * (p1[0] - p0[0]);
+    const lat = p0[1] + ratio * (p1[1] - p0[1]);
+    return [lng, lat];
+}
+
+function updateDistanceMarkers() {
+    const showCheck = document.getElementById('show-distance-markers-check');
+    const isEnabled = showCheck ? showCheck.checked : false;
+    localStorage.setItem('route_show_distance_markers', isEnabled ? 'true' : 'false');
+
+    if (!map.getSource('distance-markers-source')) return;
+
+    if (!isEnabled || !currentRouteGeoJSON || !routePathDistances || routePathDistances.length < 2) {
+        map.getSource('distance-markers-source').setData({ type: 'FeatureCollection', features: [] });
+        return;
+    }
+
+    const zoom = map.getZoom();
+    const isImperial = currentUnits === 'imperial';
+    
+    // Choose interval dynamically based on zoom and units
+    let interval = 1.0;
+    if (isImperial) {
+        if (zoom >= 15.5) interval = 0.1;
+        else if (zoom >= 14) interval = 0.25;
+        else if (zoom >= 12.5) interval = 0.5;
+        else if (zoom >= 10.5) interval = 1.0;
+        else interval = 5.0;
+    } else {
+        if (zoom >= 15.5) interval = 0.1;
+        else if (zoom >= 14) interval = 0.25;
+        else if (zoom >= 12.5) interval = 0.5;
+        else if (zoom >= 10.5) interval = 1.0;
+        else interval = 5.0;
+    }
+
+    const unitInMeters = isImperial ? 1609.344 : 1000;
+    const intervalMeters = interval * unitInMeters;
+    
+    const features = [];
+    const totalDistUnits = routeTotalDist / unitInMeters;
+    
+    const maxK = Math.floor(totalDistUnits / interval);
+    for (let k = 1; k <= maxK; k++) {
+        const distUnits = k * interval;
+        const distMeters = distUnits * unitInMeters;
+        const coord = getCoordinateAtDistance(distMeters);
+        if (coord) {
+            let text = distUnits.toString();
+            if (distUnits % 1 !== 0) {
+                text = distUnits.toFixed(distUnits % 0.25 === 0 ? 2 : 1);
+                if (text.endsWith('.00')) text = text.slice(0, -3);
+                else if (text.endsWith('.0')) text = text.slice(0, -2);
+            }
+            
+            features.push({
+                type: 'Feature',
+                geometry: { type: 'Point', coordinates: coord },
+                properties: { text }
+            });
+        }
+    }
+
+    map.getSource('distance-markers-source').setData({
+        type: 'FeatureCollection',
+        features
+    });
+}

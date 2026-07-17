@@ -11,6 +11,10 @@
     --btn-bg: #252525;
 }
 
+* {
+    -webkit-tap-highlight-color: transparent !important;
+}
+
 @keyframes spin {
     to {
         transform: rotate(360deg);
@@ -1201,13 +1205,33 @@ body.light-mode .custom-tooltip {
     @media (hover: none) {
 
         .icon-btn:active,
-        .btn:active,
-        .mode-btn:active {
+        .btn:active {
             background-color: var(--primary) !important;
             color: white !important;
             transform: scale(0.92) !important;
             opacity: 0.9 !important;
             transition: transform 0.05s ease, background-color 0.05s ease !important;
+        }
+
+        .mode-btn:active:not(.active) {
+            color: var(--text-main) !important;
+            background: rgba(255, 255, 255, 0.03) !important;
+            transform: none !important;
+            opacity: 1 !important;
+        }
+
+        #elevation-toggle-btn:active {
+            background-color: inherit !important;
+            color: inherit !important;
+            transform: none !important;
+            opacity: 1 !important;
+        }
+
+        #main-actions .icon-btn:active:not(:disabled) {
+            background-color: rgba(255, 255, 255, 0.03) !important;
+            color: var(--text-main) !important;
+            transform: none !important;
+            opacity: 1 !important;
         }
 
         .icon-btn-group-danger .icon-btn:active {

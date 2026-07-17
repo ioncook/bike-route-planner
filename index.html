@@ -7,7 +7,7 @@
         content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>Bike Route Planner</title>
     <link rel="icon" href="favicon.png">
-    <link rel="stylesheet" href="style.css?v=22">
+    <link rel="stylesheet" href="style.css?v=35">
     <!-- MapLibre CSS -->
     <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@^5.0.0/dist/maplibre-gl.css" />
     <!-- Chart.js -->
@@ -298,6 +298,20 @@
                                 <span class="slider"></span>
                             </label>
                         </div>
+                        <div class="setting-row">
+                            <span>Waypoint Style</span>
+                            <select id="waypoint-style-select">
+                                <option value="pin">Pins</option>
+                                <option value="circle">Circles</option>
+                            </select>
+                        </div>
+                        <div class="setting-row">
+                            <span>Distance Markers</span>
+                            <label class="switch">
+                                <input type="checkbox" id="show-distance-markers-check">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
                         <hr style="border:0; border-top: 1px solid var(--border); margin: 8px 0;">
                         <button id="open-keybindings" class="btn btn-secondary"
                             style="width: 100%; font-size: 0.85rem; padding: 8px; margin-top: 5px;">
@@ -377,7 +391,6 @@
                             <span id="hover-elev">--</span>
                             <span id="hover-grade">--</span>
                         </div>
-                        <button class="minimize-btn" id="elevation-min-btn">×</button>
                     </div>
                     <div class="window-content" id="elevation-content">
                         <canvas id="elevation-chart"></canvas>
@@ -416,7 +429,7 @@
 
     <!-- MapLibre JS -->
     <script src="https://unpkg.com/maplibre-gl@^5.0.0/dist/maplibre-gl.js"></script>
-    <script src="script.js?v=22"></script>
+    <script src="script.js?v=35"></script>
 </body>
 
 </html>
