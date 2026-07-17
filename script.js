@@ -1138,7 +1138,6 @@ map.on('mousemove', 'route-line', (e) => {
     let bestCi = -1;
     let bestT = 0;
     let bestProj = { x: 0, y: 0 };
-
     for (let i = 0; i < routeScreenPts.length - 1; i++) {
         const a = routeScreenPts[i];
         const b = routeScreenPts[i + 1];
@@ -4321,13 +4320,6 @@ function syncUrl() {
     }
     if (forceMode) params.set('force', '1'); else params.delete('force');
     window.history.replaceState({}, '', `${window.location.pathname}?${params.toString()}`);
-
-    // Persist GPX paths in localStorage
-    if (segmentGPXPaths && segmentGPXPaths.some(p => p !== null)) {
-        localStorage.setItem('route_gpx_paths', JSON.stringify(segmentGPXPaths));
-    } else {
-        localStorage.removeItem('route_gpx_paths');
-    }
 }
 
 function loadUrlState() {
@@ -4344,35 +4336,23 @@ function loadUrlState() {
     if (routeStr) {
         if (modes.length > 0) {
             const lastMode = modes[modes.length - 1];
-            if (['bike', 'direct', 'hike', 'gpx'].includes(lastMode)) {
-                currentRoutingMode = lastMode;
-                localStorage.setItem('route_routing_mode', lastMode);
-                const displayMode = lastMode === 'gpx' ? 'bike' : lastMode;
-                document.getElementById('mode-bike')?.classList.toggle('active', displayMode === 'bike');
-                document.getElementById('mode-direct')?.classList.toggle('active', displayMode === 'direct');
-                document.getElementById('mode-hike')?.classList.toggle('active', displayMode === 'hike');
+            const fallbackMode = lastMode === 'gpx' ? 'bike' : lastMode;
+            if (['bike', 'direct', 'hike'].includes(fallbackMode)) {
+                currentRoutingMode = fallbackMode;
+                localStorage.setItem('route_routing_mode', fallbackMode);
+                document.getElementById('mode-bike')?.classList.toggle('active', fallbackMode === 'bike');
+                document.getElementById('mode-direct')?.classList.toggle('active', fallbackMode === 'direct');
+                document.getElementById('mode-hike')?.classList.toggle('active', fallbackMode === 'hike');
             }
         }
         const points = routeStr.split(';');
         points.forEach((pt, i) => {
             const [lng, lat] = pt.split(',').map(Number);
             if (!isNaN(lng) && !isNaN(lat)) {
-                createMarker({ lng, lat }, undefined, i > 0 ? modes[i - 1] : undefined);
+                const mode = i > 0 ? modes[i - 1] : undefined;
+                createMarker({ lng, lat }, undefined, mode === 'gpx' ? 'bike' : mode);
             }
         });
-
-        // Restore GPX paths from localStorage
-        const savedGPX = localStorage.getItem('route_gpx_paths');
-        if (savedGPX) {
-            try {
-                const paths = JSON.parse(savedGPX);
-                if (paths.length === segmentGPXPaths.length) {
-                    segmentGPXPaths = paths;
-                }
-            } catch (e) {
-                console.error('Failed to parse saved GPX paths:', e);
-            }
-        }
 
         updateRoute();
 
