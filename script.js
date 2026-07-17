@@ -2681,6 +2681,7 @@ document.getElementById('theme').addEventListener('change', (e) => {
     } else {
         document.body.classList.remove('light-mode');
     }
+    updateChartTheme();
 });
 
 // Basemap switching — vector styles swap the whole style; raster use inline style
@@ -3683,7 +3684,9 @@ function initChart() {
                     ctx.moveTo(x, top);
                     ctx.lineTo(x, bottom);
                     ctx.lineWidth = 1.5;
-                    ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)';
+                    ctx.strokeStyle = document.body.classList.contains('light-mode')
+                        ? 'rgba(0, 0, 0, 0.45)'
+                        : 'rgba(255, 255, 255, 0.6)';
                     ctx.setLineDash([5, 5]);
                     ctx.stroke();
                     ctx.restore();
@@ -3853,6 +3856,27 @@ function initChart() {
             handleHoverMove(e.touches[0].clientX);
         }
     }, { passive: true });
+
+    updateChartTheme();
+}
+
+function updateChartTheme() {
+    if (!elevationChart) return;
+    const isLight = document.body.classList.contains('light-mode');
+    
+    // Update X-axis colors
+    if (elevationChart.options.scales.x) {
+        elevationChart.options.scales.x.grid.color = isLight ? 'rgba(0, 0, 0, 0.08)' : '#333';
+        elevationChart.options.scales.x.ticks.color = isLight ? '#555' : '#aaa';
+    }
+    
+    // Update Y-axis colors
+    if (elevationChart.options.scales.y) {
+        elevationChart.options.scales.y.grid.color = isLight ? 'rgba(0, 0, 0, 0.08)' : '#333';
+        elevationChart.options.scales.y.ticks.color = isLight ? '#555' : '#aaa';
+    }
+    
+    elevationChart.update();
 }
 
 

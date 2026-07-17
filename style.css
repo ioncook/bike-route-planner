@@ -36,6 +36,11 @@ body.light-mode {
     --btn-bg: #e5e5e5;
 }
 
+body.light-mode #logo,
+body.light-mode #favicon-mobile {
+    filter: invert(1);
+}
+
 select option {
     background-color: var(--bg-panel);
     color: var(--text-main);
