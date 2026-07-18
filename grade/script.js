@@ -110,7 +110,11 @@ elevationWorker.onmessage = (e) => {
     const cb = _workerCallbacks.get(e.data.id);
     if (cb) {
         _workerCallbacks.delete(e.data.id);
-        cb(e.data.elevations);
+        if (e.data.type === 'process-grade-ways') {
+            cb(e.data.processedWays);
+        } else {
+            cb(e.data.elevations);
+        }
     }
 };
 
@@ -122,75 +126,15 @@ function getHighResElevation(coords) {
     });
 }
 
-// Haversine distance formula
-function getDistance(coord1, coord2) {
-    const R = 6371000; // Earth's radius in meters
-    const lat1 = coord1[1] * Math.PI / 180;
-    const lat2 = coord2[1] * Math.PI / 180;
-    const dLat = (coord2[1] - coord1[1]) * Math.PI / 180;
-    const dLon = (coord2[0] - coord1[0]) * Math.PI / 180;
-
-    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-        Math.cos(lat1) * Math.cos(lat2) *
-        Math.sin(dLon / 2) * Math.sin(dLon / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c;
+function getProcessedSegmentsFromWorker(ways) {
+    return new Promise(resolve => {
+        const id = _nextWorkerId++;
+        _workerCallbacks.set(id, resolve);
+        elevationWorker.postMessage({ type: 'process-grade-ways', id, ways });
+    });
 }
 
-// Split way into segments under 80 meters to accurately catch steep climbs without averaging them out
-function splitWayIntoSegments(coords, wayId, maxLen = 80.0) {
-    const segments = [];
-    if (coords.length < 2) return segments;
 
-    let currentSegment = [coords[0]];
-    let currentDist = 0;
-    let segIdx = 0;
-
-    for (let i = 0; i < coords.length - 1; i++) {
-        const p1 = coords[i];
-        const p2 = coords[i + 1];
-        const d = getDistance(p1, p2);
-
-        let rem = d;
-        let prevPoint = p1;
-
-        while (currentDist + rem > maxLen) {
-            const needed = maxLen - currentDist;
-            const t = needed / rem;
-
-            // Interpolate point
-            const lng = prevPoint[0] + t * (p2[0] - prevPoint[0]);
-            const lat = prevPoint[1] + t * (p2[1] - prevPoint[1]);
-            const splitPoint = [lng, lat];
-
-            currentSegment.push(splitPoint);
-            segments.push({
-                id: `${wayId}_${segIdx++}`,
-                coordinates: currentSegment,
-                distance: maxLen
-            });
-
-            currentSegment = [splitPoint];
-            currentDist = 0;
-
-            prevPoint = splitPoint;
-            rem = rem - needed;
-        }
-
-        currentSegment.push(p2);
-        currentDist += rem;
-    }
-
-    if (currentSegment.length >= 2 && currentDist > 0.1) {
-        segments.push({
-            id: `${wayId}_${segIdx++}`,
-            coordinates: currentSegment,
-            distance: currentDist
-        });
-    }
-
-    return segments;
-}
 
 // Cache for processed ways: wayId -> Array of Segment objects
 const wayCache = new Map();
@@ -267,6 +211,31 @@ function setupGradeLayers() {
             layout: {
                 visibility: 'none'
             }
+        });
+    }
+
+    if (!map.getSource('carto-streets')) {
+        map.addSource('carto-streets', {
+            type: 'vector',
+            tiles: ['https://tiles.basemaps.cartocdn.com/vectortiles/carto.streets/v1/{z}/{x}/{y}.mvt'],
+            maxzoom: 14
+        });
+    }
+
+    if (!map.getLayer('carto-roads-hidden')) {
+        map.addLayer({
+            id: 'carto-roads-hidden',
+            type: 'line',
+            source: 'carto-streets',
+            'source-layer': 'transportation',
+            paint: {
+                'line-opacity': 0
+            },
+            filter: [
+                'all',
+                ['==', '$type', 'LineString'],
+                ['!in', 'class', 'footway', 'pedestrian', 'steps', 'construction', 'service', 'track', 'path', 'bridleway']
+            ]
         });
     }
 
@@ -479,15 +448,32 @@ function updateMapData() {
     if (!map.getSource('grade-roads')) return;
 
     const features = [];
+    const seenSegments = new Set();
+
     for (const [_, segments] of wayCache.entries()) {
         for (const seg of segments) {
             if (seg.grade !== undefined) {
+                const coords = seg.coordinates;
+                if (!coords || coords.length < 2) continue;
+
+                // Deduplicate segments by rounded start/end endpoints (approx 11m precision)
+                const p1 = coords[0];
+                const p2 = coords[coords.length - 1];
+                const lon1 = Math.min(p1[0], p2[0]).toFixed(4);
+                const lat1 = Math.min(p1[1], p2[1]).toFixed(4);
+                const lon2 = Math.max(p1[0], p2[0]).toFixed(4);
+                const lat2 = Math.max(p1[1], p2[1]).toFixed(4);
+                const key = `${lon1},${lat1}_${lon2},${lat2}`;
+
+                if (seenSegments.has(key)) continue;
+                seenSegments.add(key);
+
                 features.push({
                     type: 'Feature',
-                    id: seg.id, // Set feature id
+                    id: seg.id,
                     geometry: {
                         type: 'LineString',
-                        coordinates: seg.coordinates
+                        coordinates: coords
                     },
                     properties: {
                         id: seg.id,
@@ -505,127 +491,116 @@ function updateMapData() {
     });
 }
 
+const OVERPASS_ENDPOINTS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://lz4.overpass-api.de/api/interpreter',
+    'https://z.overpass-api.de/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter'
+];
+
+async function fetchFromOverpassWithFailover(query, signal) {
+    let lastError = null;
+    for (const endpoint of OVERPASS_ENDPOINTS) {
+        try {
+            const res = await fetch(`${endpoint}?data=${encodeURIComponent(query)}`, { signal });
+            if (res.ok) return res;
+            if (res.status === 429) {
+                console.warn(`[overpass] 429 from ${endpoint}, trying fallback...`);
+            } else {
+                console.warn(`[overpass] Error ${res.status} from ${endpoint}, trying fallback...`);
+            }
+        } catch (err) {
+            if (err.name === 'AbortError') throw err;
+            lastError = err;
+            console.warn(`[overpass] Failed to connect to ${endpoint}:`, err);
+        }
+    }
+    throw lastError || new Error('All Overpass servers failed');
+}
+
 // Fetch ways and process grades
 async function fetchAndProcessViewport() {
     const zoom = map.getZoom();
     const warning = document.getElementById('zoom-warning');
     const loading = document.getElementById('loading-indicator');
 
-    if (zoom < 11) {
+    // Allow loading major roads zoomed further out (zoom 12+)
+    if (zoom < 12.0) {
         warning.classList.remove('hidden');
+        loading.style.display = 'none';
+        isFetching = false;
         return;
     } else {
         warning.classList.add('hidden');
     }
 
-    if (isFetching) return;
     isFetching = true;
     loading.style.display = 'flex';
 
     try {
-        const bounds = map.getBounds();
-        let s = bounds.getSouth();
-        let w = bounds.getWest();
-        let n = bounds.getNorth();
-        let e = bounds.getEast();
-
-        // Clamp bounding box when zoomed out to avoid overloading Overpass API
-        if (zoom < 13) {
-            const mapCenter = map.getCenter();
-            const maxRadius = 0.08; // ~11 miles max span centered on camera
-            s = Math.max(s, mapCenter.lat - maxRadius);
-            w = Math.max(w, mapCenter.lng - maxRadius);
-            n = Math.min(n, mapCenter.lat + maxRadius);
-            e = Math.min(e, mapCenter.lng + maxRadius);
+        let features = [];
+        try {
+            features = map.queryRenderedFeatures(null, { layers: ['carto-roads-hidden'] }) || [];
+        } catch (e) {
+            // Layer might not be loaded yet
+            return;
         }
 
-        const bbox = `${s},${w},${n},${e}`;
+        // Deduplicate features and skip very short tile boundary slivers/fragments (< 15 meters)
+        const uniqueRoads = new Map();
 
-        // Exclude footways, pedestrian paths, steps, service roads/driveways, tracks, paths, bridleways (keep cycleways)
-        const query = `[out:json][timeout:25];way[highway]["highway"!~"footway|pedestrian|steps|construction|proposed|abandoned|service|track|corridor|elevator|platform|path|bridleway"](${bbox});out geom;`;
-        const res = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`);
+        function getApproxLength(coords) {
+            let dist = 0;
+            for (let i = 0; i < coords.length - 1; i++) {
+                const dx = (coords[i + 1][0] - coords[i][0]) * 85000;
+                const dy = (coords[i + 1][1] - coords[i][1]) * 111000;
+                dist += Math.sqrt(dx * dx + dy * dy);
+            }
+            return dist;
+        }
 
-        if (!res.ok) throw new Error('Overpass query failed');
+        for (const f of features) {
+            if (f.geometry.type === 'LineString') {
+                const coords = f.geometry.coordinates;
+                if (!coords || coords.length < 2) continue;
+                if (getApproxLength(coords) < 15.0) continue;
 
-        const data = await res.json();
-        const ways = data.elements || [];
+                const key = `${coords[0][0].toFixed(5)},${coords[0][1].toFixed(5)}_${coords[coords.length - 1][0].toFixed(5)},${coords[coords.length - 1][1].toFixed(5)}`;
+                if (!uniqueRoads.has(key)) {
+                    uniqueRoads.set(key, { coords, id: f.id });
+                }
+            } else if (f.geometry.type === 'MultiLineString') {
+                const parts = f.geometry.coordinates;
+                for (let pIdx = 0; pIdx < parts.length; pIdx++) {
+                    const coords = parts[pIdx];
+                    if (!coords || coords.length < 2) continue;
+                    if (getApproxLength(coords) < 15.0) continue;
+
+                    const key = `${coords[0][0].toFixed(5)},${coords[0][1].toFixed(5)}_${coords[coords.length - 1][0].toFixed(5)},${coords[coords.length - 1][1].toFixed(5)}`;
+                    if (!uniqueRoads.has(key)) {
+                        uniqueRoads.set(key, { coords, id: f.id ? `${f.id}_p${pIdx}` : `${key}_p${pIdx}` });
+                    }
+                }
+            }
+        }
 
         // Identify new ways to process
-        const newSegmentsToResolve = [];
-        for (const way of ways) {
-            if (way.type === 'way' && way.geometry && !wayCache.has(way.id)) {
-                const geomCoords = way.geometry.map(p => [p.lon, p.lat]);
-                const segments = splitWayIntoSegments(geomCoords, way.id);
-
-                // Initialize cache entry
-                wayCache.set(way.id, segments);
-
-                for (const seg of segments) {
-                    newSegmentsToResolve.push({
-                        wayId: way.id,
-                        segment: seg
-                    });
-                }
+        const waysToResolve = [];
+        for (const [key, road] of uniqueRoads.entries()) {
+            const cacheKey = road.id || key;
+            if (!wayCache.has(cacheKey)) {
+                waysToResolve.push({
+                    wayId: cacheKey,
+                    geomCoords: road.coords
+                });
             }
         }
 
-        if (newSegmentsToResolve.length > 0) {
-            // Deduplicate coordinates to minimize worker payload and speed up decoding
-            const uniqueCoordsMap = new Map();
-            const uniqueCoordsArray = [];
-
-            const getCoordKey = (coord) => `${coord[0].toFixed(6)},${coord[1].toFixed(6)}`;
-
-            for (const item of newSegmentsToResolve) {
-                const segCoords = item.segment.coordinates;
-                const start = segCoords[0];
-                const end = segCoords[segCoords.length - 1];
-
-                const startKey = getCoordKey(start);
-                if (!uniqueCoordsMap.has(startKey)) {
-                    uniqueCoordsMap.set(startKey, uniqueCoordsArray.length);
-                    uniqueCoordsArray.push(start);
-                }
-
-                const endKey = getCoordKey(end);
-                if (!uniqueCoordsMap.has(endKey)) {
-                    uniqueCoordsMap.set(endKey, uniqueCoordsArray.length);
-                    uniqueCoordsArray.push(end);
-                }
+        if (waysToResolve.length > 0) {
+            const processedWays = await getProcessedSegmentsFromWorker(waysToResolve);
+            for (const item of processedWays) {
+                wayCache.set(item.wayId, item.segments);
             }
-
-            const uniqueElevations = await getHighResElevation(uniqueCoordsArray);
-
-            // Assign elevations and compute grades
-            for (const item of newSegmentsToResolve) {
-                const segCoords = item.segment.coordinates;
-                const start = segCoords[0];
-                const end = segCoords[segCoords.length - 1];
-
-                const startKey = getCoordKey(start);
-                const endKey = getCoordKey(end);
-
-                const elevStart = uniqueElevations[uniqueCoordsMap.get(startKey)];
-                const elevEnd = uniqueElevations[uniqueCoordsMap.get(endKey)];
-
-                if (elevStart !== null && elevEnd !== null) {
-                    const rise = Math.abs(elevEnd - elevStart);
-                    const run = item.segment.distance;
-                    const gradeVal = run > 0 ? (rise / run) * 100 : 0;
-
-                    item.segment.gradePercent = gradeVal;
-                    item.segment.grade = Math.min(gradeVal, 20); // Clamp to 20% for coloring interpolation
-
-                    // Reverse coordinate order if downhill so that LineString geometry always points uphill
-                    if (elevStart > elevEnd) {
-                        item.segment.coordinates.reverse();
-                    }
-                } else {
-                    item.segment.gradePercent = 0;
-                    item.segment.grade = 0;
-                }
-            }
-
             updateMapData();
         }
     } catch (err) {
@@ -654,6 +629,13 @@ map.on('zoomend', () => {
     moveendDebounceTimer = setTimeout(() => {
         fetchAndProcessViewport();
     }, 300);
+});
+
+map.on('idle', () => {
+    clearTimeout(moveendDebounceTimer);
+    moveendDebounceTimer = setTimeout(() => {
+        fetchAndProcessViewport();
+    }, 150);
 });
 
 // Initial fetch
