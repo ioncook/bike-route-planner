@@ -138,7 +138,9 @@ function getProcessedSegmentsFromWorker(ways) {
 
 // Cache for processed ways: wayId -> Array of Segment objects
 const wayCache = new Map();
+const loadedSegments = new Map(); // seg.id -> Segment object
 let isFetching = false;
+let needsRefetch = false;
 
 // Sticky/locked popup state
 let stickySegmentId = null;
@@ -239,6 +241,18 @@ function setupGradeLayers() {
         });
     }
 
+    if (!map.getLayer('carto-names-hidden')) {
+        map.addLayer({
+            id: 'carto-names-hidden',
+            type: 'line',
+            source: 'carto-streets',
+            'source-layer': 'transportation_name',
+            paint: {
+                'line-opacity': 0.01
+            }
+        });
+    }
+
     if (!map.getSource('grade-roads')) {
         map.addSource('grade-roads', {
             type: 'geojson',
@@ -324,8 +338,40 @@ function setupGradeLayers() {
                 const midpoint = getSegmentMidpoint(geom.coordinates);
 
                 if (midpoint) {
+                    let streetName = '';
+                    try {
+                        const bbox = [[e.point.x - 50, e.point.y - 50], [e.point.x + 50, e.point.y + 50]];
+                        const nameFeats = map.queryRenderedFeatures(bbox, { layers: ['carto-names-hidden'] });
+                        if (nameFeats && nameFeats.length > 0) {
+                            let minPixDist = 80; // Search within 80 screen pixels of cursor
+                            for (const feat of nameFeats) {
+                                if (feat.properties && feat.properties.name && feat.geometry) {
+                                    const coords = feat.geometry.type === 'LineString' ? [feat.geometry.coordinates] : (feat.geometry.type === 'MultiLineString' ? feat.geometry.coordinates : []);
+                                    for (const part of coords) {
+                                        for (const p of part) {
+                                            const pix = map.project(p);
+                                            const dx = e.point.x - pix.x;
+                                            const dy = e.point.y - pix.y;
+                                            const dist = dx * dx + dy * dy;
+                                            if (dist < minPixDist * minPixDist) {
+                                                minPixDist = Math.sqrt(dist);
+                                                streetName = feat.properties.name;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (err) {
+                        console.warn(err);
+                    }
+
+                    const nameHtml = streetName ? `<div style="font-size:0.7rem;color:var(--text-muted);margin-bottom:3px;font-weight:normal;text-transform:capitalize;">${streetName}</div>` : '';
                     hoverPopup.setLngLat(midpoint)
-                        .setHTML(`<div style="font-family:'Inter',sans-serif;font-size:0.82rem;font-weight:600;background:var(--bg-panel);padding:2px 4px;">Grade: <span style="color:${getGradeColor(gradePercent)};font-weight:700;">${formatted}</span></div>`)
+                        .setHTML(`<div style="font-family:'Inter',sans-serif;font-size:0.82rem;font-weight:600;background:var(--bg-panel);padding:4px 6px;">
+                            ${nameHtml}
+                            <div>Grade: <span style="color:${getGradeColor(gradePercent)};font-weight:700;">${formatted}</span></div>
+                        </div>`)
                         .addTo(map);
 
                     const el = hoverPopup.getElement();
@@ -365,23 +411,56 @@ function setupGradeLayers() {
                         const lat = midpoint[1];
                         const lng = midpoint[0];
                         const svUrl = `https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${lat},${lng}`;
+                        
+                        let streetName = '';
+                        try {
+                            const bbox = [[e.point.x - 50, e.point.y - 50], [e.point.x + 50, e.point.y + 50]];
+                            const nameFeats = map.queryRenderedFeatures(bbox, { layers: ['carto-names-hidden'] });
+                            if (nameFeats && nameFeats.length > 0) {
+                                let minPixDist = 80;
+                                for (const feat of nameFeats) {
+                                    if (feat.properties && feat.properties.name && feat.geometry) {
+                                        const coords = feat.geometry.type === 'LineString' ? [feat.geometry.coordinates] : (feat.geometry.type === 'MultiLineString' ? feat.geometry.coordinates : []);
+                                        for (const part of coords) {
+                                            for (const p of part) {
+                                                const pix = map.project(p);
+                                                const dx = e.point.x - pix.x;
+                                                const dy = e.point.y - pix.y;
+                                                const dist = dx * dx + dy * dy;
+                                                if (dist < minPixDist * minPixDist) {
+                                                    minPixDist = Math.sqrt(dist);
+                                                    streetName = feat.properties.name;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (err) {
+                            console.warn(err);
+                        }
+
+                        const nameHtml = streetName ? `<div style="font-size:0.7rem;color:var(--text-muted);margin-bottom:3px;font-weight:normal;text-transform:capitalize;">${streetName}</div>` : '';
 
                         hoverPopup.setLngLat(midpoint)
-                            .setHTML(`<div style="font-family:'Inter',sans-serif;font-size:0.82rem;font-weight:600;background:var(--bg-panel);padding:4px 6px;display:flex;align-items:center;gap:10px;border-bottom:2px solid ${getGradeColor(gradePercent)};">
-                                <span>Grade: <span style="color:${getGradeColor(gradePercent)};font-weight:700;">${formatted}</span></span>
-                                <div style="display:flex;align-items:center;gap:6px;margin-left:4px;">
-                                    <a href="${svUrl}" target="_blank" title="Google Street View" style="color:var(--text-muted);display:flex;align-items:center;text-decoration:none;transition:color 0.2s;" onmouseover="this.style.color='#fbbc05'" onmouseout="this.style.color='var(--text-muted)'">
-                                        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
-                                            <circle cx="12" cy="6" r="3.5"/>
-                                            <path d="M12 10.5c-2.3 0-6.1 1.2-6.5 3.5-.2.9.4 1.8 1.4 2l1.6 4.8c.2.6.8 1 1.5 1h4c.7 0 1.3-.4 1.5-1l1.6-4.8c1-.2 1.6-1.1 1.4-2-.4-2.3-4.2-3.5-6.5-3.5z"/>
-                                        </svg>
-                                    </a>
-                                    <button onclick="window.unlockGradePopup()" title="Unlock" style="background:none;border:none;color:var(--text-muted);cursor:pointer;padding:0;display:flex;align-items:center;transition:color 0.2s;" onmouseover="this.style.color='var(--primary)'" onmouseout="this.style.color='var(--text-muted)'">
-                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                                            <line x1="18" y1="6" x2="6" y2="18"></line>
-                                            <line x1="6" y1="6" x2="18" y2="18"></line>
-                                        </svg>
-                                    </button>
+                            .setHTML(`<div style="font-family:'Inter',sans-serif;font-size:0.82rem;font-weight:600;background:var(--bg-panel);padding:6px 8px;border-bottom:2px solid ${getGradeColor(gradePercent)};">
+                                ${nameHtml}
+                                <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+                                    <span>Grade: <span style="color:${getGradeColor(gradePercent)};font-weight:700;">${formatted}</span></span>
+                                    <div style="display:flex;align-items:center;gap:6px;">
+                                        <a href="${svUrl}" target="_blank" title="Google Street View" style="color:var(--text-muted);display:flex;align-items:center;text-decoration:none;transition:color 0.2s;" onmouseover="this.style.color='#fbbc05'" onmouseout="this.style.color='var(--text-muted)'">
+                                            <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
+                                                <circle cx="12" cy="6" r="3.5"/>
+                                                <path d="M12 10.5c-2.3 0-6.1 1.2-6.5 3.5-.2.9.4 1.8 1.4 2l1.6 4.8c.2.6.8 1 1.5 1h4c.7 0 1.3-.4 1.5-1l1.6-4.8c1-.2 1.6-1.1 1.4-2-.4-2.3-4.2-3.5-6.5-3.5z"/>
+                                            </svg>
+                                        </a>
+                                        <button onclick="window.unlockGradePopup()" title="Unlock" style="background:none;border:none;color:var(--text-muted);cursor:pointer;padding:0;display:flex;align-items:center;transition:color 0.2s;" onmouseover="this.style.color='var(--primary)'" onmouseout="this.style.color='var(--text-muted)'">
+                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                                <line x1="18" y1="6" x2="6" y2="18"></line>
+                                                <line x1="6" y1="6" x2="18" y2="18"></line>
+                                            </svg>
+                                        </button>
+                                    </div>
                                 </div>
                             </div>`)
                             .addTo(map);
@@ -446,48 +525,59 @@ map.on('style.load', () => {
 function updateMapData() {
     if (!map.getSource('grade-roads')) return;
 
+    const tStart = performance.now();
+    const bounds = map.getBounds();
+    const west = bounds.getWest() - 0.001; // tiny padding to prevent popping at edges (~100m)
+    const east = bounds.getEast() + 0.001;
+    const south = bounds.getSouth() - 0.001;
+    const north = bounds.getNorth() + 0.001;
+
+    const size = 0.0075;
+    const xMin = Math.floor(west / size);
+    const xMax = Math.floor(east / size);
+    const yMin = Math.floor(south / size);
+    const yMax = Math.floor(north / size);
+
     const features = [];
     const seenSegments = new Set();
 
-    for (const [_, segments] of wayCache.entries()) {
-        for (const seg of segments) {
-            if (seg.grade !== undefined) {
-                const coords = seg.coordinates;
-                if (!coords || coords.length < 2) continue;
+    for (const seg of loadedSegments.values()) {
+        const coords = seg.coordinates;
+        if (!coords || coords.length < 2) continue;
 
-                // Deduplicate segments by rounded start/end endpoints (approx 11m precision)
-                const p1 = coords[0];
-                const p2 = coords[coords.length - 1];
-                const lon1 = Math.min(p1[0], p2[0]).toFixed(4);
-                const lat1 = Math.min(p1[1], p2[1]).toFixed(4);
-                const lon2 = Math.max(p1[0], p2[0]).toFixed(4);
-                const lat2 = Math.max(p1[1], p2[1]).toFixed(4);
-                const key = `${lon1},${lat1}_${lon2},${lat2}`;
+        // Deduplicate segments by rounded start/end endpoints (approx 11m precision)
+        const p1 = coords[0];
+        const p2 = coords[coords.length - 1];
+        const lon1 = Math.min(p1[0], p2[0]).toFixed(4);
+        const lat1 = Math.min(p1[1], p2[1]).toFixed(4);
+        const lon2 = Math.max(p1[0], p2[0]).toFixed(4);
+        const lat2 = Math.max(p1[1], p2[1]).toFixed(4);
+        const key = `${lon1},${lat1}_${lon2},${lat2}`;
 
-                if (seenSegments.has(key)) continue;
-                seenSegments.add(key);
+        if (seenSegments.has(key)) continue;
+        seenSegments.add(key);
 
-                features.push({
-                    type: 'Feature',
-                    id: seg.id,
-                    geometry: {
-                        type: 'LineString',
-                        coordinates: coords
-                    },
-                    properties: {
-                        id: seg.id,
-                        grade: seg.grade,
-                        gradePercent: seg.gradePercent
-                    }
-                });
+        features.push({
+            type: 'Feature',
+            id: seg.id,
+            geometry: {
+                type: 'LineString',
+                coordinates: coords
+            },
+            properties: {
+                id: seg.id,
+                grade: seg.grade,
+                gradePercent: seg.gradePercent
             }
-        }
+        });
     }
 
     map.getSource('grade-roads').setData({
         type: 'FeatureCollection',
         features: features
     });
+    const tEnd = performance.now();
+    console.log(`[Antigravity] updateMapData filtered down to ${features.length} features and ran setData in ${(tEnd - tStart).toFixed(1)}ms`);
 }
 
 const OVERPASS_ENDPOINTS = [
@@ -517,11 +607,35 @@ async function fetchFromOverpassWithFailover(query, signal) {
     throw lastError || new Error('All Overpass servers failed');
 }
 
+const loadedGridCells = new Set();
+
+function getGridKey(lng, lat) {
+    const size = 0.0075; // ~0.5 mile grid size
+    return `${Math.floor(lng / size)},${Math.floor(lat / size)}`;
+}
+
 // Fetch ways and process grades
 async function fetchAndProcessViewport() {
+    if (isFetching) {
+        needsRefetch = true;
+        return;
+    }
+
     const zoom = map.getZoom();
     const warning = document.getElementById('zoom-warning');
     const loading = document.getElementById('loading-indicator');
+
+    // Ensure the vector street data source is loaded before we attempt queries
+    if (!map.getSource('carto-streets') || !map.isSourceLoaded('carto-streets')) {
+        return;
+    }
+
+    // Do not load anything if map tilt/pitch is greater than 30 degrees
+    if (map.getPitch() > 30) {
+        isFetching = false;
+        loading.style.display = 'none';
+        return;
+    }
 
     // Allow loading major roads zoomed further out (zoom 12+)
     if (zoom < 12.0) {
@@ -533,36 +647,60 @@ async function fetchAndProcessViewport() {
         warning.classList.add('hidden');
     }
 
+    // Determine current viewport bounds and matching grid cells
+    const bounds = map.getBounds();
+    const west = bounds.getWest(), east = bounds.getEast();
+    const south = bounds.getSouth(), north = bounds.getNorth();
+
+    const size = 0.0075;
+    const xMin = Math.floor(west / size), xMax = Math.floor(east / size);
+    const yMin = Math.floor(south / size), yMax = Math.floor(north / size);
+
+    const cellsInViewport = [];
+    const unloadedCells = new Set();
+    for (let x = xMin; x <= xMax; x++) {
+        for (let y = yMin; y <= yMax; y++) {
+            const cellKey = `${x},${y}`;
+            cellsInViewport.push(cellKey);
+            if (!loadedGridCells.has(cellKey)) {
+                unloadedCells.add(cellKey);
+            }
+        }
+    }
+
+    // If all cells in the viewport are already loaded, exit immediately!
+    if (unloadedCells.size === 0) {
+        isFetching = false;
+        loading.style.display = 'none';
+        updateMapData(); // Ensure display bounds clipping is applied
+        return;
+    }
+
     isFetching = true;
     loading.style.display = 'flex';
 
     try {
         let features = [];
+        const tQueryStart = performance.now();
         try {
             features = map.queryRenderedFeatures(null, { layers: ['carto-roads-hidden'] }) || [];
         } catch (e) {
             // Layer might not be loaded yet
             return;
         }
+        const tQueryEnd = performance.now();
+        console.log(`[Antigravity] queryRenderedFeatures returned ${features.length} features in ${(tQueryEnd - tQueryStart).toFixed(1)}ms`);
 
-        // Deduplicate features and skip very short tile boundary slivers/fragments (< 15 meters)
+        // Deduplicate features
         const uniqueRoads = new Map();
 
-        function getApproxLength(coords) {
-            let dist = 0;
-            for (let i = 0; i < coords.length - 1; i++) {
-                const dx = (coords[i + 1][0] - coords[i][0]) * 85000;
-                const dy = (coords[i + 1][1] - coords[i][1]) * 111000;
-                dist += Math.sqrt(dx * dx + dy * dy);
-            }
-            return dist;
-        }
-
+        const tDedupStart = performance.now();
         for (const f of features) {
+            if (f.layer.id !== 'carto-roads-hidden') continue;
+
             if (f.geometry.type === 'LineString') {
                 const coords = f.geometry.coordinates;
                 if (!coords || coords.length < 2) continue;
-                if (getApproxLength(coords) < 15.0) continue;
 
                 const key = `${coords[0][0].toFixed(5)},${coords[0][1].toFixed(5)}_${coords[coords.length - 1][0].toFixed(5)},${coords[coords.length - 1][1].toFixed(5)}`;
                 if (!uniqueRoads.has(key)) {
@@ -573,21 +711,31 @@ async function fetchAndProcessViewport() {
                 for (let pIdx = 0; pIdx < parts.length; pIdx++) {
                     const coords = parts[pIdx];
                     if (!coords || coords.length < 2) continue;
-                    if (getApproxLength(coords) < 15.0) continue;
 
                     const key = `${coords[0][0].toFixed(5)},${coords[0][1].toFixed(5)}_${coords[coords.length - 1][0].toFixed(5)},${coords[coords.length - 1][1].toFixed(5)}`;
                     if (!uniqueRoads.has(key)) {
-                        uniqueRoads.set(key, { coords, id: f.id ? `${f.id}_p${pIdx}` : `${key}_p${pIdx}` });
+                        const wayId = f.id ? `${f.id}_p${pIdx}` : `${key}_p${pIdx}`;
+                        uniqueRoads.set(key, { coords, id: wayId });
                     }
                 }
             }
         }
+        const tDedupEnd = performance.now();
+        console.log(`[Antigravity] Deduplication of features took ${(tDedupEnd - tDedupStart).toFixed(1)}ms`);
 
         // Identify new ways to process
         const waysToResolve = [];
         for (const [key, road] of uniqueRoads.entries()) {
             const cacheKey = road.id || key;
             if (!wayCache.has(cacheKey)) {
+                // Check if the midpoint of the road is in one of the unloaded grid cells in this view
+                const mid = getSegmentMidpoint(road.coords);
+                if (mid) {
+                    const cellKey = getGridKey(mid[0], mid[1]);
+                    if (loadedGridCells.has(cellKey)) {
+                        continue; // Skip if it belongs to a cell that is already loaded
+                    }
+                }
                 waysToResolve.push({
                     wayId: cacheKey,
                     geomCoords: road.coords
@@ -599,14 +747,30 @@ async function fetchAndProcessViewport() {
             const processedWays = await getProcessedSegmentsFromWorker(waysToResolve);
             for (const item of processedWays) {
                 wayCache.set(item.wayId, item.segments);
+
+                for (const seg of item.segments) {
+                    loadedSegments.set(seg.id, seg);
+                }
             }
-            updateMapData();
         }
+
+        // Mark all viewport cells as loaded
+        for (const cellKey of cellsInViewport) {
+            loadedGridCells.add(cellKey);
+        }
+
+        updateMapData();
     } catch (err) {
         console.error('Error fetching viewport data:', err);
     } finally {
         isFetching = false;
         loading.style.display = 'none';
+        if (needsRefetch) {
+            needsRefetch = false;
+            setTimeout(() => {
+                fetchAndProcessViewport();
+            }, 100);
+        }
     }
 }
 
@@ -631,10 +795,66 @@ map.on('zoomend', () => {
 });
 
 map.on('idle', () => {
-    clearTimeout(moveendDebounceTimer);
-    moveendDebounceTimer = setTimeout(() => {
-        fetchAndProcessViewport();
-    }, 150);
+    if (map.getZoom() < 12.0 || map.getPitch() > 30) return;
+    if (!map.getSource('carto-streets') || !map.isSourceLoaded('carto-streets')) return;
+
+    const bounds = map.getBounds();
+    const west = bounds.getWest(), east = bounds.getEast();
+    const south = bounds.getSouth(), north = bounds.getNorth();
+    const size = 0.0075;
+    const xMin = Math.floor(west / size), xMax = Math.floor(east / size);
+    const yMin = Math.floor(south / size), yMax = Math.floor(north / size);
+
+    let hasUnloaded = false;
+    for (let x = xMin; x <= xMax; x++) {
+        for (let y = yMin; y <= yMax; y++) {
+            if (!loadedGridCells.has(`${x},${y}`)) {
+                hasUnloaded = true;
+                break;
+            }
+        }
+        if (hasUnloaded) break;
+    }
+
+    if (hasUnloaded) {
+        clearTimeout(moveendDebounceTimer);
+        moveendDebounceTimer = setTimeout(() => {
+            fetchAndProcessViewport();
+        }, 150);
+    }
+});
+
+
+
+map.on('sourcedata', (e) => {
+    if (e.sourceId === 'carto-streets' && map.isSourceLoaded('carto-streets')) {
+        if (map.getZoom() < 12.0 || map.getPitch() > 30) return;
+
+        const bounds = map.getBounds();
+        const west = bounds.getWest(), east = bounds.getEast();
+        const south = bounds.getSouth(), north = bounds.getNorth();
+        const size = 0.0075;
+        const xMin = Math.floor(west / size), xMax = Math.floor(east / size);
+        const yMin = Math.floor(south / size), yMax = Math.floor(north / size);
+
+        let hasUnloaded = false;
+        for (let x = xMin; x <= xMax; x++) {
+            for (let y = yMin; y <= yMax; y++) {
+                if (!loadedGridCells.has(`${x},${y}`)) {
+                    hasUnloaded = true;
+                    break;
+                }
+            }
+            if (hasUnloaded) break;
+        }
+
+        if (hasUnloaded) {
+            clearTimeout(moveendDebounceTimer);
+            moveendDebounceTimer = setTimeout(() => {
+                fetchAndProcessViewport();
+            }, 150);
+        }
+    }
 });
 
 // Initial fetch

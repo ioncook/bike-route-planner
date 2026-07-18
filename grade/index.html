@@ -123,9 +123,41 @@
             border: 1px solid var(--border) !important;
         }
 
-        .grade-hover-popup .maplibregl-popup-tip {
+        .grade-hover-popup.maplibregl-popup-anchor-bottom .maplibregl-popup-tip {
+            margin-top: -1px;
             border-top-color: var(--bg-panel) !important;
+        }
+        .grade-hover-popup.maplibregl-popup-anchor-top .maplibregl-popup-tip {
+            margin-bottom: -1px;
             border-bottom-color: var(--bg-panel) !important;
+        }
+        .grade-hover-popup.maplibregl-popup-anchor-left .maplibregl-popup-tip {
+            margin-right: -1px;
+            border-right-color: var(--bg-panel) !important;
+        }
+        .grade-hover-popup.maplibregl-popup-anchor-right .maplibregl-popup-tip {
+            margin-left: -1px;
+            border-left-color: var(--bg-panel) !important;
+        }
+        .grade-hover-popup.maplibregl-popup-anchor-top-left .maplibregl-popup-tip {
+            margin-bottom: -1px;
+            margin-right: -1px;
+            border-bottom-color: var(--bg-panel) !important;
+        }
+        .grade-hover-popup.maplibregl-popup-anchor-top-right .maplibregl-popup-tip {
+            margin-bottom: -1px;
+            margin-left: -1px;
+            border-bottom-color: var(--bg-panel) !important;
+        }
+        .grade-hover-popup.maplibregl-popup-anchor-bottom-left .maplibregl-popup-tip {
+            margin-top: -1px;
+            margin-right: -1px;
+            border-top-color: var(--bg-panel) !important;
+        }
+        .grade-hover-popup.maplibregl-popup-anchor-bottom-right .maplibregl-popup-tip {
+            margin-top: -1px;
+            margin-left: -1px;
+            border-top-color: var(--bg-panel) !important;
         }
 
         /* Custom range slider matching climate visualizer styling */
