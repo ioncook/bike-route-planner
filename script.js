@@ -551,22 +551,49 @@ function showHoverSegment(ci) {
             map.setLayoutProperty('hover-segment-layer', 'visibility', 'visible');
         }
     });
+    window.activeHoverStart = startIndex;
+    window.activeHoverEnd = endIndex;
+    updateTurnaroundJoins();
+
     // Exclusive-start range: corner at a waypoint boundary (idx==endIndex) is included in the
     // approach segment but excluded from the departure segment — avoids double-bolding.
     map.setFilter('turnaround-highlight-layer', ['all', ['>', ['get', 'idx'], startIndex], ['<=', ['get', 'idx'], endIndex]]);
     map.setFilter('turnaround-layer', ['any', ['<=', ['get', 'idx'], startIndex], ['>', ['get', 'idx'], endIndex]]);
 }
 
+function offsetLatLng(lngLat, offsetMeters, bearingDegrees) {
+    const lat = lngLat[1];
+    const lng = lngLat[0];
+    const brng = bearingDegrees * Math.PI / 180;
+
+    // Degrees per meter
+    const latDegPerMeter = 1.0 / 111320.0;
+    const lngDegPerMeter = 1.0 / (111320.0 * Math.cos(lat * Math.PI / 180));
+
+    const dLat = offsetMeters * Math.cos(brng) * latDegPerMeter;
+    const dLng = offsetMeters * Math.sin(brng) * lngDegPerMeter;
+
+    return [lng + dLng, lat + dLat];
+}
+
 function updateTurnaroundJoins() {
     if (!currentRouteGeoJSON || !map.getSource('turnarounds')) return;
 
     const coords = currentRouteGeoJSON.coordinates;
-    const pxOffset = getPixelOffset(map.getZoom());
+    const zoom = map.getZoom();
+    const pxOffset = getPixelOffset(zoom);
 
     if (pxOffset < 0.5) {
         map.getSource('turnarounds').setData({ type: 'FeatureCollection', features: [] });
         return;
     }
+
+    const latRad = coords[0][1] * Math.PI / 180;
+    const metersPerPixel = 78271.51696 * Math.cos(latRad) / Math.pow(2, zoom);
+
+    // Line width is 5 points. We extend the line center by pxOffset + 2.5 points
+    // in both directions perpendicular to the incoming segment.
+    const offsetMeters = (pxOffset + 2.5) * metersPerPixel;
 
     const turns = [];
     for (let i = 1; i < coords.length - 1; i++) {
@@ -592,46 +619,27 @@ function updateTurnaroundJoins() {
         while (d > 180) d -= 360;
         while (d < -180) d += 360;
 
-        // Fast bearing check: only evaluate side-switching on true turnarounds (> 160 degrees)
-        // This avoids calling expensive map.project() and completely removes staples/lumps on normal corners.
         if (Math.abs(d) <= 160) continue;
 
-        const pCenter = map.project(coords[i]);
-        const pIn = map.project(coords[prevIdx]);
-        const pOut = map.project(coords[nextIdx]);
+        // Check if this turnaround is currently in the active hovered segment
+        const isHovered = (window.activeHoverStart !== undefined && window.activeHoverStart !== -1 && i > window.activeHoverStart && i <= window.activeHoverEnd);
 
-        // Right-hand normal vectors for in/out segments
-        const vInX = pCenter.x - pIn.x, vInY = pCenter.y - pIn.y;
-        const lIn = Math.sqrt(vInX * vInX + vInY * vInY);
-        if (lIn < 0.1) continue;
-        const nInX = -vInY / lIn, nInY = vInX / lIn;
+        if (isHovered) {
+            // Bolded turnaround: shift inward dynamically to match outer corners and bridge angle
+            const wVal = 10.0;
+            const distOffset = (pxOffset + wVal / 2) * metersPerPixel;
 
-        const vOutX = pOut.x - pCenter.x, vOutY = pOut.y - pCenter.y;
-        const lOut = Math.sqrt(vOutX * vOutX + vOutY * vOutY);
-        if (lOut < 0.1) continue;
-        const nOutX = -vOutY / lOut, nOutY = vOutX / lOut;
+            // Scale the shift inward based on the turn's deviation from a perfect 180 degrees.
+            // A perfect 180 needs 0 shift (no overshoot), a 160 degree turn needs full shift (no gap).
+            const deviation = 180 - Math.abs(d); // 0 to 20
+            const shiftFactor = Math.min(1.0, deviation / 20.0);
+            const shiftOffset = (wVal / 2) * shiftFactor * metersPerPixel;
 
-        // Offset points are on the right side (positive normal)
-        const p1xy = [pCenter.x + nInX * pxOffset, pCenter.y + nInY * pxOffset];
-        const p2xy = [pCenter.x + nOutX * pxOffset, pCenter.y + nOutY * pxOffset];
+            const c1 = offsetLatLng(coords[i], distOffset, bIn + 90);
+            const p1 = offsetLatLng(c1, shiftOffset, bIn + 180); // shift backward along incoming road
 
-        if (isNaN(p1xy[0]) || isNaN(p1xy[1]) || isNaN(p2xy[0]) || isNaN(p2xy[1])) continue;
-
-        // Vector for incoming segment in screen space
-        const dx = pCenter.x - pIn.x;
-        const dy = pCenter.y - pIn.y;
-
-        // Cross products to determine which side of the incoming segment the offset points are on
-        const side1 = dx * (p1xy[1] - pIn.y) - dy * (p1xy[0] - pIn.x);
-        const side2 = dx * (p2xy[1] - pIn.y) - dy * (p2xy[0] - pIn.x);
-
-        // If they are on opposite sides, the offset line has switched sides of the street
-        // We use a small threshold (0.01) to ignore floating point boundary noise
-        const switchesSides = (side1 > 0.01 && side2 < -0.01) || (side1 < -0.01 && side2 > 0.01);
-
-        if (switchesSides) {
-            const p1 = map.unproject(p1xy);
-            const p2 = map.unproject(p2xy);
+            const c2 = offsetLatLng(coords[i], distOffset, bOut + 90);
+            const p2 = offsetLatLng(c2, shiftOffset, bOut); // shift forward along outgoing road
 
             turns.push({
                 type: 'Feature',
@@ -639,7 +647,27 @@ function updateTurnaroundJoins() {
                     idx: i,
                     color: routeGrades ? getColorForGrade(routeGrades[Math.min(i + 1, routeGrades.length - 1)] ?? 0) : 'rgb(34,197,94)'
                 },
-                geometry: { type: 'LineString', coordinates: [[p1.lng, p1.lat], [p2.lng, p2.lat]] }
+                geometry: {
+                    type: 'LineString',
+                    coordinates: [p1, p2]
+                }
+            });
+        } else {
+            // Untouched normal unhighlighted turnaround: straight perpendicular
+            const distOffset = (pxOffset + 2.5) * metersPerPixel;
+            const p1 = offsetLatLng(coords[i], distOffset, bIn + 90);
+            const p2 = offsetLatLng(coords[i], distOffset, bIn - 90);
+
+            turns.push({
+                type: 'Feature',
+                properties: {
+                    idx: i,
+                    color: routeGrades ? getColorForGrade(routeGrades[Math.min(i + 1, routeGrades.length - 1)] ?? 0) : 'rgb(34,197,94)'
+                },
+                geometry: {
+                    type: 'LineString',
+                    coordinates: [p1, p2]
+                }
             });
         }
     }
@@ -699,7 +727,7 @@ function getWpIconImage(index, total) {
     const key = `${index}-${total}`;
     if (wpIcons[key] && !wpIcons[key].complete === false) return wpIcons[key];
     const img = new Image();
-    
+
     const waypointStyle = localStorage.getItem('route_waypoint_style') || 'pin';
     let svg;
     if (waypointStyle === 'circle') {
@@ -718,7 +746,7 @@ function getWpIconImage(index, total) {
             72
         );
     }
-    
+
     img.src = 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
     wpIcons[key] = img;
     return img;
@@ -777,6 +805,10 @@ function hideHoverMarker() {
     map.getSource('hover-segment')?.setData({ type: 'FeatureCollection', features: [] });
     map.setFilter('turnaround-highlight-layer', ['==', ['get', 'idx'], -1]);
     map.setFilter('turnaround-layer', null);
+    window.activeHoverStart = -1;
+    window.activeHoverEnd = -1;
+    updateTurnaroundJoins();
+
     hoverCircleEl.style.display = 'none';
     hoverInfoEl.style.display = 'none';
 }
@@ -894,19 +926,19 @@ function setupRouteLayers() {
             id: 'turnaround-layer',
             type: 'line',
             source: 'turnarounds',
-            layout: { 'line-join': 'round', 'line-cap': 'round' },
+            layout: { 'line-join': 'miter', 'line-cap': 'butt' },
             paint: {
                 'line-color': ['get', 'color'],
                 'line-width': 5,
                 'line-opacity': 0.97
             }
-        }, 'route-gradient-layer');
+        });
     if (!map.getLayer('turnaround-highlight-layer'))
         map.addLayer({
             id: 'turnaround-highlight-layer',
             type: 'line',
             source: 'turnarounds',
-            layout: { 'line-join': 'round', 'line-cap': 'round' },
+            layout: { 'line-join': 'miter', 'line-cap': 'butt' },
             paint: {
                 'line-color': ['get', 'color'],
                 'line-width': 10,
@@ -3862,19 +3894,19 @@ function initChart() {
 function updateChartTheme() {
     if (!elevationChart) return;
     const isLight = document.body.classList.contains('light-mode');
-    
+
     // Update X-axis colors
     if (elevationChart.options.scales.x) {
         elevationChart.options.scales.x.grid.color = isLight ? 'rgba(0, 0, 0, 0.08)' : '#333';
         elevationChart.options.scales.x.ticks.color = isLight ? '#555' : '#aaa';
     }
-    
+
     // Update Y-axis colors
     if (elevationChart.options.scales.y) {
         elevationChart.options.scales.y.grid.color = isLight ? 'rgba(0, 0, 0, 0.08)' : '#333';
         elevationChart.options.scales.y.ticks.color = isLight ? '#555' : '#aaa';
     }
-    
+
     elevationChart.update();
 }
 
@@ -4997,7 +5029,7 @@ function updateDistanceMarkers() {
 
     const zoom = map.getZoom();
     const isImperial = currentUnits === 'imperial';
-    
+
     // Choose interval dynamically based on zoom and units
     let interval = 1.0;
     if (isImperial) {
@@ -5016,10 +5048,10 @@ function updateDistanceMarkers() {
 
     const unitInMeters = isImperial ? 1609.344 : 1000;
     const intervalMeters = interval * unitInMeters;
-    
+
     const features = [];
     const totalDistUnits = routeTotalDist / unitInMeters;
-    
+
     const maxK = Math.floor(totalDistUnits / interval);
     for (let k = 1; k <= maxK; k++) {
         const distUnits = k * interval;
@@ -5028,11 +5060,9 @@ function updateDistanceMarkers() {
         if (coord) {
             let text = distUnits.toString();
             if (distUnits % 1 !== 0) {
-                text = distUnits.toFixed(distUnits % 0.25 === 0 ? 2 : 1);
-                if (text.endsWith('.00')) text = text.slice(0, -3);
-                else if (text.endsWith('.0')) text = text.slice(0, -2);
+                text = parseFloat(distUnits.toFixed(2)).toString();
             }
-            
+
             features.push({
                 type: 'Feature',
                 geometry: { type: 'Point', coordinates: coord },
