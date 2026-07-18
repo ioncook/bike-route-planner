@@ -1,3 +1,14 @@
+window.addEventListener('error', function (e) {
+    let errDiv = document.getElementById('debug-error-overlay');
+    if (!errDiv) {
+        errDiv = document.createElement('div');
+        errDiv.id = 'debug-error-overlay';
+        errDiv.style = 'position:absolute;top:10px;left:10px;background:red;color:white;padding:10px;z-index:99999;font-family:monospace;max-width:80%;word-break:break-all;';
+        document.body.appendChild(errDiv);
+    }
+    errDiv.textContent = e.message + ' at ' + e.filename + ':' + e.lineno;
+});
+
 // CartoDB vector tile styles — same visual look as the old raster dark/light tiles
 // but rendered by GPU (smaller downloads, crisper at all zoom levels)
 const VECTOR_STYLES = {
@@ -265,27 +276,44 @@ function syncRoutingUI() {
 // Segments are static once built — no need to rebuild them on every pan/zoom.
 // Only rebuild routeScreenPts (for hover hit-testing) when map view changes.
 function rebuildRouteScreenPts() {
-    if (!currentRouteGeoJSON) { routeScreenPts = null; return; }
-    // Snapping and interaction are mapped 1:1 with the original coordinates
-    // to keep index-based elevation/grade lookups valid.
+    if (!currentRouteGeoJSON) { routeScreenPts = null; displayScreenPts = null; return; }
     const coords = currentRouteGeoJSON.coordinates;
-    const bounds = map.getBounds();
-    const west = bounds.getWest(), east = bounds.getEast();
-    const south = bounds.getSouth(), north = bounds.getNorth();
+    routeScreenPts = coords.map(c => map.project(c));
 
-    routeScreenPts = coords.map(c => {
-        if (c[0] < west || c[0] > east || c[1] < south || c[1] > north) {
-            return null;
-        }
-        return map.project(c);
-    });
+    if (currentDisplayCoords) {
+        displayScreenPts = currentDisplayCoords.map(c => map.project(c));
+    } else {
+        displayScreenPts = null;
+    }
 }
 
 let currentDisplayCoords = null; // Miter-corrected display coords, updated by rebuildMapGradient
+let displayScreenPts = null; // Screen points of currentDisplayCoords
 let rawIndexToDisplayRange = []; // Maps raw coordinates index to [displayStart, displayEnd] indices
 let displayIndexToRawIndex = []; // Maps display coordinates index to raw coordinate index
 let displayMercatorDistances = []; // Cumulative Mercator distances of displayCoords
 let displayMercTotalDist = 0;
+let lastHoverTime = 0; // Throttle timestamp for hover events
+
+let isRouteLeftHandDriving = false;
+
+function isLeftHandDriving(lng, lat) {
+    // UK & Ireland
+    if (lat >= 49.8 && lat <= 60.9 && lng >= -10.5 && lng <= 1.8) return true;
+    // Japan
+    if (lat >= 24.0 && lat <= 46.0 && lng >= 122.0 && lng <= 146.0) return true;
+    // Australia
+    if (lat >= -44.0 && lat <= -10.0 && lng >= 112.0 && lng <= 154.0) return true;
+    // New Zealand
+    if (lat >= -48.0 && lat <= -34.0 && lng >= 166.0 && lng <= 179.0) return true;
+    // India, Pakistan, Bangladesh, Nepal, Sri Lanka
+    if (lat >= 5.0 && lat <= 37.0 && lng >= 60.0 && lng <= 98.0) return true;
+    // Thailand, Malaysia, Singapore, Indonesia
+    if (lat >= -11.0 && lat <= 21.0 && lng >= 95.0 && lng <= 141.0) return true;
+    // Southern Africa
+    if (lat >= -35.0 && lat <= -17.0 && lng >= 11.0 && lng <= 36.0) return true;
+    return false;
+}
 
 // Fixes the line-offset inside-corner overlap at sharp right turns ONLY.
 // For positive line-offset (right side), a right turn puts the offset on the
@@ -299,7 +327,7 @@ function miterInsideCorners(coords) {
         displayIndexToRawIndex = coords.map((_, i) => i);
         return coords;
     }
-    const pxOffset = getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1);
+    const pxOffset = (getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1) + 1) * (isRouteLeftHandDriving ? -1 : 1);
     if (pxOffset < 1) { // No visible offset at low zooms
         rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
         displayIndexToRawIndex = coords.map((_, i) => i);
@@ -419,6 +447,14 @@ function rebuildMapGradient() {
     if (!currentRouteGeoJSON) return;
     const coords = currentRouteGeoJSON.coordinates;
 
+    const mult = isRouteLeftHandDriving ? -1 : 1;
+    console.log("[Antigravity] rebuildMapGradient isLHD:", isRouteLeftHandDriving, "mult:", mult);
+    const offsetExpression = ['interpolate', ['linear'], ['zoom'], 8, 0, 12, 2 * mult, 15, 4 * mult, 18, 6 * mult, 24, 6 * mult];
+    if (map.getLayer('route-gradient-layer')) map.setPaintProperty('route-gradient-layer', 'line-offset', offsetExpression);
+    if (map.getLayer('route-line')) map.setPaintProperty('route-line', 'line-offset', offsetExpression);
+    if (map.getLayer('route-hover-target')) map.setPaintProperty('route-hover-target', 'line-offset', offsetExpression);
+    if (map.getLayer('hover-segment-layer')) map.setPaintProperty('hover-segment-layer', 'line-offset', offsetExpression);
+
     if (coords.length > 250) {
         // Skip mitering for long routes to ensure top performance
         rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
@@ -435,6 +471,8 @@ function rebuildMapGradient() {
 
         const gradSrc = map.getSource('route-gradient');
         if (gradSrc) gradSrc.setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } });
+        const dispSrc = map.getSource('route-display');
+        if (dispSrc) dispSrc.setData({ type: 'LineString', coordinates: coords });
         routeScreenPtsDirty = true;
 
         const grades = routeGrades;
@@ -475,6 +513,8 @@ function rebuildMapGradient() {
 
     const gradSrc = map.getSource('route-gradient');
     if (gradSrc) gradSrc.setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: displayCoords } });
+    const dispSrc = map.getSource('route-display');
+    if (dispSrc) dispSrc.setData({ type: 'LineString', coordinates: displayCoords });
     routeScreenPtsDirty = true; // Snap engine must reflect the new display line
 
     const grades = routeGrades;
@@ -772,8 +812,13 @@ hoverCircleEl.id = 'hover-circle-dom';
 document.getElementById('map').appendChild(hoverCircleEl);
 
 function showHoverMarker(lngLat, info) {
-    const coords = Array.isArray(lngLat) ? lngLat : [lngLat.lng, lngLat.lat];
-    const pt = map.project(coords);
+    let pt;
+    if (lngLat && typeof lngLat.x === 'number' && typeof lngLat.y === 'number') {
+        pt = lngLat;
+    } else {
+        const coords = Array.isArray(lngLat) ? lngLat : [lngLat.lng, lngLat.lat];
+        pt = map.project(coords);
+    }
 
     // Position DOM hover circle
     hoverCircleEl.style.left = pt.x + 'px';
@@ -895,6 +940,13 @@ function setupRouteLayers() {
             buffer: 8, tolerance: 0
         });
 
+    if (!map.getSource('route-display'))
+        map.addSource('route-display', {
+            type: 'geojson',
+            data: { type: 'LineString', coordinates: [] },
+            buffer: 8, tolerance: 0
+        });
+
     if (!map.getLayer('route-gradient-layer'))
         map.addLayer({
             id: 'route-gradient-layer',
@@ -906,17 +958,39 @@ function setupRouteLayers() {
                 'line-width': 5,
                 'line-opacity': 0.97,
                 'line-gradient': ['interpolate', ['linear'], ['line-progress'], 0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)'],
-                'line-offset': ['interpolate', ['linear'], ['zoom'], 8, 0, 12, 2, 15, 4, 18, 6]
+                'line-offset': ['interpolate', ['linear'], ['zoom'], 8, 0, 12, 2, 15, 4, 18, 6, 24, 6]
             }
         });
 
     // Transparent interaction layer (hit target for drag, finger cursor)
     if (!map.getLayer('route-line'))
-        map.addLayer({ id: 'route-line', type: 'line', source: 'route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#000', 'line-width': 20, 'line-opacity': 0 } });
+        map.addLayer({
+            id: 'route-line',
+            type: 'line',
+            source: 'route-display',
+            layout: { 'line-join': 'round', 'line-cap': 'round' },
+            paint: {
+                'line-color': '#000',
+                'line-width': 20,
+                'line-opacity': 0,
+                'line-offset': ['interpolate', ['linear'], ['zoom'], 8, 0, 12, 2, 15, 4, 18, 6, 24, 6]
+            }
+        });
 
     // Invisible wide hover target (for distance/elev snapping, zero visual impact)
     if (!map.getLayer('route-hover-target'))
-        map.addLayer({ id: 'route-hover-target', type: 'line', source: 'route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#000', 'line-width': 100, 'line-opacity': 0 } });
+        map.addLayer({
+            id: 'route-hover-target',
+            type: 'line',
+            source: 'route-display',
+            layout: { 'line-join': 'round', 'line-cap': 'round' },
+            paint: {
+                'line-color': '#000',
+                'line-width': 100,
+                'line-opacity': 0,
+                'line-offset': ['interpolate', ['linear'], ['zoom'], 8, 0, 12, 2, 15, 4, 18, 6, 24, 6]
+            }
+        });
 
     // Turnaround Joins: Lines that bridge the parallel offset lines at sharp turns
     if (!map.getSource('turnarounds'))
@@ -959,7 +1033,7 @@ function setupRouteLayers() {
             paint: {
                 'line-width': 10,
                 'line-opacity': 1.0,
-                'line-offset': ['interpolate', ['linear'], ['zoom'], 8, 0, 12, 2, 15, 4, 18, 6]
+                'line-offset': ['interpolate', ['linear'], ['zoom'], 8, 0, 12, 2, 15, 4, 18, 6, 24, 6]
             }
         });
 
@@ -1023,6 +1097,9 @@ function setupRouteLayers() {
         map.getSource('route').setData({ type: 'LineString', coordinates: coords });
         // Gradient source uses decimated coords to avoid WebGL vertex limit (65535)
         map.getSource('route-gradient').setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: decimateLine(coords, PERF_MAP_POINTS) } });
+        if (map.getSource('route-display')) {
+            map.getSource('route-display').setData({ type: 'LineString', coordinates: currentDisplayCoords || coords });
+        }
         rebuildMapGradient();
         updateDistanceMarkers();
     }
@@ -1096,38 +1173,131 @@ map.on('mouseleave', 'route-line', () => {
     }
 });
 
-// Throttled Hover Logic: Only runs when mouse is near the route
-let lastHoverTime = 0;
+function getMiteredOffsetPts(pts, currentOffset) {
+    const n = pts.length;
+    const offsetPts = new Array(n);
+    if (n === 0) return offsetPts;
+
+    const normals = new Array(n - 1);
+    const dirs = new Array(n - 1);
+    for (let i = 0; i < n - 1; i++) {
+        const a = pts[i];
+        const b = pts[i + 1];
+        if (!a || !b) {
+            normals[i] = null;
+            dirs[i] = null;
+            continue;
+        }
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const len = Math.sqrt(dx * dx + dy * dy);
+        if (len < 0.1) {
+            normals[i] = null;
+            dirs[i] = null;
+        } else {
+            normals[i] = { x: -dy / len, y: dx / len };
+            dirs[i] = { x: dx, y: dy, len: len };
+        }
+    }
+
+    for (let i = 0; i < n; i++) {
+        const pt = pts[i];
+        if (!pt) {
+            offsetPts[i] = null;
+            continue;
+        }
+
+        if (i === 0) {
+            const norm = normals[0];
+            if (norm) {
+                offsetPts[0] = { x: pt.x + norm.x * currentOffset, y: pt.y + norm.y * currentOffset };
+            } else {
+                offsetPts[0] = { x: pt.x, y: pt.y };
+            }
+            continue;
+        }
+
+        if (i === n - 1) {
+            const norm = normals[n - 2];
+            if (norm) {
+                offsetPts[n - 1] = { x: pt.x + norm.x * currentOffset, y: pt.y + norm.y * currentOffset };
+            } else {
+                offsetPts[n - 1] = { x: pt.x, y: pt.y };
+            }
+            continue;
+        }
+
+        const norm1 = normals[i - 1];
+        const norm2 = normals[i];
+        const dir1 = dirs[i - 1];
+        const dir2 = dirs[i];
+
+        if (!norm1 || !norm2 || !dir1 || !dir2) {
+            const norm = norm1 || norm2;
+            if (norm) {
+                offsetPts[i] = { x: pt.x + norm.x * currentOffset, y: pt.y + norm.y * currentOffset };
+            } else {
+                offsetPts[i] = { x: pt.x, y: pt.y };
+            }
+            continue;
+        }
+
+        const dx1 = dir1.x, dy1 = dir1.y;
+        const dx2 = dir2.x, dy2 = dir2.y;
+        const cross = dx1 * dy2 - dy1 * dx2;
+
+        if (Math.abs(cross) < 1e-5) {
+            offsetPts[i] = { x: pt.x + norm1.x * currentOffset, y: pt.y + norm1.y * currentOffset };
+            continue;
+        }
+
+        const ax = pt.x + norm1.x * currentOffset;
+        const ay = pt.y + norm1.y * currentOffset;
+        const bx = pt.x + norm2.x * currentOffset;
+        const by = pt.y + norm2.y * currentOffset;
+
+        const t = ((bx - ax) * dy2 - (by - ay) * dx2) / cross;
+
+        const maxShift1 = dir1.len * 0.45;
+        const maxShift2 = dir2.len * 0.45;
+
+        let clampedT = t;
+        if (clampedT > 0) clampedT = 0;
+        if (clampedT < -maxShift1) clampedT = -maxShift1;
+
+        const miterPt = { x: ax + clampedT * dx1, y: ay + clampedT * dy1 };
+        offsetPts[i] = miterPt;
+    }
+
+    return offsetPts;
+}
+
 function findClosestPointOnLine(mousePt) {
     if (routeScreenPtsDirty) {
         rebuildRouteScreenPts();
         routeScreenPtsDirty = false;
     }
-    if (!currentRouteGeoJSON || !routeScreenPts) return { bestCi: -1 };
-    const currentOffset = getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1);
+    const pts = displayScreenPts || routeScreenPts;
+    if (!currentRouteGeoJSON || !pts) return { bestCi: -1 };
+    const currentOffset = (getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1) + 1) * (isRouteLeftHandDriving ? -1 : 1);
+    const offsetPts = getMiteredOffsetPts(pts, currentOffset);
+
     let bestDistSq = Infinity;
     let bestCi = -1;
     let bestT = 0;
     let bestProj = { x: 0, y: 0 };
 
-    for (let i = 0; i < routeScreenPts.length - 1; i++) {
-        const a = routeScreenPts[i];
-        const b = routeScreenPts[i + 1];
+    for (let i = 0; i < offsetPts.length - 1; i++) {
+        const a = offsetPts[i];
+        const b = offsetPts[i + 1];
         if (!a || !b) continue;
         const abx = b.x - a.x, aby = b.y - a.y;
         const abLenSq = abx * abx + aby * aby;
         if (abLenSq === 0) continue;
 
-        const nx = -aby / Math.sqrt(abLenSq);
-        const ny = abx / Math.sqrt(abLenSq);
-        const aoX = a.x + nx * currentOffset, aoY = a.y + ny * currentOffset;
-        const boX = b.x + nx * currentOffset, boY = b.y + ny * currentOffset;
-        const abox = boX - aoX, aboy = boY - aoY;
-
-        let t = ((mousePt.x - aoX) * abox + (mousePt.y - aoY) * aboy) / abLenSq;
+        let t = ((mousePt.x - a.x) * abx + (mousePt.y - a.y) * aby) / abLenSq;
         t = Math.max(0, Math.min(1, t));
 
-        const pProjX = aoX + t * abox, pProjY = aoY + t * aboy;
+        const pProjX = a.x + t * abx, pProjY = a.y + t * aby;
         const dx = pProjX - mousePt.x, dy = pProjY - mousePt.y;
         const dSq = dx * dx + dy * dy;
         if (dSq < bestDistSq) {
@@ -1137,7 +1307,12 @@ function findClosestPointOnLine(mousePt) {
             bestProj = { x: pProjX, y: pProjY };
         }
     }
-    return { bestCi, bestT, bestDistSq, bestProj };
+
+    let rawCi = bestCi;
+    if (displayScreenPts && displayIndexToRawIndex && bestCi !== -1) {
+        rawCi = displayIndexToRawIndex[bestCi] ?? bestCi;
+    }
+    return { bestCi: rawCi, bestT, bestDistSq, bestProj };
 }
 
 map.on('mousemove', 'route-line', (e) => {
@@ -1158,38 +1333,33 @@ map.on('mousemove', 'route-line', (e) => {
     if (now - lastHoverTime < 16) return; // 60fps throttle
     lastHoverTime = now;
 
-    if (!currentRouteGeoJSON || !routeScreenPts) return;
+    const pts = displayScreenPts || routeScreenPts;
+    if (!currentRouteGeoJSON || !pts) return;
     const coords = currentRouteGeoJSON.coordinates;
     const mousePt = e.point;
     const highlightThreshold = 225; // 15px radius squared for the visual widening
 
     // Get current line-offset for projection
-    const currentOffset = getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1);
+    const currentOffset = (getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1) + 1) * (isRouteLeftHandDriving ? -1 : 1);
+    const offsetPts = getMiteredOffsetPts(pts, currentOffset);
 
     let bestDistSq = Infinity;
     let bestCi = -1;
     let bestT = 0;
     let bestProj = { x: 0, y: 0 };
-    for (let i = 0; i < routeScreenPts.length - 1; i++) {
-        const a = routeScreenPts[i];
-        const b = routeScreenPts[i + 1];
+    for (let i = 0; i < offsetPts.length - 1; i++) {
+        const a = offsetPts[i];
+        const b = offsetPts[i + 1];
         if (!a || !b) continue; // Skip off-screen segments
         const abx = b.x - a.x, aby = b.y - a.y;
         const abLenSq = abx * abx + aby * aby;
         if (abLenSq === 0) continue;
 
-        const nx = -aby / Math.sqrt(abLenSq);
-        const ny = abx / Math.sqrt(abLenSq);
-
-        const aoX = a.x + nx * currentOffset, aoY = a.y + ny * currentOffset;
-        const boX = b.x + nx * currentOffset, boY = b.y + ny * currentOffset;
-        const abox = boX - aoX, aboy = boY - aoY;
-
-        let t = ((mousePt.x - aoX) * abox + (mousePt.y - aoY) * aboy) / abLenSq;
+        let t = ((mousePt.x - a.x) * abx + (mousePt.y - a.y) * aby) / abLenSq;
         t = Math.max(0, Math.min(1, t));
 
-        const pProjX = aoX + t * abox;
-        const pProjY = aoY + t * aboy;
+        const pProjX = a.x + t * abx;
+        const pProjY = a.y + t * aby;
         const dx = pProjX - mousePt.x;
         const dy = pProjY - mousePt.y;
         const dSq = dx * dx + dy * dy;
@@ -1203,15 +1373,16 @@ map.on('mousemove', 'route-line', (e) => {
     }
 
     if (bestCi !== -1 && bestDistSq < highlightThreshold) {
-        bestCiGlobal = bestCi;
+        const rawCi = displayIndexToRawIndex[bestCi] ?? bestCi;
+        bestCiGlobal = rawCi;
         const shiftedLngLat = map.unproject([bestProj.x, bestProj.y]);
-        updateHoverHighlight(bestCi, bestT, [shiftedLngLat.lng, shiftedLngLat.lat]);
+        updateHoverHighlight(rawCi, bestT, [shiftedLngLat.lng, shiftedLngLat.lat], bestProj);
     } else {
         clearHoverHighlight();
     }
 });
 
-function updateHoverHighlight(ci, t, lngLat) {
+function updateHoverHighlight(ci, t, lngLat, screenPt) {
     const ds = elevationChart?.data?.datasets?.[0];
     let chartIdx = ci;
     if (routePathDistances && ds?.data?.length) {
@@ -1236,7 +1407,7 @@ function updateHoverHighlight(ci, t, lngLat) {
     const elevLabel = elevVal != null ? elevVal.toFixed(1) + (currentUnits === 'metric' ? ' m' : ' ft') : '';
     const gradeLabel = grade !== undefined ? (grade >= 0 ? '+' : '') + grade.toFixed(2) + '%' : '';
     const info = `${distLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${elevLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${gradeLabel}`;
-    showHoverMarker(lngLat, info);
+    showHoverMarker(screenPt || lngLat, info);
 
     const statsDiv = document.getElementById('hover-stats');
     if (statsDiv) {
@@ -1275,6 +1446,9 @@ function clearHoverHighlight() {
         lastSegIdx = -1;
         currentHoverDispDist = null; // Clear chart hover line
         hideHoverMarker();
+        if (map.getLayer('hover-segment-layer')) {
+            map.setLayoutProperty('hover-segment-layer', 'visibility', 'none');
+        }
     }
 }
 
@@ -2085,10 +2259,12 @@ async function updateRoute() {
         if (map.getSource('route')) map.getSource('route').setData({ type: 'LineString', coordinates: [] });
         if (map.getSource('route-segments')) map.getSource('route-segments').setData({ type: 'FeatureCollection', features: [] });
         if (map.getSource('route-gradient')) map.getSource('route-gradient').setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [] } });
+        if (map.getSource('route-display')) map.getSource('route-display').setData({ type: 'LineString', coordinates: [] });
         if (map.getSource('turnarounds')) map.getSource('turnarounds').setData({ type: 'FeatureCollection', features: [] });
         hideHoverMarker();
         currentDistanceMeters = 0;
         currentRouteGeoJSON = null;
+        isRouteLeftHandDriving = false;
         routeGrades = null; routePathDistances = null; routeMercatorDistances = null; routeTotalDist = 0; routeMercTotalDist = 0;
         waypointDistances = [];
         updateDistanceUI();
@@ -2147,6 +2323,12 @@ async function updateRoute() {
     const targetPoints = Math.min(10000, Math.max(2000, Math.ceil(totalDist / 5)));
     const rawCoords = resampleLine(allCoords, targetPoints);
     currentRouteGeoJSON = { type: 'LineString', coordinates: rawCoords };
+    if (rawCoords.length > 0) {
+        isRouteLeftHandDriving = isLeftHandDriving(rawCoords[0][0], rawCoords[0][1]);
+        console.log("[Antigravity] Route loaded. Start:", rawCoords[0], "isLHD:", isRouteLeftHandDriving);
+    } else {
+        isRouteLeftHandDriving = false;
+    }
 
     // Track which indices in the final path correspond to our waypoints
     waypointPathIndices = waypoints.map(wp => {
@@ -3823,19 +4005,24 @@ function initChart() {
         const ciNext = ci + 1;
 
         // Interpolated geographic position
-        const lngC = coords[ci][0] + t * (coords[ciNext][0] - coords[ci][0]);
-        const latC = coords[ci][1] + t * (coords[ciNext][1] - coords[ci][1]);
+        const displayCoords = currentDisplayCoords || coords;
+        const displayIdx = rawIndexToDisplayRange[ci]?.[0] ?? ci;
+        const displayIdxNext = rawIndexToDisplayRange[ciNext]?.[0] ?? ciNext;
+        const lngC = displayCoords[displayIdx][0] + t * (displayCoords[displayIdxNext][0] - displayCoords[displayIdx][0]);
+        const latC = displayCoords[displayIdx][1] + t * (displayCoords[displayIdxNext][1] - displayCoords[displayIdx][1]);
 
         // Offset marker to sit on the route line (same logic as map hover)
         const pCenter = map.project([lngC, latC]);
-        const p0 = map.project(coords[ci]);
-        const p1 = map.project(coords[ciNext]);
+        const p0 = map.project(displayCoords[displayIdx]);
+        const p1 = map.project(displayCoords[displayIdxNext]);
         const vX = p1.x - p0.x, vY = p1.y - p0.y;
         const segLen = Math.sqrt(vX * vX + vY * vY);
         let markerLngLat;
+        let markerScreenPt = null;
         if (segLen > 0.1) {
             const nx = -vY / segLen, ny = vX / segLen;
-            const off = getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1);
+            const off = (getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1) + 1) * (isRouteLeftHandDriving ? -1 : 1);
+            markerScreenPt = { x: pCenter.x + nx * off, y: pCenter.y + ny * off };
             markerLngLat = map.unproject([pCenter.x + nx * off, pCenter.y + ny * off]);
         } else {
             markerLngLat = { lng: lngC, lat: latC };
@@ -3858,7 +4045,7 @@ function initChart() {
         const gradeLabel = grade !== undefined ? (grade >= 0 ? '+' : '') + grade.toFixed(2) + '%' : '';
         const info = `${distLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${elevLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${gradeLabel}`;
 
-        showHoverMarker([markerLngLat.lng, markerLngLat.lat], info);
+        showHoverMarker(markerScreenPt || [markerLngLat.lng, markerLngLat.lat], info);
         showHoverSegment(ci);
 
         const statsDiv = document.getElementById('hover-stats');
