@@ -299,7 +299,7 @@ function miterInsideCorners(coords) {
         displayIndexToRawIndex = coords.map((_, i) => i);
         return coords;
     }
-    const pxOffset = getPixelOffset(map.getZoom());
+    const pxOffset = getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1);
     if (pxOffset < 1) { // No visible offset at low zooms
         rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
         displayIndexToRawIndex = coords.map((_, i) => i);
@@ -1104,7 +1104,7 @@ function findClosestPointOnLine(mousePt) {
         routeScreenPtsDirty = false;
     }
     if (!currentRouteGeoJSON || !routeScreenPts) return { bestCi: -1 };
-    const currentOffset = getPixelOffset(map.getZoom());
+    const currentOffset = getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1);
     let bestDistSq = Infinity;
     let bestCi = -1;
     let bestT = 0;
@@ -1164,7 +1164,7 @@ map.on('mousemove', 'route-line', (e) => {
     const highlightThreshold = 225; // 15px radius squared for the visual widening
 
     // Get current line-offset for projection
-    const currentOffset = getPixelOffset(map.getZoom());
+    const currentOffset = getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1);
 
     let bestDistSq = Infinity;
     let bestCi = -1;
@@ -3835,7 +3835,7 @@ function initChart() {
         let markerLngLat;
         if (segLen > 0.1) {
             const nx = -vY / segLen, ny = vX / segLen;
-            const off = getPixelOffset(map.getZoom());
+            const off = getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1);
             markerLngLat = map.unproject([pCenter.x + nx * off, pCenter.y + ny * off]);
         } else {
             markerLngLat = { lng: lngC, lat: latC };
