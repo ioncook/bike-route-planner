@@ -300,6 +300,8 @@ let isRouteLeftHandDriving = false;
 let currentMapColorMode = 'grade'; // 'grade', 'road', or 'surface'
 let routeRoadTypes = [];
 let routeSurfaceTypes = [];
+let isHighPerformance = false;
+let currentRouteSegments = [];
 
 const roadColors = {
     cycleway: '#10b981',
@@ -473,6 +475,27 @@ function rebuildMapGradient() {
     if (map.getLayer('route-hover-target')) map.setPaintProperty('route-hover-target', 'line-offset', offsetExpression);
     if (map.getLayer('hover-segment-layer')) map.setPaintProperty('hover-segment-layer', 'line-offset', offsetExpression);
 
+    if (isHighPerformance) {
+        rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
+        displayIndexToRawIndex = coords.map((_, i) => i);
+        currentDisplayCoords = coords;
+
+        const gradSrc = map.getSource('route-gradient');
+        if (gradSrc) gradSrc.setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } });
+        const dispSrc = map.getSource('route-display');
+        if (dispSrc) dispSrc.setData({ type: 'LineString', coordinates: coords });
+        routeScreenPtsDirty = true;
+
+        if (map.getLayer('route-gradient-layer')) {
+            map.setPaintProperty('route-gradient-layer', 'line-gradient',
+                ['interpolate', ['linear'], ['line-progress'], 0, '#2563eb', 1, '#2563eb']);
+        }
+        if (map.getSource('turnarounds')) {
+            map.getSource('turnarounds').setData({ type: 'FeatureCollection', features: [] });
+        }
+        return;
+    }
+
     if (coords.length > 250) {
         // Skip mitering for long routes to ensure top performance
         rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
@@ -607,7 +630,9 @@ function showHoverSegment(ci) {
     }
 
     const stops = ['interpolate', ['linear'], ['line-progress']];
-    if (routeGrades && displayMercatorDistances && displayMercTotalDist > 0 && subCoords) {
+    if (isHighPerformance) {
+        stops.push(0, '#2563eb', 1, '#2563eb');
+    } else if (routeGrades && displayMercatorDistances && displayMercTotalDist > 0 && subCoords) {
         const startMerc = displayMercatorDistances[displayStart];
         const segMercDist = (displayMercatorDistances[displayEnd] - startMerc) || 1;
         let lastFrac = -1;
@@ -798,7 +823,7 @@ const circleSvg = (color, text = '', strokeWidth = 1, height = 22) => {
 };
 
 function createMarkerIcon(index, total) {
-    const waypointStyle = localStorage.getItem('route_waypoint_style') || 'pin';
+    const waypointStyle = localStorage.getItem('route_waypoint_style') || 'circle';
     if (waypointStyle === 'circle') {
         if (index === 0) return circleSvg('#22c55e', '', 1); // Green Start
         if (index === total - 1) return circleSvg('#ef4444', '', 1); // Red Finish
@@ -823,7 +848,7 @@ function getWpIconImage(index, total) {
     if (wpIcons[key] && !wpIcons[key].complete === false) return wpIcons[key];
     const img = new Image();
 
-    const waypointStyle = localStorage.getItem('route_waypoint_style') || 'pin';
+    const waypointStyle = localStorage.getItem('route_waypoint_style') || 'circle';
     let svg;
     if (waypointStyle === 'circle') {
         svg = circleSvg(
@@ -1032,7 +1057,7 @@ function updateRouteTypesUI(segments) {
     const container = document.getElementById('route-types-panel');
     if (!container) return;
 
-    if (!segments || segments.length === 0) {
+    if (isHighPerformance || !segments || segments.length === 0) {
         container.style.display = 'none';
         return;
     }
@@ -1741,7 +1766,7 @@ function invalidateGPXSegment(idx) {
 
 function createMarker(lngLat, index, initialMode) {
     const el = document.createElement('div');
-    const waypointStyle = localStorage.getItem('route_waypoint_style') || 'pin';
+    const waypointStyle = localStorage.getItem('route_waypoint_style') || 'circle';
     if (waypointStyle === 'circle') {
         el.style.width = '22px';
         el.style.height = '22px';
@@ -1891,7 +1916,7 @@ function createMarker(lngLat, index, initialMode) {
 }
 
 function refreshMarkerIcons() {
-    const waypointStyle = localStorage.getItem('route_waypoint_style') || 'pin';
+    const waypointStyle = localStorage.getItem('route_waypoint_style') || 'circle';
     markers.forEach((m, i) => {
         const el = m.getElement();
         if (waypointStyle === 'circle') {
@@ -2580,8 +2605,10 @@ async function updateRoute() {
     setStatus('Resampling…');
     currentDistanceMeters = totalDist;
     // Dynamic sampling: Target 1 point every 5 meters, min 2000, max 10000 points
-    // (10k max keeps us safely below MapLibre's 65k vertex-per-bucket limit for line-gradients)
-    const targetPoints = Math.min(10000, Math.max(2000, Math.ceil(totalDist / 5)));
+    // In High Performance mode: Target 1 point every 20 meters, min 500, max 2500 points
+    const targetPoints = isHighPerformance
+        ? Math.min(2500, Math.max(500, Math.ceil(totalDist / 20)))
+        : Math.min(10000, Math.max(2000, Math.ceil(totalDist / 5)));
     const rawCoords = resampleLine(allCoords, targetPoints);
     currentRouteGeoJSON = { type: 'LineString', coordinates: rawCoords };
     if (rawCoords.length > 0) {
@@ -2590,109 +2617,112 @@ async function updateRoute() {
         isRouteLeftHandDriving = false;
     }
 
-    // Build lookup for road types and surface types for resampled rawCoords
-    const originalPoints = [];
-    segments.forEach(seg => {
-        const hasMessages = seg.messages && seg.messages.length >= 2;
-        let tagsIdx = -1, distIdx = -1;
-        let header = null;
-        const msgNodes = [];
+    routeRoadTypes = [];
+    routeSurfaceTypes = [];
 
-        if (hasMessages) {
-            const firstMsg = seg.messages[0];
-            header = Array.isArray(firstMsg) ? firstMsg : (typeof firstMsg === 'string' ? firstMsg.split('\t') : null);
-            if (header) {
-                tagsIdx = header.indexOf('WayTags');
-                if (tagsIdx === -1) tagsIdx = header.indexOf('Tags');
-                distIdx = header.indexOf('Distance');
-                const lonIdx = header.indexOf('Longitude');
-                const latIdx = header.indexOf('Latitude');
+    if (!isHighPerformance) {
+        // Build lookup for road types and surface types for resampled rawCoords
+        const originalPoints = [];
+        segments.forEach(seg => {
+            const hasMessages = seg.messages && seg.messages.length >= 2;
+            let tagsIdx = -1, distIdx = -1;
+            let header = null;
+            const msgNodes = [];
 
-                if (tagsIdx !== -1 && lonIdx !== -1 && latIdx !== -1) {
-                    let lastTags = '';
-                    for (let m = 1; m < seg.messages.length; m++) {
-                        const rowVal = seg.messages[m];
-                        const row = Array.isArray(rowVal) ? rowVal : (typeof rowVal === 'string' ? rowVal.split('\t') : null);
-                        if (row && row.length > Math.max(tagsIdx, lonIdx, latIdx)) {
-                            const mLng = parseFloat(row[lonIdx]) / 1000000;
-                            const mLat = parseFloat(row[latIdx]) / 1000000;
-                            let tags = row[tagsIdx] || '';
-                            if (tags.trim()) {
-                                lastTags = tags;
-                            } else {
-                                tags = lastTags;
+            if (hasMessages) {
+                const firstMsg = seg.messages[0];
+                header = Array.isArray(firstMsg) ? firstMsg : (typeof firstMsg === 'string' ? firstMsg.split('\t') : null);
+                if (header) {
+                    tagsIdx = header.indexOf('WayTags');
+                    if (tagsIdx === -1) tagsIdx = header.indexOf('Tags');
+                    distIdx = header.indexOf('Distance');
+                    const lonIdx = header.indexOf('Longitude');
+                    const latIdx = header.indexOf('Latitude');
+
+                    if (tagsIdx !== -1 && lonIdx !== -1 && latIdx !== -1) {
+                        let lastTags = '';
+                        for (let m = 1; m < seg.messages.length; m++) {
+                            const rowVal = seg.messages[m];
+                            const row = Array.isArray(rowVal) ? rowVal : (typeof rowVal === 'string' ? rowVal.split('\t') : null);
+                            if (row && row.length > Math.max(tagsIdx, lonIdx, latIdx)) {
+                                const mLng = parseFloat(row[lonIdx]) / 1000000;
+                                const mLat = parseFloat(row[latIdx]) / 1000000;
+                                let tags = row[tagsIdx] || '';
+                                if (tags.trim()) {
+                                    lastTags = tags;
+                                } else {
+                                    tags = lastTags;
+                                }
+                                msgNodes.push({
+                                    coord: [mLng, mLat],
+                                    tags: tags
+                                });
                             }
-                            msgNodes.push({
-                                coord: [mLng, mLat],
-                                tags: tags
-                            });
                         }
                     }
                 }
             }
-        }
 
-        for (let i = 0; i < seg.coords.length; i++) {
-            const c = seg.coords[i];
-            let roadType = 'other';
-            let surfaceType = 'unknown';
+            for (let i = 0; i < seg.coords.length; i++) {
+                const c = seg.coords[i];
+                let roadType = 'other';
+                let surfaceType = 'unknown';
 
-            if (msgNodes.length > 0) {
-                let bestMIdx = 0;
-                let minDist = Infinity;
-                for (let m = 0; m < msgNodes.length; m++) {
-                    const dLng = msgNodes[m].coord[0] - c[0];
-                    const dLat = msgNodes[m].coord[1] - c[1];
-                    const dSq = dLng * dLng + dLat * dLat;
-                    if (dSq < minDist) {
-                        minDist = dSq;
-                        bestMIdx = m;
+                if (msgNodes.length > 0) {
+                    let bestMIdx = 0;
+                    let minDist = Infinity;
+                    for (let m = 0; m < msgNodes.length; m++) {
+                        const dLng = msgNodes[m].coord[0] - c[0];
+                        const dLat = msgNodes[m].coord[1] - c[1];
+                        const dSq = dLng * dLng + dLat * dLat;
+                        if (dSq < minDist) {
+                            minDist = dSq;
+                            bestMIdx = m;
+                        }
+                    }
+                    const tags = msgNodes[bestMIdx].tags;
+                    if (tags.includes('highway=cycleway')) {
+                        roadType = 'cycleway';
+                    } else if (tags.includes('highway=track') || tags.includes('highway=path') || tags.includes('highway=footway') || tags.includes('highway=bridleway') || tags.includes('highway=pedestrian')) {
+                        roadType = 'track';
+                    } else if (tags.includes('highway=residential') || tags.includes('highway=living_street') || tags.includes('highway=service') || tags.includes('highway=unclassified')) {
+                        roadType = 'quiet';
+                    } else if (tags.includes('highway=motorway') || tags.includes('highway=trunk') || tags.includes('highway=primary') || tags.includes('highway=secondary') || tags.includes('highway=tertiary')) {
+                        roadType = 'major';
+                    }
+
+                    if (tags.includes('surface=asphalt') || tags.includes('surface=concrete') || tags.includes('surface=paved') || tags.includes('surface=paving_stones') || tags.includes('surface=sett') || tags.includes('surface=tarmac')) {
+                        surfaceType = 'paved';
+                    } else if (tags.includes('surface=gravel') || tags.includes('surface=fine_gravel') || tags.includes('surface=unpaved') || tags.includes('surface=dirt') || tags.includes('surface=earth') || tags.includes('surface=sand') || tags.includes('surface=ground') || tags.includes('surface=grass') || tags.includes('surface=compacted') || tags.includes('surface=pebblestone') || tags.includes('surface=wood')) {
+                        surfaceType = 'unpaved';
                     }
                 }
-                const tags = msgNodes[bestMIdx].tags;
-                if (tags.includes('highway=cycleway')) {
-                    roadType = 'cycleway';
-                } else if (tags.includes('highway=track') || tags.includes('highway=path') || tags.includes('highway=footway') || tags.includes('highway=bridleway') || tags.includes('highway=pedestrian')) {
-                    roadType = 'track';
-                } else if (tags.includes('highway=residential') || tags.includes('highway=living_street') || tags.includes('highway=service') || tags.includes('highway=unclassified')) {
-                    roadType = 'quiet';
-                } else if (tags.includes('highway=motorway') || tags.includes('highway=trunk') || tags.includes('highway=primary') || tags.includes('highway=secondary') || tags.includes('highway=tertiary')) {
-                    roadType = 'major';
-                }
 
-                if (tags.includes('surface=asphalt') || tags.includes('surface=concrete') || tags.includes('surface=paved') || tags.includes('surface=paving_stones') || tags.includes('surface=sett') || tags.includes('surface=tarmac')) {
-                    surfaceType = 'paved';
-                } else if (tags.includes('surface=gravel') || tags.includes('surface=fine_gravel') || tags.includes('surface=unpaved') || tags.includes('surface=dirt') || tags.includes('surface=earth') || tags.includes('surface=sand') || tags.includes('surface=ground') || tags.includes('surface=grass') || tags.includes('surface=compacted') || tags.includes('surface=pebblestone') || tags.includes('surface=wood')) {
-                    surfaceType = 'unpaved';
+                originalPoints.push({
+                    coord: c,
+                    roadType,
+                    surfaceType
+                });
+            }
+        });
+
+        rawCoords.forEach(c => {
+            let bestIdx = 0;
+            let minDist = Infinity;
+            for (let i = 0; i < originalPoints.length; i++) {
+                const op = originalPoints[i];
+                const dLng = op.coord[0] - c[0];
+                const dLat = op.coord[1] - c[1];
+                const dSq = dLng * dLng + dLat * dLat;
+                if (dSq < minDist) {
+                    minDist = dSq;
+                    bestIdx = i;
                 }
             }
-
-            originalPoints.push({
-                coord: c,
-                roadType,
-                surfaceType
-            });
-        }
-    });
-
-    routeRoadTypes = [];
-    routeSurfaceTypes = [];
-    rawCoords.forEach(c => {
-        let bestIdx = 0;
-        let minDist = Infinity;
-        for (let i = 0; i < originalPoints.length; i++) {
-            const op = originalPoints[i];
-            const dLng = op.coord[0] - c[0];
-            const dLat = op.coord[1] - c[1];
-            const dSq = dLng * dLng + dLat * dLat;
-            if (dSq < minDist) {
-                minDist = dSq;
-                bestIdx = i;
-            }
-        }
-        routeRoadTypes.push(originalPoints[bestIdx].roadType);
-        routeSurfaceTypes.push(originalPoints[bestIdx].surfaceType);
-    });
+            routeRoadTypes.push(originalPoints[bestIdx].roadType);
+            routeSurfaceTypes.push(originalPoints[bestIdx].surfaceType);
+        });
+    }
 
 
     // Track which indices in the final path correspond to our waypoints
@@ -2712,6 +2742,7 @@ async function updateRoute() {
     rebuildMapGradient();
     routeScreenPtsDirty = true;
     updateDistanceUI();
+    currentRouteSegments = segments;
     updateRouteTypesUI(segments);
     // Calculate waypoint distances for the chart
     let dSum = 0;
@@ -3250,6 +3281,12 @@ document.getElementById('waypoint-style-select')?.addEventListener('change', (e)
 document.getElementById('show-distance-markers-check')?.addEventListener('change', (e) => {
     localStorage.setItem('route_show_distance_markers', e.target.checked ? 'true' : 'false');
     updateDistanceMarkers();
+});
+
+document.getElementById('high-perf-check')?.addEventListener('change', (e) => {
+    isHighPerformance = e.target.checked;
+    localStorage.setItem('route_high_performance', isHighPerformance ? 'true' : 'false');
+    updateRoute().catch(err => console.error("Error updating route on HP toggle:", err));
 });
 
 // Settings Handlers
@@ -3929,12 +3966,10 @@ function loadStoredSettings() {
     });
 
     // Projection — safe after load
-    const proj = localStorage.getItem('route_projection');
-    if (proj) {
-        document.getElementById('projection').value = proj;
-        if (map.getProjection()?.type !== proj) {
-            map.setProjection({ type: proj });
-        }
+    const proj = localStorage.getItem('route_projection') || 'mercator';
+    document.getElementById('projection').value = proj;
+    if (map.getProjection()?.type !== proj) {
+        map.setProjection({ type: proj });
     }
 
     // Terrain/hillshade UI values (applyTerrain reads them)
@@ -3967,7 +4002,7 @@ function loadStoredSettings() {
     if (locationEl) {
         locationEl.checked = showLocationVal !== null ? showLocationVal === 'true' : true;
     }
-    const waypointStyle = localStorage.getItem('route_waypoint_style') || 'pin';
+    const waypointStyle = localStorage.getItem('route_waypoint_style') || 'circle';
     const wpStyleEl = document.getElementById('waypoint-style-select');
     if (wpStyleEl) {
         wpStyleEl.value = waypointStyle;
@@ -3977,6 +4012,13 @@ function loadStoredSettings() {
     const distanceMarkersEl = document.getElementById('show-distance-markers-check');
     if (distanceMarkersEl) {
         distanceMarkersEl.checked = showDistanceMarkersVal !== null ? showDistanceMarkersVal === 'true' : false;
+    }
+
+    const highPerfVal = localStorage.getItem('route_high_performance');
+    const highPerfEl = document.getElementById('high-perf-check');
+    if (highPerfEl) {
+        isHighPerformance = highPerfVal === 'true';
+        highPerfEl.checked = isHighPerformance;
     }
 
     updateUserLocationPin();
@@ -4810,7 +4852,8 @@ async function updateElevationProfile() {
 
         elevationChart.data.datasets[0].data = chartData;
         elevationChart.data.datasets[0].grades = smoothedGrades;
-        elevationChart.data.datasets[0].borderColor = borderColors;
+        elevationChart.data.datasets[0].borderColor = isHighPerformance ? '#2563eb' : borderColors;
+        elevationChart.data.datasets[0].backgroundColor = isHighPerformance ? 'rgba(37, 99, 235, 0.15)' : 'rgba(100, 120, 160, 0.15)';
 
         if (elevationChart.data.datasets[1]) {
             elevationChart.data.datasets[1].data = wpData;

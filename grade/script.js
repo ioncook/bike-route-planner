@@ -247,8 +247,7 @@ function setupGradeLayers() {
     }
 
     // Get current line opacity setting
-    const opacityInput = document.getElementById('line-opacity-range');
-    const opacityVal = opacityInput ? parseFloat(opacityInput.value) / 100 : 0.8;
+    const opacityVal = 1.0;
 
     if (!map.getLayer('grade-roads-layer')) {
         map.addLayer({
@@ -670,19 +669,7 @@ document.getElementById('projection').addEventListener('change', (e) => {
     map.setProjection({ type: e.target.value });
 });
 
-// Line Opacity handler
-document.getElementById('line-opacity-range').addEventListener('input', (e) => {
-    const val = parseInt(e.target.value);
-    localStorage.setItem('grade_line_opacity', val);
-    document.getElementById('line-opacity-val').textContent = val + '%';
-    try {
-        if (map && map.getLayer('grade-roads-layer')) {
-            map.setPaintProperty('grade-roads-layer', 'line-opacity', val / 100);
-        }
-    } catch (err) {
-        console.warn('Could not set line opacity paint property:', err);
-    }
-});
+
 
 // Terrain switcher
 function applyTerrain() {
@@ -729,14 +716,7 @@ document.getElementById('basemap').value = storedBasemap;
 const storedProjection = localStorage.getItem('route_projection') || 'mercator';
 document.getElementById('projection').value = storedProjection;
 
-// Sync line opacity on load
-let storedOpacity = localStorage.getItem('grade_line_opacity') || '80';
-// Convert legacy float strings (e.g. "0.8") to integer percents
-if (parseFloat(storedOpacity) <= 1.0) {
-    storedOpacity = Math.round(parseFloat(storedOpacity) * 100).toString();
-}
-document.getElementById('line-opacity-range').value = storedOpacity;
-document.getElementById('line-opacity-val').textContent = storedOpacity + '%';
+
 
 // Sync terrain settings on load
 const storedHillshade = localStorage.getItem('route_hillshade') || 'off';
