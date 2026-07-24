@@ -367,8 +367,38 @@ function miterInsideCorners(coords) {
         while (d > 180) d -= 360;
         while (d < -180) d += 360;
 
+        // Subdivide sharp left turns (d <= -120°) into two smooth sub-bends around p2.
+        // This keeps each sub-bend under 120°, allowing MapLibre WebGL to render native, seamless joins without gaps or staples!
+        if (d <= -120) {
+            const sc = map.project(p2);
+            const s1 = map.project(p1);
+            const s3 = map.project(p3);
+
+            const ivX = sc.x - s1.x, ivY = sc.y - s1.y;
+            const iLen = Math.sqrt(ivX * ivX + ivY * ivY);
+            const ovX = s3.x - sc.x, ovY = s3.y - sc.y;
+            const oLen = Math.sqrt(ovX * ovX + ovY * ovY);
+
+            if (iLen >= 2 && oLen >= 2) {
+                const shiftR = Math.min(4, iLen * 0.25, oLen * 0.25);
+                const idX = ivX / iLen, idY = ivY / iLen;
+                const odX = ovX / oLen, odY = ovY / oLen;
+
+                const c1 = { x: sc.x - shiftR * idX, y: sc.y - shiftR * idY };
+                const c2 = { x: sc.x + shiftR * odX, y: sc.y + shiftR * odY };
+
+                const mPt1 = map.unproject([c1.x, c1.y]);
+                const mPt2 = map.unproject([c2.x, c2.y]);
+
+                result.push([mPt1.lng, mPt1.lat]);
+                result.push([mPt2.lng, mPt2.lat]);
+                mapping.push([currentLen, currentLen + 1]);
+                toRaw.push(i, i);
+                continue;
+            }
+        }
+
         // Only fix right turns > 30° — these are inside corners for positive offset.
-        // Left turns produce a gap (not overlap), already handled by turnaround staples.
         if (d < 30) {
             result.push(p2);
             mapping.push([currentLen, currentLen]);
@@ -496,63 +526,7 @@ function rebuildMapGradient() {
         return;
     }
 
-    if (coords.length > 250) {
-        // Skip mitering for long routes to ensure top performance
-        rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
-        displayIndexToRawIndex = coords.map((_, i) => i);
-        currentDisplayCoords = coords;
 
-        displayMercatorDistances = [0];
-        let dAcc = 0;
-        for (let i = 1; i < coords.length; i++) {
-            dAcc += getMercatorDistance(coords[i - 1], coords[i]);
-            displayMercatorDistances.push(dAcc);
-        }
-        displayMercTotalDist = dAcc;
-
-        const gradSrc = map.getSource('route-gradient');
-        if (gradSrc) gradSrc.setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } });
-        const dispSrc = map.getSource('route-display');
-        if (dispSrc) dispSrc.setData({ type: 'LineString', coordinates: coords });
-        routeScreenPtsDirty = true;
-
-        const grades = routeGrades;
-        if (!grades || !routeMercatorDistances || routeMercTotalDist <= 0) {
-            if (map.getLayer('route-gradient-layer'))
-                map.setPaintProperty('route-gradient-layer', 'line-gradient',
-                    ['interpolate', ['linear'], ['line-progress'], 0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)']);
-            return;
-        }
-        const gradStops = [];
-        let lastFrac = -1;
-        for (let i = 0; i < coords.length; i++) {
-            const frac = Math.min(Math.max(displayMercatorDistances[i] / (displayMercTotalDist || 1), 0), 1);
-            if (frac <= lastFrac) continue;
-            lastFrac = frac;
-            let color = 'rgb(34,197,94)';
-            if (currentMapColorMode === 'grade') {
-                color = getColorForGrade(grades[Math.min(i + 1, grades.length - 1)] ?? 0);
-            } else if (currentMapColorMode === 'road') {
-                const rt = routeRoadTypes[Math.min(i, routeRoadTypes.length - 1)] || 'other';
-                color = roadColors[rt] || '#6b7280';
-            } else if (currentMapColorMode === 'surface') {
-                const st = routeSurfaceTypes[Math.min(i, routeSurfaceTypes.length - 1)] || 'unknown';
-                color = surfaceColors[st] || '#4b5563';
-            }
-            gradStops.push(frac, color);
-        }
-        const colors = gradStops.filter((_, idx) => idx % 2 === 1);
-        const counts = {};
-        colors.forEach(c => counts[c] = (counts[c] || 0) + 1);
-        console.log("[Antigravity] rebuildMapGradient (long) mode:", currentMapColorMode, "color counts:", counts);
-
-        if (map.getLayer('route-gradient-layer'))
-            map.setPaintProperty('route-gradient-layer', 'line-gradient',
-                ['interpolate', ['linear'], ['line-progress'], ...gradStops]);
-        // Clean up turnaround layer on long routes
-        updateTurnaroundJoins();
-        return;
-    }
 
     // Using miter-corrected coordinates for the map display.
     const displayCoords = miterInsideCorners(coords);
@@ -604,6 +578,7 @@ function rebuildMapGradient() {
         map.setPaintProperty('route-gradient-layer', 'line-gradient',
             ['interpolate', ['linear'], ['line-progress'], ...gradStops]);
     updateTurnaroundJoins();
+    updateAngleDebugDisplay();
 }
 
 // Show the bold gradient hover highlight for the waypoint segment containing route index ci.
@@ -728,7 +703,8 @@ function updateTurnaroundJoins() {
         while (d > 180) d -= 360;
         while (d < -180) d += 360;
 
-        if (Math.abs(d) <= 160) continue;
+        // Reserve staples strictly for true 170+ degree U-turn turnarounds
+        if (Math.abs(d) <= 170) continue;
 
         // Check if this turnaround is currently in the active hovered segment
         const isHovered = (window.activeHoverStart !== undefined && window.activeHoverStart !== -1 && i > window.activeHoverStart && i <= window.activeHoverEnd);
@@ -792,6 +768,65 @@ function updateTurnaroundJoins() {
         }
     }
     map.getSource('turnarounds').setData({ type: 'FeatureCollection', features: turns });
+}
+
+// ─── Localhost Turn Angle Debugger ─────────────────────────────────────────
+let isAngleDebugMode = false;
+
+function updateAngleDebugDisplay() {
+    const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' || window.location.hostname === '0.0.0.0';
+    if (!map || !map.getSource('debug-angles')) return;
+
+    if (!isAngleDebugMode || !isLocalhost || !currentRouteGeoJSON) {
+        map.getSource('debug-angles').setData({ type: 'FeatureCollection', features: [] });
+        return;
+    }
+
+    const coords = currentRouteGeoJSON.coordinates;
+    const features = [];
+
+    for (let i = 1; i < coords.length - 1; i++) {
+        let prevIdx = i - 1;
+        while (prevIdx >= 0 && haversineDistance(coords[prevIdx], coords[i]) < 0.5) prevIdx--;
+        if (prevIdx < 0) continue;
+
+        let nextIdx = i + 1;
+        while (nextIdx < coords.length && haversineDistance(coords[i], coords[nextIdx]) < 0.5) nextIdx++;
+        if (nextIdx >= coords.length) continue;
+
+        const bIn = getBearing(coords[prevIdx], coords[i]);
+        const bOut = getBearing(coords[i], coords[nextIdx]);
+
+        let d = bOut - bIn;
+        while (d > 180) d -= 360;
+        while (d < -180) d += 360;
+
+        if (Math.abs(d) < 0.5) continue; // Skip straight lines (< 0.5 deg)
+
+        const roundedD = Math.round(d);
+        const signStr = d > 0 ? '+' : '';
+        const label = `${signStr}${roundedD}°`;
+
+        // Color coding: Red (#ef4444) for Right turns (+), Blue (#3b82f6) for Left turns (-)
+        const color = d > 0 ? '#ef4444' : '#3b82f6';
+
+        features.push({
+            type: 'Feature',
+            geometry: {
+                type: 'Point',
+                coordinates: coords[i]
+            },
+            properties: {
+                label: label,
+                color: color
+            }
+        });
+    }
+
+    map.getSource('debug-angles').setData({
+        type: 'FeatureCollection',
+        features: features
+    });
 }
 
 
@@ -986,9 +1021,9 @@ function parseRoadTypes(segments) {
             unknown: 0
         }
     };
-    
+
     let totalDist = 0;
-    
+
     segments.forEach(seg => {
         if (!seg.messages || seg.messages.length < 2) {
             stats.road.other += seg.dist;
@@ -996,10 +1031,10 @@ function parseRoadTypes(segments) {
             totalDist += seg.dist;
             return;
         }
-        
+
         const firstMsg = seg.messages[0];
         const header = Array.isArray(firstMsg) ? firstMsg : (typeof firstMsg === 'string' ? firstMsg.split('\t') : null);
-        
+
         if (!header) {
             stats.road.other += seg.dist;
             stats.surface.unknown += seg.dist;
@@ -1010,23 +1045,23 @@ function parseRoadTypes(segments) {
         let tagsIdx = header.indexOf('WayTags');
         if (tagsIdx === -1) tagsIdx = header.indexOf('Tags');
         const distIdx = header.indexOf('Distance');
-        
+
         if (tagsIdx === -1 || distIdx === -1) {
             stats.road.other += seg.dist;
             stats.surface.unknown += seg.dist;
             totalDist += seg.dist;
             return;
         }
-        
+
         let lastTags = '';
         for (let i = 1; i < seg.messages.length; i++) {
             const rowVal = seg.messages[i];
             const row = Array.isArray(rowVal) ? rowVal : (typeof rowVal === 'string' ? rowVal.split('\t') : null);
             if (!row || row.length <= Math.max(tagsIdx, distIdx)) continue;
-            
+
             const dist = parseFloat(row[distIdx]) || 0;
             if (dist <= 0) continue;
-            
+
             let tags = row[tagsIdx] || '';
             if (tags.trim()) {
                 lastTags = tags;
@@ -1034,7 +1069,7 @@ function parseRoadTypes(segments) {
                 tags = lastTags;
             }
             totalDist += dist;
-            
+
             let roadType = 'other';
             if (tags.includes('highway=cycleway')) {
                 roadType = 'cycleway';
@@ -1046,7 +1081,7 @@ function parseRoadTypes(segments) {
                 roadType = 'major';
             }
             stats.road[roadType] += dist;
-            
+
             let surfaceType = 'unknown';
             if (tags.includes('surface=asphalt') || tags.includes('surface=concrete') || tags.includes('surface=paved') || tags.includes('surface=paving_stones') || tags.includes('surface=sett') || tags.includes('surface=tarmac')) {
                 surfaceType = 'paved';
@@ -1056,7 +1091,7 @@ function parseRoadTypes(segments) {
             stats.surface[surfaceType] += dist;
         }
     });
-    
+
     return { stats, totalDist };
 }
 
@@ -1321,6 +1356,34 @@ function setupRouteLayers() {
                 'text-color': '#ffffff',
                 'text-halo-color': '#000000',
                 'text-halo-width': 1
+            }
+        });
+    }
+
+    // Debug Turn Angles layer (Localhost only)
+    if (!map.getSource('debug-angles')) {
+        map.addSource('debug-angles', {
+            type: 'geojson',
+            data: { type: 'FeatureCollection', features: [] }
+        });
+    }
+    if (!map.getLayer('debug-angles-layer')) {
+        map.addLayer({
+            id: 'debug-angles-layer',
+            type: 'symbol',
+            source: 'debug-angles',
+            layout: {
+                'text-field': ['get', 'label'],
+                'text-size': 13,
+                'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+                'text-allow-overlap': true,
+                'text-ignore-placement': true,
+                'text-offset': [0, -1.2]
+            },
+            paint: {
+                'text-color': ['get', 'color'],
+                'text-halo-color': '#ffffff',
+                'text-halo-width': 2
             }
         });
     }
@@ -2697,16 +2760,20 @@ async function updateRoute() {
     }
 
 
-    // Track which indices in the final path correspond to our waypoints
-    waypointPathIndices = waypoints.map(wp => {
-        let bestIdx = 0;
+    // Track which indices in the final path correspond to our waypoints sequentially
+    let searchStart = 0;
+    waypointPathIndices = waypoints.map((wp, wpIdx) => {
+        if (wpIdx === 0) return 0;
+        if (wpIdx === waypoints.length - 1) return rawCoords.length - 1;
+        let bestIdx = searchStart;
         let minDist = Infinity;
-        for (let i = 0; i < rawCoords.length; i++) {
+        for (let i = searchStart; i < rawCoords.length; i++) {
             const rc = rawCoords[i];
             if (!rc || isNaN(rc[0]) || isNaN(rc[1])) continue;
             const d = turf_distance(wp, rc);
             if (d < minDist) { minDist = d; bestIdx = i; }
         }
+        searchStart = bestIdx;
         return bestIdx;
     });
 
@@ -3195,6 +3262,18 @@ window.addEventListener('keydown', (e) => {
     }
 
     const key = e.key.toLowerCase();
+
+    // Localhost Debug Mode toggle: 'd'
+    if (key === 'd') {
+        const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' || window.location.hostname === '0.0.0.0';
+        if (isLocalhost) {
+            e.preventDefault();
+            isAngleDebugMode = !isAngleDebugMode;
+            updateAngleDebugDisplay();
+            showToast(isAngleDebugMode ? 'Debug Mode: Turn Angles ON' : 'Debug Mode: Turn Angles OFF', isAngleDebugMode ? 'success' : 'info');
+            return;
+        }
+    }
 
     if (key === currentKeybindings.toggleElevation) {
         e.preventDefault();
