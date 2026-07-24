@@ -872,8 +872,6 @@ function getWpIconImage(index, total) {
     return img;
 }
 
-// Hover info is now rendered as a MapLibre circle layer + floating HTML label.
-// This avoids all DOM/CSS wrapper square issues from maplibregl.Marker.
 const hoverInfoEl = document.createElement('div');
 hoverInfoEl.id = 'hover-info';
 hoverInfoEl.style.cssText = [
@@ -884,20 +882,29 @@ hoverInfoEl.style.cssText = [
     'border:1px solid rgba(255,255,255,0.12)', 'z-index:10',
     'backdrop-filter:blur(4px)', 'transform:translate(-50%,-140%)'
 ].join(';');
-document.getElementById('map').appendChild(hoverInfoEl);
 
 // Lightweight DOM-based hover circle element to avoid WebGL state flushes
 const hoverCircleEl = document.createElement('div');
 hoverCircleEl.id = 'hover-circle-dom';
-document.getElementById('map').appendChild(hoverCircleEl);
+
+function ensureHoverElementsAppended() {
+    if (!hoverInfoEl.parentNode && map) {
+        const container = (map.getCanvasContainer && map.getCanvasContainer()) || (map.getContainer && map.getContainer()) || document.getElementById('map');
+        if (container) {
+            container.appendChild(hoverInfoEl);
+            container.appendChild(hoverCircleEl);
+        }
+    }
+}
 
 function showHoverMarker(lngLat, info) {
+    ensureHoverElementsAppended();
     let pt;
     if (lngLat && typeof lngLat.x === 'number' && typeof lngLat.y === 'number') {
         pt = lngLat;
     } else {
         const coords = Array.isArray(lngLat) ? lngLat : [lngLat.lng, lngLat.lat];
-        pt = map.project(coords);
+        pt = projectToScreen(coords);
     }
 
     // Position DOM hover circle
@@ -1071,10 +1078,8 @@ function updateRouteTypesUI(segments) {
     container.style.display = 'block';
 
     const roadBar = document.getElementById('road-class-bar');
-    const surfaceBar = document.getElementById('surface-type-bar');
-
+    if (!roadBar) return;
     roadBar.innerHTML = '';
-    surfaceBar.innerHTML = '';
 
     const roadDefs = {
         cycleway: { color: '#10b981', label: 'Cycleway' },
@@ -1082,12 +1087,6 @@ function updateRouteTypesUI(segments) {
         track: { color: '#d97706', label: 'Path / Track' },
         major: { color: '#ef4444', label: 'Major Road' },
         other: { color: '#6b7280', label: 'Other / Direct' }
-    };
-
-    const surfaceDefs = {
-        paved: { color: '#06b6d4', label: 'Paved' },
-        unpaved: { color: '#854d0e', label: 'Unpaved / Dirt' },
-        unknown: { color: '#4b5563', label: 'Unknown' }
     };
 
     const formatDist = (d) => {
@@ -1106,7 +1105,7 @@ function updateRouteTypesUI(segments) {
         const dist = stats.road[key];
         if (dist <= 0) return;
         const pct = (dist / totalDist) * 100;
-        
+
         const el = document.createElement('div');
         el.style.width = `${pct}%`;
         el.style.height = '100%';
@@ -1116,24 +1115,8 @@ function updateRouteTypesUI(segments) {
         roadBar.appendChild(el);
     });
 
-    // Render Surface Bar
-    Object.keys(surfaceDefs).forEach(key => {
-        const dist = stats.surface[key];
-        if (dist <= 0) return;
-        const pct = (dist / totalDist) * 100;
-        
-        const el = document.createElement('div');
-        el.style.width = `${pct}%`;
-        el.style.height = '100%';
-        el.style.backgroundColor = surfaceDefs[key].color;
-        el.style.transition = 'width 0.3s ease';
-        el.title = `${surfaceDefs[key].label}: ${formatDist(dist)} (${pct.toFixed(0)}%)`;
-        surfaceBar.appendChild(el);
-    });
-
     const updateBarHighlights = () => {
         roadBar.style.outline = currentMapColorMode === 'road' ? '2px solid var(--primary)' : 'none';
-        surfaceBar.style.outline = currentMapColorMode === 'surface' ? '2px solid var(--primary)' : 'none';
     };
 
     updateBarHighlights();
@@ -1144,17 +1127,6 @@ function updateRouteTypesUI(segments) {
             currentMapColorMode = 'grade';
         } else {
             currentMapColorMode = 'road';
-        }
-        updateBarHighlights();
-        rebuildMapGradient();
-    };
-
-    surfaceBar.onclick = (e) => {
-        e.stopPropagation();
-        if (currentMapColorMode === 'surface') {
-            currentMapColorMode = 'grade';
-        } else {
-            currentMapColorMode = 'surface';
         }
         updateBarHighlights();
         rebuildMapGradient();
@@ -1555,7 +1527,7 @@ function findClosestPointOnLine(mousePt) {
     }
     const pts = displayScreenPts || routeScreenPts;
     if (!currentRouteGeoJSON || !pts) return { bestCi: -1 };
-    const currentOffset = (getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1) + 1) * (isRouteLeftHandDriving ? -1 : 1);
+    const currentOffset = getPixelOffset(map.getZoom()) * (isRouteLeftHandDriving ? -1 : 1);
     const offsetPts = getMiteredOffsetPts(pts, currentOffset);
 
     let bestDistSq = Infinity;
@@ -4429,7 +4401,7 @@ function initChart() {
         let markerScreenPt = null;
         if (segLen > 0.1) {
             const nx = -vY / segLen, ny = vX / segLen;
-            const off = (getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1) + 1) * (isRouteLeftHandDriving ? -1 : 1);
+            const off = getPixelOffset(map.getZoom()) * (isRouteLeftHandDriving ? -1 : 1);
             markerScreenPt = { x: pCenter.x + nx * off, y: pCenter.y + ny * off };
             markerLngLat = map.unproject([pCenter.x + nx * off, pCenter.y + ny * off]);
         } else {
