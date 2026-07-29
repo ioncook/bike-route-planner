@@ -3,7 +3,7 @@ window.addEventListener('error', function (e) {
     if (!errDiv) {
         errDiv = document.createElement('div');
         errDiv.id = 'debug-error-overlay';
-        errDiv.style = 'position:absolute;top:10px;left:10px;background:red;color:white;padding:10px;z-index:99999;font-family:monospace;max-width:80%;word-break:break-all;';
+        errDiv.style = 'position:fixed;bottom:10px;right:10px;background:rgba(220,38,38,0.85);color:white;padding:6px 10px;z-index:999999;font-family:monospace;font-size:11px;max-width:350px;border-radius:6px;word-break:break-all;pointer-events:none;display:none;';
         document.body.appendChild(errDiv);
     }
     errDiv.textContent = e.message + ' at ' + e.filename + ':' + e.lineno;
@@ -60,8 +60,10 @@ initialCover.innerHTML = `
 document.addEventListener('DOMContentLoaded', () => {
     const params = new URLSearchParams(window.location.search);
     const routeStr = params.get('route');
-    // Only show the loading cover when there are 2+ waypoints (a real route to fetch).
-    if (routeStr && routeStr.includes(';')) {
+    const modeStr = params.get('modes');
+    const modes = modeStr ? modeStr.split(',') : [];
+    // Only show the loading cover when there are 2+ waypoints (a real route to fetch) and not a GPX import.
+    if (routeStr && routeStr.includes(';') && !modes.includes('gpx')) {
         document.getElementById('map').appendChild(initialCover);
         document.getElementById('loading-indicator').style.display = 'flex';
         document.getElementById('loading-phase').textContent = 'Initializing...';
@@ -218,11 +220,61 @@ function getCookie(name) {
         return parts[0] === name ? decodeURIComponent(parts[1]) : r
     }, '');
 }
+function getKeyLabel(actionKey) {
+    const k = currentKeybindings[actionKey];
+    if (!k) return '';
+    return k.length === 1 ? k.toUpperCase() : (k.charAt(0).toUpperCase() + k.slice(1));
+}
+
+function updateAllButtonTooltips() {
+    const setTooltip = (id, baseText, actionKey) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const keyLabel = getKeyLabel(actionKey);
+        const text = keyLabel ? `${baseText} (${keyLabel})` : baseText;
+        if (el.hasAttribute('data-tooltip')) {
+            el.setAttribute('data-tooltip', text);
+        } else {
+            el.setAttribute('title', text);
+        }
+    };
+
+    setTooltip('total-distance', 'Click to view detailed route statistics', 'toggleStats');
+    setTooltip('search-toggle', 'Search locations', 'search');
+    setTooltip('fit-route-btn', 'Fit route', 'fitRoute');
+    setTooltip('reverse-route-btn', 'Reverse route', 'reverse');
+    setTooltip('current-location-btn', 'Center on current location', 'centerLocation');
+    setTooltip('reset-orientation-btn', 'Reset orientation', 'resetOrientation');
+    setTooltip('elevation-toggle-btn', 'Toggle elevation profile', 'toggleElevation');
+    setTooltip('settings-btn', 'Open settings', 'toggleSettings');
+
+    const modeKey = getKeyLabel('toggleMode');
+    const bikeBtn = document.getElementById('mode-bike');
+    if (bikeBtn) {
+        const text = modeKey ? `Cycling (Paved routes) (${modeKey})` : 'Cycling (Paved routes)';
+        if (bikeBtn.hasAttribute('data-tooltip')) bikeBtn.setAttribute('data-tooltip', text);
+        else bikeBtn.setAttribute('title', text);
+    }
+    const directBtn = document.getElementById('mode-direct');
+    if (directBtn) {
+        const text = modeKey ? `Direct (Straight line) (${modeKey})` : 'Direct (Straight line)';
+        if (directBtn.hasAttribute('data-tooltip')) directBtn.setAttribute('data-tooltip', text);
+        else directBtn.setAttribute('title', text);
+    }
+    const hikeBtn = document.getElementById('mode-hike');
+    if (hikeBtn) {
+        const text = modeKey ? `Hiking (Allow unpaved) (${modeKey})` : 'Hiking (Allow unpaved)';
+        if (hikeBtn.hasAttribute('data-tooltip')) hikeBtn.setAttribute('data-tooltip', text);
+        else hikeBtn.setAttribute('title', text);
+    }
+}
+
 function loadKeybindings() {
     const saved = getCookie('route_keybindings');
     if (saved) {
         try { currentKeybindings = { ...DEFAULT_KEYBINDINGS, ...JSON.parse(saved) }; } catch (e) { }
     }
+    updateAllButtonTooltips();
 }
 loadKeybindings();
 
@@ -347,6 +399,14 @@ function miterInsideCorners(coords) {
         displayIndexToRawIndex = coords.map((_, i) => i);
         return coords;
     }
+    // On 3D terrain mode, return raw coordinates to prevent 3D elevation raycast distortion on zoom or page load
+    const is3DTerrain = (map && map.getTerrain && map.getTerrain()) ||
+        (document.getElementById('hillshade-select')?.value === 'terrain');
+    if (is3DTerrain) {
+        rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
+        displayIndexToRawIndex = coords.map((_, i) => i);
+        return coords;
+    }
     const pxOffset = (getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1) + 1) * (isRouteLeftHandDriving ? -1 : 1);
     if (pxOffset < 1) { // No visible offset at low zooms
         rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
@@ -366,6 +426,15 @@ function miterInsideCorners(coords) {
         let d = getBearing(p2, p3) - getBearing(p1, p2);
         while (d > 180) d -= 360;
         while (d < -180) d += 360;
+
+        // Reserve staples strictly for true 170+ degree U-turn turnarounds.
+        // Keep p2 untouched so the route display line reaches coords[i] directly and connects seamlessly to the turnaround staple without a gap.
+        if (Math.abs(d) > 170) {
+            result.push(p2);
+            mapping.push([currentLen, currentLen]);
+            toRaw.push(i);
+            continue;
+        }
 
         // Subdivide sharp left turns (d <= -120°) into two smooth sub-bends around p2.
         // This keeps each sub-bend under 120°, allowing MapLibre WebGL to render native, seamless joins without gaps or staples!
@@ -665,19 +734,13 @@ function updateTurnaroundJoins() {
 
     const coords = currentRouteGeoJSON.coordinates;
     const zoom = map.getZoom();
-    const pxOffset = getPixelOffset(zoom);
+    const mult = isRouteLeftHandDriving ? -1 : 1;
+    const pxOffset = getPixelOffset(zoom) * mult;
 
-    if (pxOffset < 0.5) {
+    if (Math.abs(pxOffset) < 0.5) {
         map.getSource('turnarounds').setData({ type: 'FeatureCollection', features: [] });
         return;
     }
-
-    const latRad = coords[0][1] * Math.PI / 180;
-    const metersPerPixel = 78271.51696 * Math.cos(latRad) / Math.pow(2, zoom);
-
-    // Line width is 5 points. We extend the line center by pxOffset + 2.5 points
-    // in both directions perpendicular to the incoming segment.
-    const offsetMeters = (pxOffset + 2.5) * metersPerPixel;
 
     const turns = [];
     for (let i = 1; i < coords.length - 1; i++) {
@@ -706,6 +769,9 @@ function updateTurnaroundJoins() {
         // Reserve staples strictly for true 170+ degree U-turn turnarounds
         if (Math.abs(d) <= 170) continue;
 
+        const latRad = coords[i][1] * Math.PI / 180;
+        const metersPerPixel = 78271.51696 * Math.cos(latRad) / Math.pow(2, zoom);
+
         // Check if this turnaround is currently in the active hovered segment
         const isHovered = (window.activeHoverStart !== undefined && window.activeHoverStart !== -1 && i > window.activeHoverStart && i <= window.activeHoverEnd);
 
@@ -723,7 +789,7 @@ function updateTurnaroundJoins() {
         if (isHovered) {
             // Bolded turnaround: shift inward dynamically to match outer corners and bridge angle
             const wVal = 10.0;
-            const distOffset = (pxOffset + wVal / 2) * metersPerPixel;
+            const distOffset = (Math.abs(pxOffset) + wVal / 2) * metersPerPixel;
 
             // Scale the shift inward based on the turn's deviation from a perfect 180 degrees.
             // A perfect 180 needs 0 shift (no overshoot), a 160 degree turn needs full shift (no gap).
@@ -731,10 +797,10 @@ function updateTurnaroundJoins() {
             const shiftFactor = Math.min(1.0, deviation / 20.0);
             const shiftOffset = (wVal / 2) * shiftFactor * metersPerPixel;
 
-            const c1 = offsetLatLng(coords[i], distOffset, bIn + 90);
+            const c1 = offsetLatLng(coords[i], distOffset, bIn + 90 * mult);
             const p1 = offsetLatLng(c1, shiftOffset, bIn + 180); // shift backward along incoming road
 
-            const c2 = offsetLatLng(coords[i], distOffset, bOut + 90);
+            const c2 = offsetLatLng(coords[i], distOffset, bOut + 90 * mult);
             const p2 = offsetLatLng(c2, shiftOffset, bOut); // shift forward along outgoing road
 
             turns.push({
@@ -750,9 +816,9 @@ function updateTurnaroundJoins() {
             });
         } else {
             // Untouched normal unhighlighted turnaround: straight perpendicular
-            const distOffset = (pxOffset + 2.5) * metersPerPixel;
-            const p1 = offsetLatLng(coords[i], distOffset, bIn + 90);
-            const p2 = offsetLatLng(coords[i], distOffset, bIn - 90);
+            const distOffset = (Math.abs(pxOffset) + 2.5) * metersPerPixel;
+            const p1 = offsetLatLng(coords[i], distOffset, bIn + 90 * mult);
+            const p2 = offsetLatLng(coords[i], distOffset, bIn - 90 * mult);
 
             turns.push({
                 type: 'Feature',
@@ -937,9 +1003,11 @@ function showHoverMarker(lngLat, info) {
     let pt;
     if (lngLat && typeof lngLat.x === 'number' && typeof lngLat.y === 'number') {
         pt = lngLat;
-    } else {
+    } else if (map && typeof map.project === 'function') {
         const coords = Array.isArray(lngLat) ? lngLat : [lngLat.lng, lngLat.lat];
-        pt = projectToScreen(coords);
+        pt = map.project(coords);
+    } else {
+        return;
     }
 
     // Position DOM hover circle
@@ -1694,7 +1762,64 @@ map.on('mousemove', 'route-line', (e) => {
     }
 });
 
-function updateHoverHighlight(ci, t, lngLat, screenPt) {
+function getOffsetScreenPt(ci) {
+    if (ci === undefined || ci < 0 || !map || !currentRouteGeoJSON || !currentRouteGeoJSON.coordinates) return null;
+    const coords = currentRouteGeoJSON.coordinates;
+    if (ci >= coords.length) return null;
+
+    let pIdx = ci;
+    if (typeof rawIndexToDisplayRange !== 'undefined' && rawIndexToDisplayRange[ci]) {
+        pIdx = rawIndexToDisplayRange[ci][0] ?? ci;
+    }
+
+    const p2 = map.project(coords[pIdx]);
+    if (!p2) return null;
+
+    const p1 = (pIdx > 0) ? map.project(coords[pIdx - 1]) : null;
+    const p3 = (pIdx < coords.length - 1) ? map.project(coords[pIdx + 1]) : null;
+
+    const pxOffset = (getPixelOffset(map.getZoom()) + 1) * (isRouteLeftHandDriving ? -1 : 1);
+    if (Math.abs(pxOffset) < 0.5) {
+        return p2;
+    }
+
+    let nx = 0, ny = 0;
+    if (p1 && p3) {
+        const dx1 = p2.x - p1.x, dy1 = p2.y - p1.y;
+        const len1 = Math.sqrt(dx1 * dx1 + dy1 * dy1) || 1;
+        const n1x = -dy1 / len1, n1y = dx1 / len1;
+
+        const dx2 = p3.x - p2.x, dy2 = p3.y - p2.y;
+        const len2 = Math.sqrt(dx2 * dx2 + dy2 * dy2) || 1;
+        const n2x = -dy2 / len2, n2y = dx2 / len2;
+
+        nx = (n1x + n2x) / 2;
+        ny = (n1y + n2y) / 2;
+        const nlen = Math.sqrt(nx * nx + ny * ny) || 1;
+        nx /= nlen; ny /= nlen;
+    } else if (p1) {
+        const dx = p2.x - p1.x, dy = p2.y - p1.y;
+        const len = Math.sqrt(dx * dx + dy * dy) || 1;
+        nx = -dy / len; ny = dx / len;
+    } else if (p3) {
+        const dx = p3.x - p2.x, dy = p3.y - p2.y;
+        const len = Math.sqrt(dx * dx + dy * dy) || 1;
+        nx = -dy / len; ny = dx / len;
+    }
+
+    return {
+        x: p2.x + nx * pxOffset,
+        y: p2.y + ny * pxOffset
+    };
+}
+
+let isFlyToActive = false;
+let activeStatIdx = -1;
+
+function updateHoverHighlight(ci, t = 0, lngLat, screenPt) {
+    if (!screenPt && ci !== undefined && ci >= 0) {
+        screenPt = getOffsetScreenPt(ci);
+    }
     const ds = elevationChart?.data?.datasets?.[0];
     let chartIdx = ci;
     if (routePathDistances && ds?.data?.length) {
@@ -1719,7 +1844,8 @@ function updateHoverHighlight(ci, t, lngLat, screenPt) {
     const elevLabel = elevVal != null ? elevVal.toFixed(1) + (currentUnits === 'metric' ? ' m' : ' ft') : '';
     const gradeLabel = grade !== undefined ? (grade >= 0 ? '+' : '') + grade.toFixed(2) + '%' : '';
     const info = `${distLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${elevLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${gradeLabel}`;
-    showHoverMarker(screenPt || lngLat, info);
+    const gradeColor = grade !== undefined ? getColorForGrade(grade) : 'rgb(34,197,94)';
+    showHoverMarker(screenPt || lngLat, info, gradeColor);
 
     const statsDiv = document.getElementById('hover-stats');
     if (statsDiv) {
@@ -1741,16 +1867,34 @@ function updateHoverHighlight(ci, t, lngLat, screenPt) {
         }
     }
 
-    if (ci !== lastHoverIdx) {
-        lastHoverIdx = ci;
-        currentHoverDispDist = dispDist; // Sync with chart hover line
-        if (elevationChart) {
-            elevationChart.update('none');
-        }
+    lastHoverIdx = ci;
+    currentHoverDispDist = dispDist; // Sync with chart hover line
+    if (elevationChart) {
+        elevationChart.update('none'); // Update vertical line on elevation chart continuously
     }
 }
 
-function clearHoverHighlight() {
+let hoverFrameLoopId = null;
+
+function ensureHoverFrameLoopRunning() {
+    if (hoverFrameLoopId) return;
+    function loop() {
+        if (activeStatIdx >= 0 && currentRouteGeoJSON && currentRouteGeoJSON.coordinates && activeStatIdx < currentRouteGeoJSON.coordinates.length) {
+            const lngLat = currentRouteGeoJSON.coordinates[activeStatIdx];
+            const screenPt = getOffsetScreenPt(activeStatIdx);
+            if (screenPt) {
+                updateHoverHighlight(activeStatIdx, 0, lngLat, screenPt);
+            }
+        }
+        hoverFrameLoopId = requestAnimationFrame(loop);
+    }
+    hoverFrameLoopId = requestAnimationFrame(loop);
+}
+
+ensureHoverFrameLoopRunning();
+
+function clearHoverHighlight(force) {
+    if (isFlyToActive && !force) return;
     const statsDiv = document.getElementById('hover-stats');
     if (statsDiv) statsDiv.style.opacity = '0';
     if (lastHoverIdx !== -1) {
@@ -1758,6 +1902,9 @@ function clearHoverHighlight() {
         lastSegIdx = -1;
         currentHoverDispDist = null; // Clear chart hover line
         hideHoverMarker();
+        if (elevationChart) {
+            elevationChart.update('none');
+        }
         if (map.getLayer('hover-segment-layer')) {
             map.setLayoutProperty('hover-segment-layer', 'visibility', 'none');
         }
@@ -1765,7 +1912,7 @@ function clearHoverHighlight() {
 }
 
 map.on('mouseleave', clearHoverHighlight);
-map.on('movestart', clearHoverHighlight);
+map.on('movestart', () => clearHoverHighlight(false));
 map.on('touchstart', () => {
     clearHoverHighlight();
     document.activeElement?.blur();
@@ -2559,7 +2706,9 @@ async function fetchOneSegment(from, to, mode, avoidUnpaved, excludeParam, signa
     } catch (e) {
         if (e.name === 'AbortError') throw e;
     }
-    return { coords: [from, to], dist: turf_distance(from, to), failed: true };
+    const fallbackResult = { coords: [from, to], dist: turf_distance(from, to), failed: true };
+    segmentCache.set(key, fallbackResult);
+    return fallbackResult;
 }
 
 let currentAbortController = null;
@@ -2595,9 +2744,29 @@ async function updateRoute() {
         return;
     }
 
-    // --- Routing phase: fetch ALL segments in parallel ---
+    // --- Routing phase: fetch segments in parallel ---
     const numSegs = waypoints.length - 1;
-    setStatus(numSegs === 1 ? 'Routing…' : `Routing ${numSegs} segments…`);
+
+    let uncachedCount = 0;
+    for (let i = 0; i < numSegs; i++) {
+        const mode = segmentModes[i] || 'bike';
+        if (mode !== 'direct' && mode !== 'gpx') {
+            const avoidUnpaved = (mode !== 'hike');
+            let exclude = [];
+            if (avoidUnpaved) exclude.push('unpaved');
+            const excludeParam = exclude.length > 0 ? `&exclude=${exclude.join(',')}` : '';
+            const key = getCacheKey(waypoints[i], waypoints[i + 1], mode, avoidUnpaved, excludeParam);
+            if (!segmentCache.has(key)) {
+                uncachedCount++;
+            }
+        }
+    }
+
+    if (uncachedCount > 0) {
+        setStatus(uncachedCount === 1 ? 'Routing 1 segment…' : `Routing ${uncachedCount} of ${numSegs} segments…`);
+    } else {
+        setStatus('Updating route…');
+    }
 
     let segments = [];
     try {
@@ -3243,11 +3412,29 @@ window.addEventListener('keydown', (e) => {
     if (activeCaptureKey && !isInput) {
         e.preventDefault();
         let key = e.key.toLowerCase();
-        if (key !== 'escape') {
-            currentKeybindings[activeCaptureKey] = key;
+        if (key === 'escape' || key === 'esc') {
+            currentKeybindings[activeCaptureKey] = '';
+        } else {
+            // Check for duplicate keybindings
+            let duplicateAction = null;
+            Object.keys(currentKeybindings).forEach(act => {
+                if (act !== activeCaptureKey && currentKeybindings[act] && currentKeybindings[act] === key) {
+                    duplicateAction = act;
+                }
+            });
+
+            if (duplicateAction) {
+                let keyName = key.length === 1 ? key.toUpperCase() : (key.charAt(0).toUpperCase() + key.slice(1));
+                if (key === ' ') keyName = 'Space';
+                const actionName = ACTION_NAMES[duplicateAction] || duplicateAction;
+                alert(`"${keyName}" is already bound to ${actionName}.`);
+            } else {
+                currentKeybindings[activeCaptureKey] = key;
+            }
         }
         activeCaptureKey = null;
         renderKeybindings();
+        updateAllButtonTooltips();
         return;
     }
 
@@ -3396,11 +3583,7 @@ document.getElementById('units').addEventListener('change', (e) => {
     }
 });
 
-document.getElementById('projection').addEventListener('change', (e) => {
-    const proj = e.target.value;
-    localStorage.setItem('route_projection', proj);
-    map.setProjection({ type: proj });
-});
+
 
 // GPX Import: supports track (trkpt) and route/waypoint (rtept, wpt) formats
 function importGPX(file) {
@@ -3522,6 +3705,7 @@ function applyTerrain() {
         map.setTerrain({ source: 'terrain-source', exaggeration: exVal });
     }
 
+    rebuildMapGradient();
     needsElevationUpdate = true;
     if (typeof updateElevationProfile === 'function') updateElevationProfile();
 }
@@ -3565,6 +3749,8 @@ function updateStatsToggleBtn() {
     if (panel && totalDistBtn) {
         const visible = panel.classList.contains('show');
         totalDistBtn.classList.toggle('active', visible);
+        const key = (currentKeybindings?.toggleStats || 'r').toUpperCase();
+        totalDistBtn.title = `Click to view detailed route statistics (${key})`;
     }
 }
 
@@ -3920,7 +4106,7 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
         maxDownEl.textContent = '--'; maxDownEl.style.color = '';
     }
 
-    // Setup interactive map hovers
+    // Setup interactive map hovers & 30-60fps unified frame loop
     const hoverTargets = [
         { id: 'stats-min', getIdx: () => currentStats.minIdx },
         { id: 'stats-max', getIdx: () => currentStats.maxIdx },
@@ -3930,27 +4116,95 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
 
     hoverTargets.forEach(({ id, getIdx }) => {
         const el = document.getElementById(id);
-        if (!el) return;
+        if (!el || el._hasStatListeners) return;
+        el._hasStatListeners = true;
 
-        const newEl = el.cloneNode(true);
-        el.parentNode.replaceChild(newEl, el);
-
-        newEl.addEventListener('mouseenter', () => {
-            const ci = getIdx();
-            if (ci !== undefined && ci >= 0 && currentRouteGeoJSON && currentRouteGeoJSON.coordinates.length > ci) {
+        function triggerStatHover(ci) {
+            if (ci !== undefined && ci >= 0 && currentRouteGeoJSON && currentRouteGeoJSON.coordinates && currentRouteGeoJSON.coordinates.length > ci) {
+                activeStatIdx = ci;
                 const coords = currentRouteGeoJSON.coordinates;
                 const lngLat = coords[ci];
-                updateHoverHighlight(ci, 0, lngLat);
+                const screenPt = getOffsetScreenPt(ci);
+                updateHoverHighlight(ci, 0, lngLat, screenPt);
+            }
+        }
+
+        // Desktop hover preview
+        el.addEventListener('mouseenter', () => {
+            const ci = getIdx();
+            triggerStatHover(ci);
+        });
+
+        el.addEventListener('mouseleave', () => {
+            if ('ontouchstart' in window && isFlyToActive) return;
+            activeStatIdx = -1;
+            isFlyToActive = false;
+            clearHoverHighlight(true);
+        });
+
+        el.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+        });
+
+        // Mobile touch & long-press handling
+        let touchTimer = null;
+        let isLongPress = false;
+
+        el.addEventListener('touchstart', () => {
+            isLongPress = false;
+            const ci = getIdx();
+            triggerStatHover(ci);
+            if (touchTimer) clearTimeout(touchTimer);
+            touchTimer = setTimeout(() => {
+                isLongPress = true;
+                const ci = getIdx();
+                if (ci !== undefined && ci >= 0 && currentRouteGeoJSON && currentRouteGeoJSON.coordinates.length > ci) {
+                    activeStatIdx = ci;
+                    isFlyToActive = true;
+                    const lngLat = currentRouteGeoJSON.coordinates[ci];
+                    map.flyTo({
+                        center: lngLat,
+                        zoom: Math.max(map.getZoom(), 16),
+                        speed: 1.2,
+                        curve: 1.4,
+                        essential: true
+                    });
+                    if (navigator.vibrate) try { navigator.vibrate(35); } catch (_) {}
+                }
+            }, 350);
+        }, { passive: true });
+
+        el.addEventListener('touchend', () => {
+            if (touchTimer) {
+                clearTimeout(touchTimer);
+                touchTimer = null;
             }
         });
-        newEl.addEventListener('mouseleave', clearHoverHighlight);
 
-        newEl.addEventListener('click', () => {
-            const ci = getIdx();
-            if (ci !== undefined && ci >= 0 && currentRouteGeoJSON && currentRouteGeoJSON.coordinates.length > ci) {
-                const coords = currentRouteGeoJSON.coordinates;
-                const lngLat = coords[ci];
-                updateHoverHighlight(ci, 0, lngLat);
+        el.addEventListener('touchmove', () => {
+            if (touchTimer) {
+                clearTimeout(touchTimer);
+                touchTimer = null;
+            }
+        }, { passive: true });
+
+        // Desktop click handling
+        el.addEventListener('click', () => {
+            const isMobileTouch = 'ontouchstart' in window && window.innerWidth <= 768;
+            if (!isMobileTouch && !isLongPress) {
+                const ci = getIdx();
+                if (ci !== undefined && ci >= 0 && currentRouteGeoJSON && currentRouteGeoJSON.coordinates.length > ci) {
+                    activeStatIdx = ci;
+                    isFlyToActive = true;
+                    const lngLat = currentRouteGeoJSON.coordinates[ci];
+                    map.flyTo({
+                        center: lngLat,
+                        zoom: Math.max(map.getZoom(), 16),
+                        speed: 1.2,
+                        curve: 1.4,
+                        essential: true
+                    });
+                }
             }
         });
     });
@@ -4015,13 +4269,6 @@ function loadStoredSettings() {
             }
         }
     });
-
-    // Projection — safe after load
-    const proj = localStorage.getItem('route_projection') || 'mercator';
-    document.getElementById('projection').value = proj;
-    if (map.getProjection()?.type !== proj) {
-        map.setProjection({ type: proj });
-    }
 
     // Terrain/hillshade UI values (applyTerrain reads them)
     const hillshade = localStorage.getItem('route_hillshade');
@@ -4988,7 +5235,8 @@ map.on('idle', () => {
 
 function syncUrl() {
     const params = new URLSearchParams(window.location.search);
-    if (waypoints.length > 0) {
+    const hasGPX = segmentModes.some(m => m === 'gpx');
+    if (waypoints.length > 0 && !hasGPX) {
         const wpStr = waypoints.map(wp => `${wp[0].toFixed(5)},${wp[1].toFixed(5)}`).join(';');
         params.set('route', wpStr);
         if (segmentModes.length > 0) params.set('modes', segmentModes.join(','));
@@ -5011,6 +5259,14 @@ function loadUrlState() {
     const routeStr = params.get('route');
     const modeStr = params.get('modes');
     const modes = modeStr ? modeStr.split(',') : [];
+
+    if (modes.includes('gpx')) {
+        params.delete('route');
+        params.delete('modes');
+        window.history.replaceState({}, '', `${window.location.pathname}?${params.toString()}`);
+        removeInitialCover();
+        return;
+    }
 
     if (routeStr) {
         if (modes.length > 0) {
@@ -5429,10 +5685,14 @@ function renderKeybindings() {
         name.style.color = 'var(--text-muted)';
 
         const keyBtn = document.createElement('button');
-        let displayKey = currentKeybindings[action].toUpperCase();
+        let displayKey = currentKeybindings[action] ? currentKeybindings[action].toUpperCase() : 'NONE';
         if (displayKey === ' ') displayKey = 'SPACE';
         keyBtn.textContent = displayKey;
         keyBtn.style.cssText = 'min-width:85px; background:var(--btn-bg); border:1px solid var(--border); color:var(--primary); padding:8px 12px; border-radius:8px; font-size:0.75rem; font-family:monospace; font-weight:600; cursor:pointer; transition: all 0.2s;';
+        if (!currentKeybindings[action]) {
+            keyBtn.style.color = 'var(--text-muted)';
+            keyBtn.style.opacity = '0.6';
+        }
 
         if (activeCaptureKey === action) {
             keyBtn.textContent = '...';
@@ -5466,11 +5726,13 @@ document.getElementById('save-keybindings').onclick = () => {
     setCookie('route_keybindings', JSON.stringify(currentKeybindings));
     document.getElementById('keybindings-modal').style.display = 'none';
     activeCaptureKey = null;
+    updateAllButtonTooltips();
 };
 
 document.getElementById('reset-keybindings').onclick = () => {
     currentKeybindings = { ...DEFAULT_KEYBINDINGS };
     renderKeybindings();
+    updateAllButtonTooltips();
 };
 
 function initCustomTooltips() {

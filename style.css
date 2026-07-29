@@ -918,9 +918,12 @@ body.light-mode .custom-tooltip {
 
 .stats-interactive {
     cursor: pointer;
-    border-bottom: 1px dotted;
-    text-decoration: none;
+    border-bottom: 1.5px dotted currentColor;
+    text-decoration: none !important;
     padding-bottom: 1px;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
 }
 
 .help-interactive {
@@ -1271,7 +1274,7 @@ body.right-click-dragging #map canvas {
     border-radius: 50%;
     background: #4b5563;
     border: 1.5px solid #ffffff;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
     z-index: 9;
     transform: translate(-50%, -50%);
 }
@@ -1288,15 +1291,16 @@ body.right-click-dragging #map canvas {
     bottom: 24px;
     left: 50%;
     transform: translateX(-50%) translateY(100px);
-    background: #ef4444;
-    color: #ffffff;
-    padding: 12px 24px;
-    border-radius: 8px;
+    background: var(--bg-panel);
+    color: var(--text-main);
+    border: 1px solid var(--border);
+    padding: 12px 22px;
+    border-radius: 10px;
     font-family: 'Inter', sans-serif;
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 500;
-    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4);
-    z-index: 10000;
+    box-shadow: 0 15px 35px rgba(0, 0, 0, 0.5);
+    z-index: 999999;
     transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s ease;
     opacity: 0;
     pointer-events: none;
@@ -1304,11 +1308,41 @@ body.right-click-dragging #map canvas {
     align-items: center;
     gap: 8px;
 }
+
 .toast-notification.show {
     transform: translateX(-50%) translateY(0);
     opacity: 1;
     pointer-events: auto;
 }
-.toast-notification.warning {
-    background: #d97706; /* Darker amber to be readable and premium */
+
+.toast-notification.warning,
+.toast-notification.info {
+    background: var(--bg-panel);
+    color: var(--text-main);
+    border: 1px solid var(--border);
+}
+
+/* Subtle Custom Scrollbar for Keybinding Modal */
+#keybinding-list {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+}
+
+#keybinding-list::-webkit-scrollbar {
+    width: 6px;
+}
+
+#keybinding-list::-webkit-scrollbar-track {
+    background: transparent;
+    border-radius: 3px;
+}
+
+#keybinding-list::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+    transition: background 0.2s ease;
+}
+
+#keybinding-list::-webkit-scrollbar-thumb:hover {
+    background: var(--text-muted);
 }

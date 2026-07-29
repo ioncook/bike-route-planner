@@ -52,7 +52,7 @@
 
                 <div class="icon-btn-divider" style="height: 20px; opacity: 0.5; margin: 0 4px;"></div>
 
-                <span class="stat-value" id="total-distance" title="Click to view detailed route statistics"
+                <span class="stat-value" id="total-distance" title="Click to view detailed route statistics (R)"
                     style="cursor: pointer;">0.0 mi</span>
 
                 <div id="loading-indicator"
@@ -229,10 +229,10 @@
                     </button>
                     <div id="settings-menu" class="settings-content" style="display: none;">
                         <div class="setting-row">
-                            <span>Theme</span>
+                            <span>UI Theme</span>
                             <select id="theme">
-                                <option value="dark">Dark Mode</option>
-                                <option value="light">Light Mode</option>
+                                <option value="dark">Dark</option>
+                                <option value="light">Light</option>
                             </select>
                         </div>
                         <div class="setting-row">
@@ -244,13 +244,6 @@
                                 <option value="light">Clean Light Map</option>
                                 <option value="osm">Open Street Map</option>
                                 <option value="satellite">Satellite</option>
-                            </select>
-                        </div>
-                        <div class="setting-row">
-                            <span>Projection</span>
-                            <select id="projection">
-                                <option value="mercator">Flat</option>
-                                <option value="globe">Globe</option>
                             </select>
                         </div>
                         <hr style="border:0; border-top: 1px solid var(--border); margin: 8px 0;">
@@ -306,7 +299,8 @@
                             </label>
                         </div>
                         <div class="setting-row">
-                            <span title="Reduces coordinate density and disables gradients to speed up map updates" class="help-interactive">Simple Mode</span>
+                            <span title="Reduces coordinate density and disables gradients to speed up map updates"
+                                class="help-interactive">Simple Mode</span>
                             <label class="switch">
                                 <input type="checkbox" id="high-perf-check">
                                 <span class="slider"></span>
@@ -381,9 +375,13 @@
                         </span>
                     </div>
                     <!-- Road Class Bar -->
-                    <div id="route-types-panel" style="margin-top: 15px; border-top: 1px solid var(--border); padding-top: 12px; display: none;">
-                        <span class="stats-label" style="display: block; margin-bottom: 5px; font-weight: 500;">Road Class</span>
-                        <div id="road-class-bar" style="height: 12px; width: 100%; border-radius: 4px; overflow: hidden; display: flex; background: var(--btn-bg); cursor: pointer; margin-bottom: 5px;"></div>
+                    <div id="route-types-panel"
+                        style="margin-top: 15px; border-top: 1px solid var(--border); padding-top: 12px; display: none;">
+                        <span class="stats-label" style="display: block; margin-bottom: 5px; font-weight: 500;">Road
+                            Class</span>
+                        <div id="road-class-bar"
+                            style="height: 12px; width: 100%; border-radius: 4px; overflow: hidden; display: flex; background: var(--btn-bg); cursor: pointer; margin-bottom: 5px;">
+                        </div>
                     </div>
                 </div>
             </div>
