@@ -29,7 +29,7 @@
 body.light-mode {
     --bg-dark: #f5f5f5;
     --bg-panel: #ffffff;
-    --header-bg: #ececec;
+    --header-bg: #ffffff;
     --text-main: #222222;
     --text-muted: #666666;
     --border: #cccccc;
@@ -469,7 +469,7 @@ body {
     max-height: 80vh;
     overflow-y: auto;
     box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.5);
-    z-index: 3000;
+    z-index: 2000000 !important;
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 12px;
@@ -575,17 +575,22 @@ input:checked+.slider:before {
 /* Floating Window */
 .floating-window {
     position: absolute;
-    bottom: 20px;
-    left: 20px;
     width: 450px;
     height: 220px;
     min-width: 400px;
     min-height: 150px;
-    z-index: 2000;
+    z-index: 2000000 !important;
     display: flex;
     flex-direction: column;
     overflow: visible;
     /* CRITICAL: Must be visible so resizers aren't clipped */
+}
+
+body.is-dragging-window #elevation-chart,
+body.is-dragging-window #elevation-panel .window-content,
+body.is-dragging-window #stats-panel,
+body.is-dragging-window #stats-panel * {
+    pointer-events: none !important;
 }
 
 .window-inner {
@@ -744,7 +749,7 @@ input:checked+.slider:before {
     font-size: 0.75rem;
     font-weight: 500;
     pointer-events: none;
-    z-index: 100000;
+    z-index: 3000000 !important;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6);
     border: 1px solid rgba(255, 255, 255, 0.1);
     white-space: nowrap;
@@ -852,7 +857,7 @@ body.light-mode .custom-tooltip {
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
     backdrop-filter: blur(12px);
     -webkit-backdrop-filter: blur(12px);
-    z-index: 1500;
+    z-index: 2000000 !important;
     display: none;
     flex-direction: column;
     overflow: hidden;
@@ -910,6 +915,9 @@ body.light-mode .custom-tooltip {
     border-bottom: 1px dotted;
     text-decoration: none;
     padding-bottom: 1px;
+    user-select: none !important;
+    -webkit-user-select: none !important;
+    -webkit-touch-callout: none !important;
 }
 
 @media (max-width: 768px) {

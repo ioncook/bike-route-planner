@@ -35,10 +35,10 @@ let currentBasemap = localStorage.getItem('route_basemap') || 'cyclosm';
 // This perfectly answers the request to "only make it visually load on the second load".
 const initialCover = document.createElement('div');
 initialCover.id = 'initial-map-cover';
-initialCover.style.position = 'absolute';
+initialCover.style.position = 'fixed';
 initialCover.style.inset = '0';
 initialCover.style.backgroundColor = '#111';
-initialCover.style.zIndex = '999999';
+initialCover.style.zIndex = '10000000';
 initialCover.style.transition = 'opacity 0.5s ease-in-out';
 initialCover.style.pointerEvents = 'none';
 
@@ -64,7 +64,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const modes = modeStr ? modeStr.split(',') : [];
     // Only show the loading cover when there are 2+ waypoints (a real route to fetch) and not a GPX import.
     if (routeStr && routeStr.includes(';') && !modes.includes('gpx')) {
-        document.getElementById('map').appendChild(initialCover);
+        document.body.appendChild(initialCover);
         document.getElementById('loading-indicator').style.display = 'flex';
         document.getElementById('loading-phase').textContent = 'Initializing...';
     } else {
@@ -1816,7 +1816,7 @@ let isHoveringMarker = false;
 
 map.on('mousemove', 'route-line', (e) => {
     if (window.innerWidth <= 768) return; // Disable hover interaction on mobile
-    if (isDraggingLine || isDraggingMarker || isHoveringMarker) {
+    if (isDraggingLine || isDraggingMarker || isHoveringMarker || isDraggingWindow || isDraggingStats || isResizing) {
         clearHoverHighlight();
         return;
     }
@@ -1903,6 +1903,10 @@ let isFlyToActive = false;
 let activeStatIdx = -1;
 
 function updateHoverHighlight(ci, t = 0, lngLat, screenPt) {
+    if (isDraggingWindow || isDraggingStats || isResizing) {
+        clearHoverHighlight(true);
+        return;
+    }
     if (!screenPt && ci !== undefined && ci >= 0) {
         screenPt = getOffsetScreenPt(ci);
     }
@@ -4317,6 +4321,7 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
         el._hasStatListeners = true;
 
         function triggerStatHover(ci) {
+            if (isDraggingWindow || isDraggingStats || isResizing) return;
             if (ci !== undefined && ci >= 0 && currentRouteGeoJSON && currentRouteGeoJSON.coordinates && currentRouteGeoJSON.coordinates.length > ci) {
                 activeStatIdx = ci;
                 const coords = currentRouteGeoJSON.coordinates;
@@ -4352,6 +4357,7 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
         }
 
         function flyToStatPoint(ci) {
+            if (isDraggingWindow || isResizing) return;
             if (ci === undefined || ci < 0 || !currentRouteGeoJSON || !currentRouteGeoJSON.coordinates || currentRouteGeoJSON.coordinates.length <= ci) return;
             activeStatIdx = ci;
             isFlyToActive = true;
@@ -4575,6 +4581,7 @@ document.getElementById('gpx-download-btn').addEventListener('click', downloadGP
 
 Chart.Interaction.modes.routeHover = function (chart, e, options, useFinalPosition) {
     const items = [];
+    if (isDraggingWindow || isResizing || isDraggingStats) return items;
     const meta = chart.getDatasetMeta(0);
     if (!meta || !meta.data || !meta.data.length) return items;
 
@@ -5615,12 +5622,15 @@ let isDraggingWindow = false;
 let startX, startY, initialLeft, initialTop;
 
 let isDraggingStats = false;
+let isPotentialStatsDrag = false;
 let statsStartX, statsStartY, statsInitialLeft, statsInitialTop;
 
 elHeader.addEventListener('mousedown', (e) => {
     if (window.innerWidth <= 768) return; // Disable dragging on mobile
     if (e.target === elMinBtn) return;
     isDraggingWindow = true;
+    document.body.classList.add('is-dragging-window');
+    hideHoverMarker();
     startX = e.clientX;
     startY = e.clientY;
 
@@ -5634,27 +5644,37 @@ elHeader.addEventListener('mousedown', (e) => {
     initialTop = rect.top;
 });
 
-statsHeader?.addEventListener('mousedown', (e) => {
+statsPanel?.addEventListener('mousedown', (e) => {
     if (window.innerWidth <= 768) return; // Disable dragging on mobile
     if (e.target === closeStatsBtn || e.target.closest('#close-stats-btn')) return;
-    isDraggingStats = true;
+
+    isPotentialStatsDrag = true;
+    isDraggingStats = false;
     statsStartX = e.clientX;
     statsStartY = e.clientY;
 
     const rect = statsPanel.getBoundingClientRect();
-    statsPanel.style.position = 'absolute';
-    statsPanel.style.left = rect.left + 'px';
-    statsPanel.style.top = rect.top + 'px';
-    statsPanel.style.right = 'auto';
-    statsPanel.style.bottom = 'auto';
-
     statsInitialLeft = rect.left;
     statsInitialTop = rect.top;
-    e.preventDefault();
 });
 
 document.addEventListener('mousemove', (e) => {
+    if (isPotentialStatsDrag && !isDraggingStats) {
+        const dist = Math.hypot(e.clientX - statsStartX, e.clientY - statsStartY);
+        if (dist > 4) {
+            isDraggingStats = true;
+            document.body.classList.add('is-dragging-window');
+            hideHoverMarker();
+            statsPanel.style.position = 'absolute';
+            statsPanel.style.left = statsInitialLeft + 'px';
+            statsPanel.style.top = statsInitialTop + 'px';
+            statsPanel.style.right = 'auto';
+            statsPanel.style.bottom = 'auto';
+        }
+    }
+
     if (isDraggingWindow) {
+        hideHoverMarker();
         const dx = e.clientX - startX;
         const dy = e.clientY - startY;
         const container = document.getElementById('map').getBoundingClientRect();
@@ -5665,6 +5685,7 @@ document.addEventListener('mousemove', (e) => {
         elPanel.style.left = newLeft + 'px';
         elPanel.style.top = newTop + 'px';
     } else if (isDraggingStats) {
+        hideHoverMarker();
         const dx = e.clientX - statsStartX;
         const dy = e.clientY - statsStartY;
         const container = document.getElementById('map').getBoundingClientRect();
@@ -5678,6 +5699,8 @@ document.addEventListener('mousemove', (e) => {
 });
 
 document.addEventListener('mouseup', () => {
+    isPotentialStatsDrag = false;
+    document.body.classList.remove('is-dragging-window');
     if (isDraggingWindow) {
         isDraggingWindow = false;
         saveWindowState();
@@ -5685,6 +5708,9 @@ document.addEventListener('mouseup', () => {
     if (isDraggingStats) {
         isDraggingStats = false;
         saveStatsPosition();
+    }
+    if (isResizing) {
+        isResizing = false;
     }
 });
 
@@ -5706,6 +5732,9 @@ let resizeStartX, resizeStartY, startW, startH, startLeft, startTop;
 function initResize(e) {
     if (window.innerWidth <= 768) return; // Disable resizing on mobile
     if (elPanel.classList.contains('minimized')) return;
+    isResizing = true;
+    document.body.classList.add('is-dragging-window');
+    hideHoverMarker();
 
     const cl = e.target.classList;
     let resizer = '';
@@ -5963,40 +5992,91 @@ document.getElementById('reset-keybindings').onclick = () => {
 };
 
 function initCustomTooltips() {
-    if (window.innerWidth <= 768) return; // Disable on mobile
     const tooltip = document.createElement('div');
     tooltip.className = 'custom-tooltip';
     document.body.appendChild(tooltip);
 
     let activeEl = null;
 
-    document.addEventListener('mouseover', (e) => {
-        const el = e.target.closest('[title]');
+    function showTooltipForElement(el) {
         if (!el) return;
+        const isMobile = window.innerWidth <= 768;
+        // On mobile, hints should NOT appear on any buttons
+        if (isMobile && el.closest('button, .icon-btn, .btn, [role="button"], input, select')) {
+            return;
+        }
 
-        activeEl = el;
-        const text = el.getAttribute('title');
+        const text = el.getAttribute('title') || el.getAttribute('data-tooltip');
         if (!text) return;
 
-        el.setAttribute('data-tooltip', text);
-        el.removeAttribute('title');
+        if (el.getAttribute('title')) {
+            el.setAttribute('data-tooltip', text);
+            el.removeAttribute('title');
+        }
 
+        activeEl = el;
         tooltip.textContent = text;
         tooltip.classList.add('show');
 
         const rect = el.getBoundingClientRect();
-        tooltip.style.left = Math.max(8, Math.min(window.innerWidth - tooltip.offsetWidth - 8, rect.left + rect.width / 2 - tooltip.offsetWidth / 2)) + 'px';
-        tooltip.style.top = (rect.bottom + 8) + 'px';
-    });
+        const tooltipWidth = tooltip.offsetWidth || 200;
+        const leftPos = Math.max(8, Math.min(window.innerWidth - tooltipWidth - 8, rect.left + rect.width / 2 - tooltipWidth / 2));
+        tooltip.style.left = leftPos + 'px';
 
-    document.addEventListener('mouseout', (e) => {
-        if (activeEl && !activeEl.contains(e.relatedTarget)) {
-            tooltip.classList.remove('show');
+        if (rect.bottom + tooltip.offsetHeight + 12 > window.innerHeight && rect.top - tooltip.offsetHeight - 8 > 0) {
+            tooltip.style.top = (rect.top - tooltip.offsetHeight - 8) + 'px';
+        } else {
+            tooltip.style.top = (rect.bottom + 8) + 'px';
+        }
+    }
+
+    function hideTooltip() {
+        tooltip.classList.remove('show');
+        if (activeEl && activeEl.getAttribute('data-tooltip')) {
             activeEl.setAttribute('title', activeEl.getAttribute('data-tooltip'));
             activeEl.removeAttribute('data-tooltip');
             activeEl = null;
         }
+    }
+
+    let holdTimer = null;
+
+    // Desktop hover handling
+    document.addEventListener('mouseover', (e) => {
+        const el = e.target.closest('[title], [data-tooltip]');
+        if (!el) return;
+        showTooltipForElement(el);
     });
+
+    document.addEventListener('mouseout', (e) => {
+        if (activeEl && !activeEl.contains(e.relatedTarget)) {
+            hideTooltip();
+        }
+    });
+
+    // Touch hold-down (long-press ~300ms) handling for hints
+    document.addEventListener('touchstart', (e) => {
+        const helpEl = e.target.closest('.help-interactive, [data-tooltip], [title]');
+        if (!helpEl) return;
+
+        if (holdTimer) clearTimeout(holdTimer);
+        holdTimer = setTimeout(() => {
+            showTooltipForElement(helpEl);
+            if (navigator.vibrate) try { navigator.vibrate(20); } catch (_) { }
+        }, 300);
+    }, { passive: true });
+
+    const cancelHold = () => {
+        if (holdTimer) {
+            clearTimeout(holdTimer);
+            holdTimer = null;
+        }
+        hideTooltip();
+    };
+
+    document.addEventListener('touchend', cancelHold);
+    document.addEventListener('touchcancel', cancelHold);
+    document.addEventListener('touchmove', cancelHold, { passive: true });
 }
 initCustomTooltips();
 
