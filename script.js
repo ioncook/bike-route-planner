@@ -3957,7 +3957,12 @@ function updateStatsToggleBtn() {
 
 function toggleSettings(event) {
     if (event) event.stopPropagation();
-    document.getElementById('settings-menu').classList.toggle('show');
+    const menu = document.getElementById('settings-menu');
+    const isShowing = menu.classList.toggle('show');
+    if (isShowing) {
+        clearHoverHighlight(true);
+        hideHoverMarker();
+    }
 }
 
 function toggleStatsPanel(event) {
@@ -5879,8 +5884,13 @@ function loadWindowState() {
                 elPanel.classList.add('minimized');
                 elMinBtn.textContent = '+';
             }
+            return;
         } catch (e) { }
     }
+    elPanel.style.left = '20px';
+    elPanel.style.bottom = '20px';
+    elPanel.style.top = 'auto';
+    elPanel.style.right = 'auto';
 }
 
 function loadStatsPosition() {

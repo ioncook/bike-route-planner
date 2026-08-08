@@ -156,7 +156,7 @@ body {
     align-items: center;
     padding: 0 16px;
     gap: 12px;
-    z-index: 1000;
+    z-index: 5000000 !important;
 }
 
 .header-brand {
@@ -469,7 +469,7 @@ body {
     max-height: 80vh;
     overflow-y: auto;
     box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.5);
-    z-index: 2000000 !important;
+    z-index: 5000000 !important;
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 12px;
@@ -575,6 +575,8 @@ input:checked+.slider:before {
 /* Floating Window */
 .floating-window {
     position: absolute;
+    bottom: 20px;
+    left: 20px;
     width: 450px;
     height: 220px;
     min-width: 400px;
