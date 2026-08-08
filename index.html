@@ -282,6 +282,7 @@
                             <select id="waypoint-style-select">
                                 <option value="circle">Circles</option>
                                 <option value="pin">Pins</option>
+                                <option value="flag">Flags</option>
                             </select>
                         </div>
                         <div class="setting-row">
@@ -329,10 +330,6 @@
             <div id="map"></div>
             <!-- Stats Panel -->
             <div id="stats-panel" class="stats-panel">
-                <div class="stats-header">
-                    <span class="stats-title">Route Statistics</span>
-                    <button id="close-stats-btn" class="close-stats-btn" aria-label="Close stats">&times;</button>
-                </div>
                 <div class="stats-body">
                     <div class="stats-row">
                         <span class="stats-label">Total Distance</span>
@@ -376,7 +373,7 @@
                     </div>
                     <!-- Road Class Bar -->
                     <div id="route-types-panel"
-                        style="margin-top: 15px; border-top: 1px solid var(--border); padding-top: 12px; display: none;">
+                        style="margin-top: 8px; padding-top: 4px; display: none;">
                         <span class="stats-label" style="display: block; margin-bottom: 5px; font-weight: 500;">Road
                             Class</span>
                         <div id="road-class-bar"

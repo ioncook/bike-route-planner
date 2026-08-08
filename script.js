@@ -97,32 +97,21 @@ const map = new maplibregl.Map({
 });
 
 // Double right-click capture to reset orientation and right-click drag cursor (grabbing hand)
-let lastRightClickTime = 0;
 let isRightClickDragging = false;
 
 map.getCanvasContainer().addEventListener('mousedown', (e) => {
     if (e.button === 2) { // Right mouse button
         isRightClickDragging = true;
         document.body.classList.add('right-click-dragging');
-
-        const now = Date.now();
-        if (now - lastRightClickTime < 350) {
-            e.preventDefault();
-            e.stopPropagation();
-            map.flyTo({ bearing: 0, pitch: 0 });
-            lastRightClickTime = 0;
-            return;
-        }
-        lastRightClickTime = now;
     }
-}, true);
+});
 
 window.addEventListener('mouseup', (e) => {
     if (isRightClickDragging) {
         isRightClickDragging = false;
         document.body.classList.remove('right-click-dragging');
     }
-}, true);
+});
 
 
 // Enable native right-click tilt/rotate controls (MapLibre's built-in dragRotate is highly optimized)
@@ -923,12 +912,35 @@ const circleSvg = (color, text = '', strokeWidth = 1, height = 22) => {
 </svg>`;
 };
 
+const flagSvg = (color, text = '', isGraphIcon = false) => {
+    if (isGraphIcon) {
+        // 52x66 icon for Chart.js elevation profile. Banner width 20px (from 26 to 46), matching map banner width (20px). Center is (26, 33), matching pole base (26, 33).
+        return `<svg xmlns="http://www.w3.org/2000/svg" width="52" height="66" viewBox="0 0 52 66">
+    <line x1="26" y1="3" x2="26" y2="33" stroke="${color}" stroke-width="2.5" stroke-linecap="round" />
+    <circle cx="26" cy="3" r="1.5" fill="${color}" />
+    <path d="M26 4 H46 V19 H26 Z" fill="${color}" />
+    ${text ? `<text x="36" y="11.5" text-anchor="middle" dominant-baseline="central" fill="white" font-size="10px" font-family="Arial, sans-serif" font-weight="bold">${text}</text>` : ''}
+</svg>`;
+    }
+    // 26x34 map marker icon. Flagpole at x=4, y=3..33. Base at (4, 33). Flag banner (20px wide from x=4 to 24), no white outline.
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="26" height="34" viewBox="0 0 26 34">
+    <line x1="4" y1="3" x2="4" y2="33" stroke="${color}" stroke-width="2.5" stroke-linecap="round" />
+    <circle cx="4" cy="3" r="1.5" fill="${color}" />
+    <path d="M4 4 H24 V19 H4 Z" fill="${color}" />
+    ${text ? `<text x="14" y="11.5" text-anchor="middle" dominant-baseline="central" fill="white" font-size="10px" font-family="Arial, sans-serif" font-weight="bold">${text}</text>` : ''}
+</svg>`;
+};
+
 function createMarkerIcon(index, total) {
     const waypointStyle = localStorage.getItem('route_waypoint_style') || 'circle';
     if (waypointStyle === 'circle') {
         if (index === 0) return circleSvg('#22c55e', '', 1); // Green Start
         if (index === total - 1) return circleSvg('#ef4444', '', 1); // Red Finish
         return circleSvg('#4b5563', index, 1); // Grey Numbered Circle
+    } else if (waypointStyle === 'flag') {
+        if (index === 0) return flagSvg('#22c55e', ''); // Green Start Flag
+        if (index === total - 1) return flagSvg('#ef4444', ''); // Red Finish Flag
+        return flagSvg('#4b5563', index); // Dark Grey Numbered Flag
     } else {
         if (index === 0) return pinSvg('#22c55e'); // Green Start
         if (index === total - 1) return pinSvg('#ef4444'); // Red Finish
@@ -958,6 +970,12 @@ function getWpIconImage(index, total) {
             1, // 1px white stroke
             48 // Height of 48px offsets the 11px radius circle up by 13px (radius + 2px)
         );
+    } else if (waypointStyle === 'flag') {
+        svg = flagSvg(
+            index === 0 ? '#22c55e' : (index === total - 1 ? '#ef4444' : '#4b5563'),
+            index === 0 || index === total - 1 ? '' : index,
+            true // isGraphIcon = true
+        );
     } else {
         // Standard pin with height 72px offsets the 34px pin up by 19px (17px + 2px)
         svg = pinSvg(
@@ -980,13 +998,73 @@ hoverInfoEl.style.cssText = [
     'background:rgba(20,20,30,0.85)', 'color:#fff',
     'padding:5px 10px', 'border-radius:8px', 'font-size:0.78rem',
     'font-family:Inter,sans-serif', 'white-space:nowrap',
-    'border:1px solid rgba(255,255,255,0.12)', 'z-index:10',
+    'border:1px solid rgba(255,255,255,0.12)', 'z-index:9999',
     'backdrop-filter:blur(4px)', 'transform:translate(-50%,-140%)'
 ].join(';');
 
 // Lightweight DOM-based hover circle element to avoid WebGL state flushes
 const hoverCircleEl = document.createElement('div');
 hoverCircleEl.id = 'hover-circle-dom';
+
+let dragGuideSvgEl = null;
+let dragGuidePathEl = null;
+
+function ensureDragGuideSVGAppended() {
+    if (!dragGuideSvgEl && map) {
+        const container = (map.getCanvasContainer && map.getCanvasContainer()) || (map.getContainer && map.getContainer()) || document.getElementById('map');
+        if (container) {
+            dragGuideSvgEl = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            dragGuideSvgEl.id = 'drag-guide-svg-overlay';
+            dragGuideSvgEl.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:1;display:none;';
+
+            dragGuidePathEl = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            dragGuidePathEl.setAttribute('fill', 'none');
+            dragGuidePathEl.setAttribute('stroke', 'rgba(30, 41, 59, 0.75)');
+            dragGuidePathEl.setAttribute('stroke-width', '3');
+            dragGuidePathEl.setAttribute('stroke-linecap', 'round');
+            dragGuidePathEl.setAttribute('stroke-linejoin', 'round');
+
+            dragGuideSvgEl.appendChild(dragGuidePathEl);
+            if (container.firstChild) {
+                container.insertBefore(dragGuideSvgEl, container.firstChild);
+            } else {
+                container.appendChild(dragGuideSvgEl);
+            }
+        }
+    }
+}
+
+function updateDragGuideSVG(currentLngLat, prevWp, nextWp) {
+    ensureDragGuideSVGAppended();
+    if (!dragGuideSvgEl || !dragGuidePathEl || !map) return;
+
+    const currCoords = Array.isArray(currentLngLat) ? currentLngLat : [currentLngLat.lng, currentLngLat.lat];
+    const currPt = map.project(currCoords);
+    let d = '';
+
+    if (prevWp) {
+        const p1 = map.project(prevWp);
+        d += `M ${p1.x} ${p1.y} L ${currPt.x} ${currPt.y}`;
+    }
+    if (nextWp) {
+        const p2 = map.project(nextWp);
+        if (!d) d += `M ${currPt.x} ${currPt.y}`;
+        d += ` L ${p2.x} ${p2.y}`;
+    }
+
+    if (d) {
+        dragGuidePathEl.setAttribute('d', d);
+        dragGuideSvgEl.style.display = 'block';
+    } else {
+        dragGuideSvgEl.style.display = 'none';
+    }
+}
+
+function hideDragGuideSVG() {
+    if (dragGuideSvgEl) {
+        dragGuideSvgEl.style.display = 'none';
+    }
+}
 
 function ensureHoverElementsAppended() {
     if (!hoverInfoEl.parentNode && map) {
@@ -1469,6 +1547,14 @@ function setupRouteLayers() {
     }
 
     // Hover circle is handled via lightweight DOM elements to avoid WebGL state flushes
+    let isUpdatingRoute = false;
+    const originalQueryTerrainElevation = map.queryTerrainElevation ? map.queryTerrainElevation.bind(map) : null;
+    if (originalQueryTerrainElevation) {
+        map.queryTerrainElevation = function (...args) {
+            if (isDraggingMarker || isDraggingLine || isUpdatingRoute) return 0;
+            return originalQueryTerrainElevation(...args);
+        };
+    }
 
 
     // Re-upload route data if already computed (e.g. after a style swap)
@@ -1652,35 +1738,66 @@ function getMiteredOffsetPts(pts, currentOffset) {
 }
 
 function findClosestPointOnLine(mousePt) {
-    if (routeScreenPtsDirty) {
-        rebuildRouteScreenPts();
-        routeScreenPtsDirty = false;
-    }
-    const pts = displayScreenPts || routeScreenPts;
-    if (!currentRouteGeoJSON || !pts) return { bestCi: -1 };
-    const currentOffset = getPixelOffset(map.getZoom()) * (isRouteLeftHandDriving ? -1 : 1);
-    const offsetPts = getMiteredOffsetPts(pts, currentOffset);
+    if (!currentRouteGeoJSON) return { bestCi: -1 };
+    const coords = currentRouteGeoJSON.coordinates;
+    const dispCoords = currentDisplayCoords || coords;
+    if (!coords || coords.length === 0) return { bestCi: -1 };
+
+    const mouseLngLat = map.unproject([mousePt.x, mousePt.y]);
+    const mLng = mouseLngLat.lng;
+    const mLat = mouseLngLat.lat;
+
+    const zoom = map.getZoom();
+    const limit = zoom < 10 ? 0.05 : 0.005;
 
     let bestDistSq = Infinity;
+    let bestCost = Infinity;
     let bestCi = -1;
     let bestT = 0;
     let bestProj = { x: 0, y: 0 };
 
-    for (let i = 0; i < offsetPts.length - 1; i++) {
-        const a = offsetPts[i];
-        const b = offsetPts[i + 1];
-        if (!a || !b) continue;
-        const abx = b.x - a.x, aby = b.y - a.y;
-        const abLenSq = abx * abx + aby * aby;
-        if (abLenSq === 0) continue;
+    const currentOffset = getPixelOffset(zoom) * (isRouteLeftHandDriving ? -1 : 1);
 
-        let t = ((mousePt.x - a.x) * abx + (mousePt.y - a.y) * aby) / abLenSq;
+    for (let i = 0; i < dispCoords.length - 1; i++) {
+        const a = dispCoords[i];
+        const b = dispCoords[i + 1];
+        if (!a || !b) continue;
+
+        const minLng = Math.min(a[0], b[0]) - limit;
+        const maxLng = Math.max(a[0], b[0]) + limit;
+        const minLat = Math.min(a[1], b[1]) - limit;
+        const maxLat = Math.max(a[1], b[1]) + limit;
+        if (mLng < minLng || mLng > maxLng || mLat < minLat || mLat > maxLat) continue;
+
+        const screenA = map.project(a);
+        const screenB = map.project(b);
+        if (!screenA || !screenB) continue;
+
+        const abx = screenB.x - screenA.x, aby = screenB.y - screenA.y;
+        const len = Math.sqrt(abx * abx + aby * aby);
+        if (len === 0) continue;
+
+        const nx = -aby / len, ny = abx / len;
+        const aOffset = { x: screenA.x + nx * currentOffset, y: screenA.y + ny * currentOffset };
+        const bOffset = { x: screenB.x + nx * currentOffset, y: screenB.y + ny * currentOffset };
+
+        const segX = bOffset.x - aOffset.x, segY = bOffset.y - aOffset.y;
+        const segLenSq = segX * segX + segY * segY;
+        if (segLenSq === 0) continue;
+
+        let t = ((mousePt.x - aOffset.x) * segX + (mousePt.y - aOffset.y) * segY) / segLenSq;
         t = Math.max(0, Math.min(1, t));
 
-        const pProjX = a.x + t * abx, pProjY = a.y + t * aby;
+        const pProjX = aOffset.x + t * segX, pProjY = aOffset.y + t * segY;
         const dx = pProjX - mousePt.x, dy = pProjY - mousePt.y;
         const dSq = dx * dx + dy * dy;
-        if (dSq < bestDistSq) {
+
+        const rawI = (displayIndexToRawIndex && displayIndexToRawIndex[i] !== undefined) ? displayIndexToRawIndex[i] : i;
+        const indexDiff = (bestCiGlobal !== -1) ? Math.abs(rawI - bestCiGlobal) : 0;
+        const cost = dSq + indexDiff * 1e-6;
+
+        if (cost < bestCost) {
+            bestCost = cost;
             bestDistSq = dSq;
             bestCi = i;
             bestT = t;
@@ -1689,15 +1806,17 @@ function findClosestPointOnLine(mousePt) {
     }
 
     let rawCi = bestCi;
-    if (displayScreenPts && displayIndexToRawIndex && bestCi !== -1) {
+    if (displayIndexToRawIndex && bestCi !== -1) {
         rawCi = displayIndexToRawIndex[bestCi] ?? bestCi;
     }
     return { bestCi: rawCi, bestT, bestDistSq, bestProj };
 }
 
+let isHoveringMarker = false;
+
 map.on('mousemove', 'route-line', (e) => {
     if (window.innerWidth <= 768) return; // Disable hover interaction on mobile
-    if (isDraggingLine || isDraggingMarker) {
+    if (isDraggingLine || isDraggingMarker || isHoveringMarker) {
         clearHoverHighlight();
         return;
     }
@@ -1705,58 +1824,25 @@ map.on('mousemove', 'route-line', (e) => {
         clearHoverHighlight();
         return;
     }
-    if (routeScreenPtsDirty) {
-        rebuildRouteScreenPts();
-        routeScreenPtsDirty = false;
-    }
     const now = performance.now();
     if (now - lastHoverTime < 16) return; // 60fps throttle
     lastHoverTime = now;
 
-    const pts = displayScreenPts || routeScreenPts;
-    if (!currentRouteGeoJSON || !pts) return;
-    const coords = currentRouteGeoJSON.coordinates;
-    const mousePt = e.point;
-    const highlightThreshold = 225; // 15px radius squared for the visual widening
+    const { bestCi, bestT, bestDistSq, bestProj } = findClosestPointOnLine(e.point);
 
-    // Get current line-offset for projection
-    const currentOffset = (getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1) + 1) * (isRouteLeftHandDriving ? -1 : 1);
-    const offsetPts = getMiteredOffsetPts(pts, currentOffset);
-
-    let bestDistSq = Infinity;
-    let bestCi = -1;
-    let bestT = 0;
-    let bestProj = { x: 0, y: 0 };
-    for (let i = 0; i < offsetPts.length - 1; i++) {
-        const a = offsetPts[i];
-        const b = offsetPts[i + 1];
-        if (!a || !b) continue; // Skip off-screen segments
-        const abx = b.x - a.x, aby = b.y - a.y;
-        const abLenSq = abx * abx + aby * aby;
-        if (abLenSq === 0) continue;
-
-        let t = ((mousePt.x - a.x) * abx + (mousePt.y - a.y) * aby) / abLenSq;
-        t = Math.max(0, Math.min(1, t));
-
-        const pProjX = a.x + t * abx;
-        const pProjY = a.y + t * aby;
-        const dx = pProjX - mousePt.x;
-        const dy = pProjY - mousePt.y;
-        const dSq = dx * dx + dy * dy;
-
-        if (dSq < bestDistSq) {
-            bestDistSq = dSq;
-            bestCi = i;
-            bestT = t;
-            bestProj = { x: pProjX, y: pProjY };
+    if (bestCi !== -1) {
+        bestCiGlobal = bestCi;
+        const ptA = getOffsetScreenPt(bestCi);
+        const ptB = getOffsetScreenPt(Math.min(bestCi + 1, currentRouteGeoJSON.coordinates.length - 1));
+        let smoothScreenPt = ptA;
+        if (ptA && ptB) {
+            smoothScreenPt = {
+                x: ptA.x + bestT * (ptB.x - ptA.x),
+                y: ptA.y + bestT * (ptB.y - ptA.y)
+            };
         }
-    }
-
-    if (bestCi !== -1 && bestDistSq < highlightThreshold) {
-        const rawCi = displayIndexToRawIndex[bestCi] ?? bestCi;
-        bestCiGlobal = rawCi;
-        const shiftedLngLat = map.unproject([bestProj.x, bestProj.y]);
-        updateHoverHighlight(rawCi, bestT, [shiftedLngLat.lng, shiftedLngLat.lat], bestProj);
+        const projectedLngLat = map.unproject([bestProj.x, bestProj.y]);
+        updateHoverHighlight(bestCi, bestT, [projectedLngLat.lng, projectedLngLat.lat], smoothScreenPt);
     } else {
         clearHoverHighlight();
     }
@@ -1952,6 +2038,9 @@ function createMarker(lngLat, index, initialMode) {
     if (waypointStyle === 'circle') {
         el.style.width = '22px';
         el.style.height = '22px';
+    } else if (waypointStyle === 'flag') {
+        el.style.width = '26px';
+        el.style.height = '34px';
     } else {
         el.style.width = '24px';
         el.style.height = '34px';
@@ -1964,40 +2053,59 @@ function createMarker(lngLat, index, initialMode) {
         .setLngLat(lngLat)
         .addTo(map);
 
+    function deleteMarker(m) {
+        isHoveringMarker = false;
+        const idx = markers.indexOf(m);
+        if (idx > -1) {
+            saveHistory();
+            markers.splice(idx, 1);
+            waypoints.splice(idx, 1);
+            if (idx > 0) {
+                segmentModes.splice(idx - 1, 1);
+                segmentGPXPaths.splice(idx - 1, 1);
+            } else {
+                segmentModes.splice(0, 1);
+                segmentGPXPaths.splice(0, 1);
+            }
+            m.remove();
+            updateRoute();
+        }
+    }
+
     const onRightClick = (evt) => {
         if (evt.button === 2) { // Right click
             evt.preventDefault();
             evt.stopPropagation();
-            const idx = markers.indexOf(marker);
-            if (idx > -1) {
-                saveHistory();
-                markers.splice(idx, 1);
-                waypoints.splice(idx, 1);
-                if (idx > 0) {
-                    segmentModes.splice(idx - 1, 1);
-                    segmentGPXPaths.splice(idx - 1, 1);
-                } else {
-                    segmentModes.splice(0, 1);
-                    segmentGPXPaths.splice(0, 1);
-                }
-                marker.remove();
-                updateRoute();
-            }
+            showWeatherPopup(marker.getLngLat());
         }
     };
     marker.getElement().addEventListener('mousedown', (evt) => {
-        if (evt.button !== 0) {
-            if (evt.button === 2) {
-                onRightClick(evt);
-            }
+        if (evt.button === 2) {
+            onRightClick(evt);
             evt.preventDefault();
             evt.stopPropagation();
         }
-    }, true);
+    });
     marker.getElement().addEventListener('auxclick', onRightClick);
     marker.getElement().addEventListener('contextmenu', (e) => {
         e.preventDefault();
         e.stopPropagation();
+    });
+
+    marker.getElement().addEventListener('mouseenter', () => {
+        isHoveringMarker = true;
+        clearHoverHighlight();
+    });
+    marker.getElement().addEventListener('mouseleave', () => {
+        isHoveringMarker = false;
+    });
+
+    let markerWasDragged = false;
+    marker.getElement().addEventListener('click', (evt) => {
+        evt.stopPropagation();
+        if (!markerWasDragged) {
+            deleteMarker(marker);
+        }
     });
 
     // Mobile Long-Press Deletion
@@ -2022,8 +2130,14 @@ function createMarker(lngLat, index, initialMode) {
         }
     }, { passive: true });
 
+    let cachedPrevWpPt = null;
+    let cachedNextWpPt = null;
+    let dragGuideRaf = null;
+
     marker.on('dragstart', () => {
+        markerWasDragged = true;
         isDraggingMarker = true;
+        isHoveringMarker = false;
         window._currentlyDraggingMarker = marker;
         const idx = markers.indexOf(marker);
         if (idx > -1 && waypoints[idx]) {
@@ -2032,23 +2146,53 @@ function createMarker(lngLat, index, initialMode) {
             window._currentlyDraggingMarkerOriginalLngLat = marker.getLngLat();
         }
         window._currentlyDraggingMarkerCancel = false;
-        console.log('[Antigravity] Marker dragstart. idx:', idx, 'Original location set to:', window._currentlyDraggingMarkerOriginalLngLat);
+
+        cachedPrevWpPt = null;
+        cachedNextWpPt = null;
+
         hideHoverMarker();
-        saveHistory();
+        clearHoverHighlight();
     });
 
     marker.on('drag', () => {
-        const idx = markers.indexOf(marker);
-        if (idx === -1) return;
-        const ll = marker.getLngLat();
-        const guideCoords = [];
-        if (idx > 0) guideCoords.push(waypoints[idx - 1]);
-        guideCoords.push([ll.lng, ll.lat]);
-        if (idx < waypoints.length - 1) guideCoords.push(waypoints[idx + 1]);
-        map.getSource('drag-guide')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: guideCoords } });
+        if (!dragGuideRaf) {
+            dragGuideRaf = requestAnimationFrame(() => {
+                dragGuideRaf = null;
+                if (!isDraggingMarker || !marker) return;
+
+                const idx = markers.indexOf(marker);
+                if (idx === -1) return;
+
+                if (!cachedPrevWpPt && idx > 0 && waypoints[idx - 1]) {
+                    cachedPrevWpPt = map.project(waypoints[idx - 1]);
+                }
+                if (!cachedNextWpPt && idx < waypoints.length - 1 && waypoints[idx + 1]) {
+                    cachedNextWpPt = map.project(waypoints[idx + 1]);
+                }
+
+                const currPt = map.project(marker.getLngLat());
+                let d = '';
+                if (cachedPrevWpPt) {
+                    d += `M ${cachedPrevWpPt.x} ${cachedPrevWpPt.y} L ${currPt.x} ${currPt.y}`;
+                }
+                if (cachedNextWpPt) {
+                    if (!d) d += `M ${currPt.x} ${currPt.y}`;
+                    d += ` L ${cachedNextWpPt.x} ${cachedNextWpPt.y}`;
+                }
+                if (d && dragGuidePathEl && dragGuideSvgEl) {
+                    dragGuidePathEl.setAttribute('d', d);
+                    dragGuideSvgEl.style.display = 'block';
+                }
+            });
+        }
     });
 
     marker.on('dragend', () => {
+        if (dragGuideRaf) { cancelAnimationFrame(dragGuideRaf); dragGuideRaf = null; }
+        cachedPrevWpPt = null;
+        cachedNextWpPt = null;
+        hideDragGuideSVG();
+        setTimeout(() => { markerWasDragged = false; }, 100);
         console.log('[Antigravity] Marker dragend. window._currentlyDraggingMarkerCancel =', window._currentlyDraggingMarkerCancel);
         if (window._currentlyDraggingMarkerCancel) {
             console.log('[Antigravity] Marker dragend cancelled, aborting save.');
@@ -2057,8 +2201,8 @@ function createMarker(lngLat, index, initialMode) {
         isDraggingMarker = false;
         window._currentlyDraggingMarker = null;
         window._currentlyDraggingMarkerOriginalLngLat = null;
-        map.getSource('drag-guide')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [] } });
         hideHoverMarker();
+        saveHistory();
         const idx = markers.indexOf(marker);
         if (idx > -1) {
             invalidateGPXSegment(idx);
@@ -2106,6 +2250,11 @@ function refreshMarkerIcons() {
             el.style.height = '22px';
             el.innerHTML = createMarkerIcon(i, markers.length);
             m.setOffset([0, 0]);
+        } else if (waypointStyle === 'flag') {
+            el.style.width = '26px';
+            el.style.height = '34px';
+            el.innerHTML = createMarkerIcon(i, markers.length);
+            m.setOffset([9, -16]);
         } else {
             el.style.width = '24px';
             el.style.height = '34px';
@@ -2121,6 +2270,11 @@ function refreshMarkerIcons() {
             el.style.height = '22px';
             el.innerHTML = circleSvg('#4b5563', '', 1, 22); // Grey circle, 1px white stroke
             window._dragPreviewMarker.setOffset([0, 0]);
+        } else if (waypointStyle === 'flag') {
+            el.style.width = '26px';
+            el.style.height = '34px';
+            el.innerHTML = flagSvg('#4b5563', '');
+            window._dragPreviewMarker.setOffset([9, -16]);
         } else {
             el.style.width = '24px';
             el.style.height = '34px';
@@ -2271,9 +2425,7 @@ function onLineDown(e) {
 
     const onMove = (moveEvent) => {
         const lngLat = moveEvent.lngLat;
-        const guideCoords = [prevWp, [lngLat.lng, lngLat.lat]];
-        if (nextWp) guideCoords.push(nextWp);
-        map.getSource('drag-guide')?.setData({ type: 'LineString', coordinates: guideCoords });
+        updateDragGuideSVG(lngLat, prevWp, nextWp);
         const pm = window._dragPreviewMarker;
         if (pm) {
             pm.setLngLat(lngLat);
@@ -2290,7 +2442,7 @@ function onLineDown(e) {
         map.off('mouseup', onUp);
         map.off('touchend', onUp);
 
-        map.getSource('drag-guide')?.setData({ type: 'LineString', coordinates: [] });
+        hideDragGuideSVG();
         hideHoverMarker();
         const pm = window._dragPreviewMarker;
         if (pm && pm._added) { pm.remove(); pm._added = false; }
@@ -2315,7 +2467,7 @@ function onLineDown(e) {
         map.off('mouseup', onUp);
         map.off('touchend', onUp);
 
-        map.getSource('drag-guide')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [] } });
+        hideDragGuideSVG();
         hideHoverMarker();
         const pm = window._dragPreviewMarker;
         if (pm && pm._added) { pm.remove(); pm._added = false; }
@@ -2466,22 +2618,67 @@ function showWeatherPopup(lngLat) {
 }
 
 let currentInfoPopup = null;
+let rightClickStartX = 0;
+let rightClickStartY = 0;
+let pendingRightClickTimer = null;
+let lastRightClickTimestamp = 0;
+const weatherPrefetchCache = new Map();
+
+function prefetchWeatherPopupData(lngLat) {
+    const { lat, lng } = lngLat;
+    const units = currentUnits === 'imperial' ? 'fahrenheit' : 'celsius';
+    const windUnits = currentUnits === 'imperial' ? 'mph' : 'kmh';
+    const key = `${lat.toFixed(4)},${lng.toFixed(4)}`;
+
+    if (!weatherPrefetchCache.has(key)) {
+        const fetchPromise = fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,wind_speed_10m,weather_code,wind_direction_10m&temperature_unit=${units}&wind_speed_unit=${windUnits}`)
+            .then(r => r.json())
+            .catch(err => null);
+        weatherPrefetchCache.set(key, fetchPromise);
+    }
+    getHighResElevation([[lng, lat]]).catch(() => { });
+}
+
 map.getCanvasContainer().addEventListener('mousedown', (e) => {
-    if (e.button === 1) { // Middle mouse button
-        middleClickStartX = e.clientX;
-        middleClickStartY = e.clientY;
-        e.preventDefault(); // Prevent auto-scroll
+    if (e.button === 2) { // Right mouse button
+        rightClickStartX = e.clientX;
+        rightClickStartY = e.clientY;
     }
 });
 map.on('mouseup', (e) => {
-    if (e.originalEvent.button !== 1) return;
-    // Only show popup if cursor barely moved (i.e. it was a click, not a pan)
-    const dx = e.originalEvent.clientX - middleClickStartX;
-    const dy = e.originalEvent.clientY - middleClickStartY;
-    if (Math.hypot(dx, dy) < 8) showWeatherPopup(e.lngLat);
+    if (e.originalEvent.button !== 2) return;
+    // Only show popup if cursor barely moved (i.e. it was a click, not a right-drag pan/rotate)
+    const dx = e.originalEvent.clientX - rightClickStartX;
+    const dy = e.originalEvent.clientY - rightClickStartY;
+    if (Math.hypot(dx, dy) >= 8) return;
+
+    const now = performance.now();
+    if (now - lastRightClickTimestamp < 350) {
+        // Double right-click: reset orientation and cancel popup
+        if (pendingRightClickTimer) {
+            clearTimeout(pendingRightClickTimer);
+            pendingRightClickTimer = null;
+        }
+        lastRightClickTimestamp = 0;
+        map.flyTo({ bearing: 0, pitch: 0 });
+        return;
+    }
+    lastRightClickTimestamp = now;
+
+    if (pendingRightClickTimer) {
+        clearTimeout(pendingRightClickTimer);
+    }
+
+    const targetLngLat = e.lngLat;
+    prefetchWeatherPopupData(targetLngLat);
+
+    pendingRightClickTimer = setTimeout(() => {
+        pendingRightClickTimer = null;
+        showWeatherPopup(targetLngLat);
+    }, 300);
 });
 
-// Prevent browser context menu on right-click so rotate works cleanly
+// Prevent browser context menu on right-click so rotate & popup work cleanly
 map.getCanvasContainer().addEventListener('contextmenu', (e) => e.preventDefault());
 
 // Long Press Handler for Mobile
@@ -2979,7 +3176,7 @@ function saveHistory() {
     undoStack.push({
         waypoints: waypoints.map(w => [...w]),
         modes: [...segmentModes],
-        gpxPaths: segmentGPXPaths.map(p => p ? p.map(c => [...c]) : null)
+        gpxPaths: segmentGPXPaths.map(p => p ? [...p] : null)
     });
     redoStack.length = 0; // clear redo on new action
     updateUndoRedoBtns();
@@ -3774,7 +3971,7 @@ function toggleStatsPanel(event) {
 }
 
 document.getElementById('total-distance').addEventListener('click', toggleStatsPanel);
-document.getElementById('close-stats-btn').addEventListener('click', (e) => {
+document.getElementById('close-stats-btn')?.addEventListener('click', (e) => {
     e.stopPropagation();
     document.getElementById('stats-panel').classList.remove('show');
     localStorage.setItem('stats_panel_visible', 'false');
@@ -4169,7 +4366,7 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
                         curve: 1.4,
                         essential: true
                     });
-                    if (navigator.vibrate) try { navigator.vibrate(35); } catch (_) {}
+                    if (navigator.vibrate) try { navigator.vibrate(35); } catch (_) { }
                 }
             }, 350);
         }, { passive: true });
@@ -4473,7 +4670,7 @@ function initChart() {
                 data: [],
                 grades: [],
                 borderColor: 'rgba(100,120,160,0.8)',
-                backgroundColor: 'rgba(100,120,160,0.15)',
+                backgroundColor: document.body.classList.contains('light-mode') ? 'rgba(100,120,160,0.45)' : 'rgba(100,120,160,0.15)',
                 borderWidth: 4,
                 fill: 'start',
                 pointRadius: 0,
@@ -4642,8 +4839,9 @@ function initChart() {
                     return grad;
                 };
 
+                const isLight = document.body.classList.contains('light-mode');
                 ds.borderColor = buildGrad(0.95);
-                ds.backgroundColor = buildGrad(0.18);
+                ds.backgroundColor = buildGrad(isLight ? 0.45 : 0.18);
             }
         }]
     });
@@ -5150,8 +5348,10 @@ async function updateElevationProfile() {
 
         elevationChart.data.datasets[0].data = chartData;
         elevationChart.data.datasets[0].grades = smoothedGrades;
+        const isLight = document.body.classList.contains('light-mode');
+        const fillAlpha = isLight ? 0.45 : 0.15;
         elevationChart.data.datasets[0].borderColor = isHighPerformance ? '#2563eb' : borderColors;
-        elevationChart.data.datasets[0].backgroundColor = isHighPerformance ? 'rgba(37, 99, 235, 0.15)' : 'rgba(100, 120, 160, 0.15)';
+        elevationChart.data.datasets[0].backgroundColor = isHighPerformance ? `rgba(37, 99, 235, ${fillAlpha})` : `rgba(100, 120, 160, ${fillAlpha})`;
 
         if (elevationChart.data.datasets[1]) {
             elevationChart.data.datasets[1].data = wpData;
@@ -5381,7 +5581,7 @@ const elHeader = document.getElementById('elevation-header');
 const elMinBtn = document.getElementById('elevation-min-btn');
 
 const statsPanel = document.getElementById('stats-panel');
-const statsHeader = statsPanel.querySelector('.stats-header');
+const statsHeader = statsPanel?.querySelector('.stats-header') || statsPanel;
 const closeStatsBtn = document.getElementById('close-stats-btn');
 
 let isDraggingWindow = false;
@@ -5407,7 +5607,7 @@ elHeader.addEventListener('mousedown', (e) => {
     initialTop = rect.top;
 });
 
-statsHeader.addEventListener('mousedown', (e) => {
+statsHeader?.addEventListener('mousedown', (e) => {
     if (window.innerWidth <= 768) return; // Disable dragging on mobile
     if (e.target === closeStatsBtn || e.target.closest('#close-stats-btn')) return;
     isDraggingStats = true;
