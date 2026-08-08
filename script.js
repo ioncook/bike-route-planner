@@ -4343,6 +4343,55 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
             e.preventDefault();
         });
 
+        function getTerrainExaggeration() {
+            if (!map || !map.getTerrain()) return 1.0;
+            const exInput = document.getElementById('terrain-exaggeration');
+            const stored = localStorage.getItem('route_exaggeration');
+            const val = parseFloat(stored || (exInput ? exInput.value : '2.0'));
+            return (isNaN(val) || val < 0) ? 1.0 : val;
+        }
+
+        function flyToStatPoint(ci) {
+            if (ci === undefined || ci < 0 || !currentRouteGeoJSON || !currentRouteGeoJSON.coordinates || currentRouteGeoJSON.coordinates.length <= ci) return;
+            activeStatIdx = ci;
+            isFlyToActive = true;
+            const lngLat = currentRouteGeoJSON.coordinates[ci];
+
+            let elev = 0;
+            if (map && typeof map.queryTerrainElevation === 'function') {
+                const tElev = map.queryTerrainElevation(lngLat);
+                if (tElev !== null && tElev !== undefined && !isNaN(tElev)) {
+                    elev = tElev;
+                }
+            }
+            if (!elev && elevationChart && elevationChart.data && elevationChart.data.datasets && elevationChart.data.datasets[0]) {
+                const chartPts = elevationChart.data.datasets[0].data;
+                if (chartPts && chartPts[ci] && typeof chartPts[ci].y === 'number') {
+                    elev = chartPts[ci].y;
+                }
+            }
+            if (!elev && Array.isArray(lngLat) && lngLat.length >= 3 && typeof lngLat[2] === 'number') {
+                elev = lngLat[2];
+            }
+
+            const exaggeration = getTerrainExaggeration();
+            const effectiveElev = (elev && !isNaN(elev)) ? Math.max(0, elev * exaggeration) : 0;
+
+            // Base desired zoom at sea level is 16 (ref camera height ~350m).
+            // Compensate target zoom for local exaggerated terrain height so camera maintains ~350m clearance above ground:
+            const baseZoom = 16;
+            const zoomCorrection = Math.log2(1 + (effectiveElev / 350));
+            const targetZoom = Math.max(10, Math.min(16, baseZoom - zoomCorrection));
+
+            map.flyTo({
+                center: [lngLat[0], lngLat[1]],
+                zoom: targetZoom,
+                speed: 1.2,
+                curve: 1.4,
+                essential: true
+            });
+        }
+
         // Mobile touch & long-press handling
         let touchTimer = null;
         let isLongPress = false;
@@ -4355,19 +4404,8 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
             touchTimer = setTimeout(() => {
                 isLongPress = true;
                 const ci = getIdx();
-                if (ci !== undefined && ci >= 0 && currentRouteGeoJSON && currentRouteGeoJSON.coordinates.length > ci) {
-                    activeStatIdx = ci;
-                    isFlyToActive = true;
-                    const lngLat = currentRouteGeoJSON.coordinates[ci];
-                    map.flyTo({
-                        center: lngLat,
-                        zoom: Math.max(map.getZoom(), 16),
-                        speed: 1.2,
-                        curve: 1.4,
-                        essential: true
-                    });
-                    if (navigator.vibrate) try { navigator.vibrate(35); } catch (_) { }
-                }
+                flyToStatPoint(ci);
+                if (navigator.vibrate) try { navigator.vibrate(35); } catch (_) { }
             }, 350);
         }, { passive: true });
 
@@ -4390,18 +4428,7 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
             const isMobileTouch = 'ontouchstart' in window && window.innerWidth <= 768;
             if (!isMobileTouch && !isLongPress) {
                 const ci = getIdx();
-                if (ci !== undefined && ci >= 0 && currentRouteGeoJSON && currentRouteGeoJSON.coordinates.length > ci) {
-                    activeStatIdx = ci;
-                    isFlyToActive = true;
-                    const lngLat = currentRouteGeoJSON.coordinates[ci];
-                    map.flyTo({
-                        center: lngLat,
-                        zoom: Math.max(map.getZoom(), 16),
-                        speed: 1.2,
-                        curve: 1.4,
-                        essential: true
-                    });
-                }
+                flyToStatPoint(ci);
             }
         });
     });
