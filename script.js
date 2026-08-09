@@ -2457,7 +2457,7 @@ map.on('touchstart', (e) => {
     if (isDraggingLine || isDraggingMarker || window._currentlyDraggingMarker) return;
     if (e.originalEvent && (e.originalEvent.target?.closest('.maplibregl-marker') || e.originalEvent.target?.closest('.custom-marker'))) return;
     const { bestCi, bestDistSq } = findClosestPointOnLine(e.point);
-    if (bestCi !== -1 && bestDistSq <= 100 * 100) {
+    if (bestCi !== -1 && bestDistSq <= 25 * 25) {
         onLineDown(e);
     }
 });
@@ -2470,7 +2470,7 @@ function onLineDown(e) {
 
     // Ensure we have a valid snapping point, especially for mobile touchstart
     const { bestCi, bestT, bestDistSq, bestProj } = findClosestPointOnLine(e.point);
-    const highlightThreshold = 100 * 100; // More generous for touch
+    const highlightThreshold = 25 * 25; // Strict touch radius (25px)
     if (bestCi === -1 || bestDistSq > highlightThreshold) return;
 
     // Sync global state for the up/move handlers
