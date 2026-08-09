@@ -2452,10 +2452,19 @@ map.on('touchstart', 'route-line', (e) => {
     // Do NOT call preventDefault() here — it breaks MapLibre's pinch-zoom origin tracking
     onLineDown(e);
 });
+map.on('touchstart', (e) => {
+    if (e.points && e.points.length > 1) return;
+    if (isDraggingLine || isDraggingMarker || window._currentlyDraggingMarker) return;
+    if (e.originalEvent && (e.originalEvent.target?.closest('.maplibregl-marker') || e.originalEvent.target?.closest('.custom-marker'))) return;
+    const { bestCi, bestDistSq } = findClosestPointOnLine(e.point);
+    if (bestCi !== -1 && bestDistSq <= 100 * 100) {
+        onLineDown(e);
+    }
+});
 
 function onLineDown(e) {
     if (e.type === 'mousedown' && e.originalEvent.button !== 0) return;
-    if (isDraggingMarker || isHoveringMarker || window._currentlyDraggingMarker || window._isMarkerTouch) return;
+    if (isDraggingMarker || (window.innerWidth > 768 && isHoveringMarker) || window._currentlyDraggingMarker || window._isMarkerTouch) return;
     if (e.originalEvent && (e.originalEvent.target?.closest('.maplibregl-marker') || e.originalEvent.target?.closest('.custom-marker'))) return;
     e.originalEvent?.stopPropagation();
 
