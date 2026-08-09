@@ -900,7 +900,7 @@ const pinSvg = (color, text = '', strokeWidth = 1, height = 34) => {
         ? `M12 0C5.37 0 0 5.37 0 12c0 9 12 20 12 20s12-11 12-20c0-6.63-5.37-12-12-12z`
         : `M12 0C5.37 0 0 5.37 0 12c0 9 12 20 12 20s12-11 12-20c0-6.63-5.37-12-12-12zm0 18c-3.31 0-6-2.69-6-6s2.69-6 6-6 6 2.69 6 6-2.69 6-6 6z`;
     return `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="${height}" viewBox="-1 -1 26 ${height + 1}">
-    <path d="${path}" fill="${color}" fill-rule="evenodd" stroke="black" stroke-opacity="0.6" stroke-width="${strokeWidth}" />
+    <path d="${path}" fill="${color}" fill-rule="evenodd" stroke="white" stroke-width="${strokeWidth}" stroke-linejoin="round" />
     <text x="12" y="12.5" text-anchor="middle" dominant-baseline="central" fill="white" font-size="13px" font-family="Arial, sans-serif" font-weight="bold">${text}</text>
 </svg>`;
 };
@@ -914,37 +914,115 @@ const circleSvg = (color, text = '', strokeWidth = 1, height = 22) => {
 
 const flagSvg = (color, text = '', isGraphIcon = false) => {
     if (isGraphIcon) {
-        // 52x66 icon for Chart.js elevation profile. Banner width 20px (from 26 to 46), matching map banner width (20px). Center is (26, 33), matching pole base (26, 33).
-        return `<svg xmlns="http://www.w3.org/2000/svg" width="52" height="66" viewBox="0 0 52 66">
-    <line x1="26" y1="3" x2="26" y2="33" stroke="${color}" stroke-width="2.5" stroke-linecap="round" />
-    <circle cx="26" cy="3" r="1.5" fill="${color}" />
-    <path d="M26 4 H46 V19 H26 Z" fill="${color}" />
+        return `<svg xmlns="http://www.w3.org/2000/svg" width="52" height="66" viewBox="0 0 50 66">
+    <line x1="26" y1="2" x2="26" y2="33" stroke="white" stroke-width="4" stroke-linecap="round" />
+    <line x1="26" y1="2" x2="26" y2="33" stroke="${color}" stroke-width="2" stroke-linecap="round" />
+    <circle cx="26" cy="2" r="1.5" fill="${color}" stroke="white" stroke-width="1" />
+    <path d="M26 4 H46 V19 H26 Z" fill="${color}" stroke="white" stroke-width="1" stroke-linejoin="round" />
     ${text ? `<text x="36" y="11.5" text-anchor="middle" dominant-baseline="central" fill="white" font-size="10px" font-family="Arial, sans-serif" font-weight="bold">${text}</text>` : ''}
 </svg>`;
     }
-    // 26x34 map marker icon. Flagpole at x=4, y=3..33. Base at (4, 33). Flag banner (20px wide from x=4 to 24), no white outline.
-    return `<svg xmlns="http://www.w3.org/2000/svg" width="26" height="34" viewBox="0 0 26 34">
-    <line x1="4" y1="3" x2="4" y2="33" stroke="${color}" stroke-width="2.5" stroke-linecap="round" />
-    <circle cx="4" cy="3" r="1.5" fill="${color}" />
-    <path d="M4 4 H24 V19 H4 Z" fill="${color}" />
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="28" height="36" viewBox="-1 -1 28 36">
+    <line x1="4" y1="2" x2="4" y2="33" stroke="white" stroke-width="4" stroke-linecap="round" />
+    <line x1="4" y1="2" x2="4" y2="33" stroke="${color}" stroke-width="2" stroke-linecap="round" />
+    <circle cx="4" cy="2" r="1.5" fill="${color}" stroke="white" stroke-width="1" />
+    <path d="M4 4 H24 V19 H4 Z" fill="${color}" stroke="white" stroke-width="1" stroke-linejoin="round" />
     ${text ? `<text x="14" y="11.5" text-anchor="middle" dominant-baseline="central" fill="white" font-size="10px" font-family="Arial, sans-serif" font-weight="bold">${text}</text>` : ''}
 </svg>`;
 };
+
+function getDirectDistanceMeters(coord1, coord2) {
+    if (!coord1 || !coord2) return 0;
+    const R = 6371000;
+    const dLat = (coord2[1] - coord1[1]) * Math.PI / 180;
+    const dLng = (coord2[0] - coord1[0]) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+              Math.cos(coord1[1] * Math.PI / 180) * Math.cos(coord2[1] * Math.PI / 180) *
+              Math.sin(dLng / 2) * Math.sin(dLng / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+}
+
+function showLongSegmentDialog(miles, km) {
+    return new Promise((resolve) => {
+        const modal = document.getElementById('long-segment-modal');
+        const msg = document.getElementById('long-segment-msg');
+        const btnCancel = document.getElementById('long-segment-cancel');
+        const btnConfirm = document.getElementById('long-segment-confirm');
+
+        if (!modal || !btnCancel || !btnConfirm) {
+            return resolve(true);
+        }
+
+        if (msg) {
+            msg.textContent = `This segment is ~${miles} miles (~${km} km) and may be too long to load correctly. Continue?`;
+        }
+
+        modal.style.display = 'flex';
+
+        const cleanup = (result) => {
+            modal.style.display = 'none';
+            btnCancel.onclick = null;
+            btnConfirm.onclick = null;
+            window.removeEventListener('keydown', onKeyDown);
+            resolve(result);
+        };
+
+        const onKeyDown = (e) => {
+            if (e.key === 'Escape') cleanup(false);
+            if (e.key === 'Enter') cleanup(true);
+        };
+
+        btnCancel.onclick = () => cleanup(false);
+        btnConfirm.onclick = () => cleanup(true);
+        window.addEventListener('keydown', onKeyDown);
+    });
+}
+
+async function checkLongSegmentWarning(idx) {
+    if (waypoints.length < 2) return true;
+
+    const LIMIT_METERS = 250 * 1609.344; // 250 miles = 402,336m
+    let maxSegmentMeters = 0;
+
+    if (idx > 0 && waypoints[idx - 1] && waypoints[idx]) {
+        const d = getDirectDistanceMeters(waypoints[idx - 1], waypoints[idx]);
+        if (d > maxSegmentMeters) maxSegmentMeters = d;
+    }
+    if (idx < waypoints.length - 1 && waypoints[idx] && waypoints[idx + 1]) {
+        const d = getDirectDistanceMeters(waypoints[idx], waypoints[idx + 1]);
+        if (d > maxSegmentMeters) maxSegmentMeters = d;
+    }
+
+    if (maxSegmentMeters <= LIMIT_METERS) {
+        return true;
+    }
+
+    const miles = Math.round(maxSegmentMeters / 1609.344);
+    const km = Math.round(maxSegmentMeters / 1000);
+
+    const approved = await showLongSegmentDialog(miles, km);
+    if (!approved) {
+        undo();
+        return false;
+    }
+    return true;
+}
 
 function createMarkerIcon(index, total) {
     const waypointStyle = localStorage.getItem('route_waypoint_style') || 'circle';
     if (waypointStyle === 'circle') {
         if (index === 0) return circleSvg('#22c55e', '', 1); // Green Start
         if (index === total - 1) return circleSvg('#ef4444', '', 1); // Red Finish
-        return circleSvg('#4b5563', index, 1); // Grey Numbered Circle
+        return circleSvg('#1f2937', index, 1); // Dark Grey Numbered Circle
     } else if (waypointStyle === 'flag') {
         if (index === 0) return flagSvg('#22c55e', ''); // Green Start Flag
         if (index === total - 1) return flagSvg('#ef4444', ''); // Red Finish Flag
-        return flagSvg('#4b5563', index); // Dark Grey Numbered Flag
+        return flagSvg('#1f2937', index); // Dark Grey Numbered Flag
     } else {
         if (index === 0) return pinSvg('#22c55e'); // Green Start
         if (index === total - 1) return pinSvg('#ef4444'); // Red Finish
-        return pinSvg('#4b5563', index); // Dark Grey Numbered Pin
+        return pinSvg('#1f2937', index); // Dark Grey Numbered Pin
     }
 }
 
@@ -957,29 +1035,34 @@ function clearWpIconsCache() {
 const wpIcons = {}; // Cache for Chart.js waypoint icons
 
 function getWpIconImage(index, total) {
-    const key = `${index}-${total}`;
-    if (wpIcons[key] && !wpIcons[key].complete === false) return wpIcons[key];
-    const img = new Image();
-
     const waypointStyle = localStorage.getItem('route_waypoint_style') || 'circle';
+    const key = `${index}-${total}-${waypointStyle}`;
+    if (wpIcons[key] && wpIcons[key].complete) return wpIcons[key];
+
+    const img = new Image();
+    img.onload = () => {
+        if (elevationChart) {
+            elevationChart.update('none');
+        }
+    };
     let svg;
     if (waypointStyle === 'circle') {
         svg = circleSvg(
-            index === 0 ? '#22c55e' : (index === total - 1 ? '#ef4444' : '#4b5563'),
+            index === 0 ? '#22c55e' : (index === total - 1 ? '#ef4444' : '#1f2937'),
             index === 0 || index === total - 1 ? '' : index,
             1, // 1px white stroke
             48 // Height of 48px offsets the 11px radius circle up by 13px (radius + 2px)
         );
     } else if (waypointStyle === 'flag') {
         svg = flagSvg(
-            index === 0 ? '#22c55e' : (index === total - 1 ? '#ef4444' : '#4b5563'),
+            index === 0 ? '#22c55e' : (index === total - 1 ? '#ef4444' : '#1f2937'),
             index === 0 || index === total - 1 ? '' : index,
             true // isGraphIcon = true
         );
     } else {
         // Standard pin with height 72px offsets the 34px pin up by 19px (17px + 2px)
         svg = pinSvg(
-            index === 0 ? '#22c55e' : (index === total - 1 ? '#ef4444' : '#4b5563'),
+            index === 0 ? '#22c55e' : (index === total - 1 ? '#ef4444' : '#1f2937'),
             index === 0 || index === total - 1 ? '' : index,
             1,
             72
@@ -1019,8 +1102,8 @@ function ensureDragGuideSVGAppended() {
 
             dragGuidePathEl = document.createElementNS('http://www.w3.org/2000/svg', 'path');
             dragGuidePathEl.setAttribute('fill', 'none');
-            dragGuidePathEl.setAttribute('stroke', 'rgba(30, 41, 59, 0.75)');
-            dragGuidePathEl.setAttribute('stroke-width', '3');
+            dragGuidePathEl.setAttribute('stroke', 'rgba(148, 163, 184, 0.65)');
+            dragGuidePathEl.setAttribute('stroke-width', '2.5');
             dragGuidePathEl.setAttribute('stroke-linecap', 'round');
             dragGuidePathEl.setAttribute('stroke-linejoin', 'round');
 
@@ -1445,7 +1528,7 @@ function setupRouteLayers() {
             layout: { 'line-join': 'miter', 'line-cap': 'butt' },
             paint: {
                 'line-color': ['get', 'color'],
-                'line-width': 10,
+                'line-width': 8,
                 'line-opacity': 1.0
             },
             filter: ['==', ['get', 'idx'], -1] // Initially hide
@@ -1461,7 +1544,7 @@ function setupRouteLayers() {
             source: 'hover-segment',
             layout: { 'line-join': 'miter', 'line-cap': 'round' },
             paint: {
-                'line-width': 10,
+                'line-width': 8,
                 'line-opacity': 1.0,
                 'line-offset': ['interpolate', ['linear'], ['zoom'], 8, 0, 12, 2, 15, 4, 18, 6, 24, 6]
             }
@@ -1832,17 +1915,8 @@ map.on('mousemove', 'route-line', (e) => {
 
     if (bestCi !== -1) {
         bestCiGlobal = bestCi;
-        const ptA = getOffsetScreenPt(bestCi);
-        const ptB = getOffsetScreenPt(Math.min(bestCi + 1, currentRouteGeoJSON.coordinates.length - 1));
-        let smoothScreenPt = ptA;
-        if (ptA && ptB) {
-            smoothScreenPt = {
-                x: ptA.x + bestT * (ptB.x - ptA.x),
-                y: ptA.y + bestT * (ptB.y - ptA.y)
-            };
-        }
         const projectedLngLat = map.unproject([bestProj.x, bestProj.y]);
-        updateHoverHighlight(bestCi, bestT, [projectedLngLat.lng, projectedLngLat.lat], smoothScreenPt);
+        updateHoverHighlight(bestCi, bestT, [projectedLngLat.lng, projectedLngLat.lat], bestProj);
     } else {
         clearHoverHighlight();
     }
@@ -2142,6 +2216,10 @@ function createMarker(lngLat, index, initialMode) {
         markerWasDragged = true;
         isDraggingMarker = true;
         isHoveringMarker = false;
+        if (isDraggingLine) {
+            isDraggingLine = false;
+            hideDragGuideSVG();
+        }
         window._currentlyDraggingMarker = marker;
         const idx = markers.indexOf(marker);
         if (idx > -1 && waypoints[idx]) {
@@ -2167,26 +2245,9 @@ function createMarker(lngLat, index, initialMode) {
                 const idx = markers.indexOf(marker);
                 if (idx === -1) return;
 
-                if (!cachedPrevWpPt && idx > 0 && waypoints[idx - 1]) {
-                    cachedPrevWpPt = map.project(waypoints[idx - 1]);
-                }
-                if (!cachedNextWpPt && idx < waypoints.length - 1 && waypoints[idx + 1]) {
-                    cachedNextWpPt = map.project(waypoints[idx + 1]);
-                }
-
-                const currPt = map.project(marker.getLngLat());
-                let d = '';
-                if (cachedPrevWpPt) {
-                    d += `M ${cachedPrevWpPt.x} ${cachedPrevWpPt.y} L ${currPt.x} ${currPt.y}`;
-                }
-                if (cachedNextWpPt) {
-                    if (!d) d += `M ${currPt.x} ${currPt.y}`;
-                    d += ` L ${cachedNextWpPt.x} ${cachedNextWpPt.y}`;
-                }
-                if (d && dragGuidePathEl && dragGuideSvgEl) {
-                    dragGuidePathEl.setAttribute('d', d);
-                    dragGuideSvgEl.style.display = 'block';
-                }
+                const prevWp = idx > 0 ? waypoints[idx - 1] : null;
+                const nextWp = idx < waypoints.length - 1 ? waypoints[idx + 1] : null;
+                updateDragGuideSVG(marker.getLngLat(), prevWp, nextWp);
             });
         }
     });
@@ -2196,7 +2257,8 @@ function createMarker(lngLat, index, initialMode) {
         cachedPrevWpPt = null;
         cachedNextWpPt = null;
         hideDragGuideSVG();
-        setTimeout(() => { markerWasDragged = false; }, 100);
+        window._wasDraggingMarker = true;
+        setTimeout(() => { markerWasDragged = false; window._wasDraggingMarker = false; }, 200);
         console.log('[Antigravity] Marker dragend. window._currentlyDraggingMarkerCancel =', window._currentlyDraggingMarkerCancel);
         if (window._currentlyDraggingMarkerCancel) {
             console.log('[Antigravity] Marker dragend cancelled, aborting save.');
@@ -2213,6 +2275,7 @@ function createMarker(lngLat, index, initialMode) {
             const ll = marker.getLngLat();
             waypoints[idx] = [ll.lng, ll.lat];
             updateRoute();
+            checkLongSegmentWarning(idx);
         }
     });
 
@@ -2392,6 +2455,8 @@ map.on('touchstart', 'route-line', (e) => {
 
 function onLineDown(e) {
     if (e.type === 'mousedown' && e.originalEvent.button !== 0) return;
+    if (isDraggingMarker || isHoveringMarker || window._currentlyDraggingMarker || window._isMarkerTouch) return;
+    if (e.originalEvent && (e.originalEvent.target?.closest('.maplibregl-marker') || e.originalEvent.target?.closest('.custom-marker'))) return;
     e.originalEvent?.stopPropagation();
 
     // Ensure we have a valid snapping point, especially for mobile touchstart
@@ -2406,7 +2471,7 @@ function onLineDown(e) {
     for (const wp of waypoints) {
         const wpPt = map.project(wp);
         const dist = Math.hypot(wpPt.x - clickPt.x, wpPt.y - clickPt.y);
-        if (dist < 25) return;
+        if (dist < 35) return;
     }
 
     saveHistory();
@@ -2453,6 +2518,7 @@ function onLineDown(e) {
 
         createMarker(upEvent.lngLat, insertIdx);
         updateRoute();
+        checkLongSegmentWarning(insertIdx);
         setTimeout(() => wasDraggingLine = false, 50);
         window._activeLineDragCleanup = null;
     };
@@ -2484,7 +2550,7 @@ function onLineDown(e) {
 
 map.on('click', (e) => {
     if (e.originalEvent.button !== 0) return; // Left click only
-    if (wasDraggingLine) return;
+    if (wasDraggingLine || window._wasDraggingMarker || isDraggingMarker) return;
 
     // Check if the click is on or too close to an existing waypoint
     const clickedPoint = e.point;
@@ -2513,6 +2579,7 @@ map.on('click', (e) => {
     saveHistory();
     createMarker(e.lngLat);
     updateRoute();
+    checkLongSegmentWarning(waypoints.length - 1);
 });
 
 function getWeatherIcon(code) {
@@ -2643,14 +2710,34 @@ function prefetchWeatherPopupData(lngLat) {
     getHighResElevation([[lng, lat]]).catch(() => { });
 }
 
+let hasRightClickDragged = false;
+
 map.getCanvasContainer().addEventListener('mousedown', (e) => {
     if (e.button === 2) { // Right mouse button
         rightClickStartX = e.clientX;
         rightClickStartY = e.clientY;
+        hasRightClickDragged = false;
     }
 });
+
+map.getCanvasContainer().addEventListener('mousemove', (e) => {
+    if (rightClickStartX !== null && rightClickStartY !== null) {
+        const dx = e.clientX - rightClickStartX;
+        const dy = e.clientY - rightClickStartY;
+        if (Math.hypot(dx, dy) >= 5) {
+            hasRightClickDragged = true;
+        }
+    }
+});
+
 map.on('mouseup', (e) => {
     if (e.originalEvent.button !== 2) return;
+    if (hasRightClickDragged) {
+        rightClickStartX = null;
+        rightClickStartY = null;
+        hasRightClickDragged = false;
+        return;
+    }
     // Only show popup if cursor barely moved (i.e. it was a click, not a right-drag pan/rotate)
     const dx = e.originalEvent.clientX - rightClickStartX;
     const dy = e.originalEvent.clientY - rightClickStartY;
@@ -2740,6 +2827,34 @@ window.addEventListener('keydown', (e) => {
         currentInfoPopup.remove();
     }
 });
+
+// Forward wheel events over floating windows and popups directly to MapLibre canvas so scroll-to-zoom works everywhere
+window.addEventListener('wheel', (e) => {
+    if (!map) return;
+    const overlayTarget = e.target.closest('#top-bar, .settings-content, .floating-window, #stats-panel, .stats-panel, #hover-stats, .maplibregl-popup, .mapboxgl-popup, .weather-popup, #context-menu');
+    if (overlayTarget) {
+        const scrollable = e.target.closest('#search-results, .settings-body, .stats-body');
+        if (scrollable && scrollable.scrollHeight > scrollable.clientHeight) {
+            const isAtTop = scrollable.scrollTop <= 0 && e.deltaY < 0;
+            const isAtBottom = scrollable.scrollTop + scrollable.clientHeight >= scrollable.scrollHeight - 1 && e.deltaY > 0;
+            if (!isAtTop && !isAtBottom) return;
+        }
+
+        const canvas = map.getCanvas();
+        if (canvas) {
+            canvas.dispatchEvent(new WheelEvent('wheel', {
+                clientX: e.clientX,
+                clientY: e.clientY,
+                deltaX: e.deltaX,
+                deltaY: e.deltaY,
+                deltaZ: e.deltaZ,
+                deltaMode: e.deltaMode,
+                bubbles: true,
+                cancelable: true
+            }));
+        }
+    }
+}, { passive: true });
 
 // Disable default browser context menu
 document.getElementById('map').addEventListener('contextmenu', (e) => e.preventDefault());
@@ -3708,13 +3823,21 @@ window.addEventListener('keydown', (e) => {
     }
 }, true);
 
+function updateWaypointIconsOnChart() {
+    if (!elevationChart || !elevationChart.data?.datasets?.[1] || waypoints.length === 0) return;
+    const wpStyles = [];
+    for (let i = 0; i < waypoints.length; i++) {
+        wpStyles.push(getWpIconImage(i, waypoints.length));
+    }
+    elevationChart.data.datasets[1].pointStyle = wpStyles;
+    elevationChart.update('none');
+}
+
 document.getElementById('waypoint-style-select')?.addEventListener('change', (e) => {
     localStorage.setItem('route_waypoint_style', e.target.value);
     refreshMarkerIcons();
     clearWpIconsCache();
-    if (elevationChart) {
-        elevationChart.update();
-    }
+    updateWaypointIconsOnChart();
 });
 
 document.getElementById('show-distance-markers-check')?.addEventListener('change', (e) => {
@@ -4715,13 +4838,15 @@ function initChart() {
                 pointRadius: 0,
                 pointHoverRadius: 0,
                 tension: 0.1,
-                spanGaps: true
+                spanGaps: true,
+                order: 2
             }, {
                 label: 'Waypoints',
                 data: [],
                 type: 'scatter',
                 pointRadius: 10,
-                pointHoverRadius: 12
+                pointHoverRadius: 12,
+                order: 1
             }]
         },
         options: {
@@ -4826,7 +4951,7 @@ function initChart() {
         },
         plugins: [{
             id: 'hoverLine',
-            afterDraw: (chart) => {
+            beforeDatasetsDraw: (chart) => {
                 if (currentHoverDispDist !== null && chart.scales.x) {
                     const x = chart.scales.x.getPixelForValue(currentHoverDispDist);
                     const area = chart.chartArea;
