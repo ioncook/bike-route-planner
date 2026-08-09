@@ -40,21 +40,42 @@ initialCover.style.inset = '0';
 initialCover.style.backgroundColor = '#111';
 initialCover.style.zIndex = '10000000';
 initialCover.style.transition = 'opacity 0.5s ease-in-out';
-initialCover.style.pointerEvents = 'none';
+initialCover.style.pointerEvents = 'auto';
 
 initialCover.innerHTML = `
-    <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; gap:18px; color:#94a3b8; font-family:'Inter', sans-serif;">
+    <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; gap:16px; color:#94a3b8; font-family:'Inter', sans-serif;">
         <svg class="initial-spinner" width="44" height="44" viewBox="0 0 16 16" fill="none">
             <circle cx="8" cy="8" r="7" stroke="#1e293b" stroke-width="2"/>
             <path d="M8 1a7 7 0 0 1 7 7" stroke="#34d399" stroke-width="2" stroke-linecap="round"/>
         </svg>
         <div id="initial-loading-text" style="font-size: 0.9rem; font-weight: 500; letter-spacing: 0.02em;">Loading route...</div>
+        <button id="initial-clear-route-btn" style="margin-top: 4px; padding: 7px 15px; background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 8px; font-size: 0.85rem; font-weight: 500; cursor: pointer; transition: all 0.2s ease; display: flex; align-items: center; gap: 6px;" onmouseover="this.style.background='rgba(239,68,68,0.25)'" onmouseout="this.style.background='rgba(239,68,68,0.15)'">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="3 6 5 6 21 6"></polyline>
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+            </svg>
+            Clear Route & Reload
+        </button>
     </div>
     <style>
         @keyframes spin { 100% { transform: rotate(360deg); } }
         .initial-spinner { animation: spin 0.8s linear infinite; }
     </style>
 `;
+
+document.addEventListener('click', (e) => {
+    const btn = e.target.closest('#initial-clear-route-btn');
+    if (btn) {
+        e.preventDefault();
+        e.stopPropagation();
+        try {
+            localStorage.removeItem('route_waypoints');
+            localStorage.removeItem('route_segment_modes');
+            localStorage.removeItem('route_gpx_paths');
+        } catch (_) { }
+        window.location.href = window.location.origin + window.location.pathname;
+    }
+}, true);
 
 // Wait for DOM content to be ready
 document.addEventListener('DOMContentLoaded', () => {
@@ -2076,9 +2097,19 @@ function clearHoverHighlight(force) {
 }
 
 map.on('mouseleave', clearHoverHighlight);
-map.on('movestart', () => clearHoverHighlight(false));
-map.on('touchstart', () => {
-    clearHoverHighlight();
+map.on('movestart', () => {
+    if (!isFlyToActive) {
+        activeStatIdx = -1;
+        clearHoverHighlight(false);
+    }
+});
+map.on('touchstart', (e) => {
+    isFlyToActive = false;
+    activeStatIdx = -1;
+    if (!e.originalEvent?.target?.closest('.maplibregl-marker') && !e.originalEvent?.target?.closest('.custom-marker')) {
+        window._isMarkerTouch = false;
+    }
+    clearHoverHighlight(true);
     document.activeElement?.blur();
 });
 map.on('mousedown', () => {
@@ -2837,18 +2868,12 @@ window.addEventListener('keydown', (e) => {
     }
 });
 
-// Forward wheel events over floating windows and popups directly to MapLibre canvas so scroll-to-zoom works everywhere
+// Forward wheel events over right-click weather popups directly to MapLibre canvas so scroll-to-zoom works there,
+// while blocking map zoom when scrolling over settings, elevation profile, or graph windows.
 window.addEventListener('wheel', (e) => {
     if (!map) return;
-    const overlayTarget = e.target.closest('#top-bar, .settings-content, .floating-window, #stats-panel, .stats-panel, #hover-stats, .maplibregl-popup, .mapboxgl-popup, .weather-popup, #context-menu');
-    if (overlayTarget) {
-        const scrollable = e.target.closest('#search-results, .settings-body, .stats-body');
-        if (scrollable && scrollable.scrollHeight > scrollable.clientHeight) {
-            const isAtTop = scrollable.scrollTop <= 0 && e.deltaY < 0;
-            const isAtBottom = scrollable.scrollTop + scrollable.clientHeight >= scrollable.scrollHeight - 1 && e.deltaY > 0;
-            if (!isAtTop && !isAtBottom) return;
-        }
-
+    const weatherPopup = e.target.closest('.weather-popup, .maplibregl-popup, .mapboxgl-popup');
+    if (weatherPopup) {
         const canvas = map.getCanvas();
         if (canvas) {
             canvas.dispatchEvent(new WheelEvent('wheel', {
@@ -2862,8 +2887,14 @@ window.addEventListener('wheel', (e) => {
                 cancelable: true
             }));
         }
+        return;
     }
-}, { passive: true });
+
+    const blockedUI = e.target.closest('#top-bar, .settings-content, .floating-window, #elevation-panel, #stats-panel, .stats-panel, #right-panel, #context-menu');
+    if (blockedUI) {
+        e.stopPropagation();
+    }
+}, { capture: true });
 
 // Disable default browser context menu
 document.getElementById('map').addEventListener('contextmenu', (e) => e.preventDefault());
@@ -4976,7 +5007,7 @@ function initChart() {
                     ctx.strokeStyle = document.body.classList.contains('light-mode')
                         ? 'rgba(0, 0, 0, 0.45)'
                         : 'rgba(255, 255, 255, 0.6)';
-                    ctx.setLineDash([5, 5]);
+                    ctx.setLineDash([]);
                     ctx.stroke();
                     ctx.restore();
                 }
@@ -5032,6 +5063,8 @@ function initChart() {
     };
 
     const handleHoverMove = (clientX) => {
+        isFlyToActive = false;
+        activeStatIdx = -1;
         if (!elevationChart || !currentRouteGeoJSON?.coordinates) return;
         const chart = elevationChart;
         const rect = ctx.canvas.getBoundingClientRect();
@@ -6142,11 +6175,19 @@ function initCustomTooltips() {
 
     let activeEl = null;
 
+    // On mobile, strip native title attributes so native OS system tooltips never pop up on tap
+    if (window.innerWidth <= 768) {
+        document.querySelectorAll('[title]').forEach(el => {
+            el.setAttribute('data-tooltip', el.getAttribute('title'));
+            el.removeAttribute('title');
+        });
+    }
+
     function showTooltipForElement(el) {
         if (!el) return;
         const isMobile = window.innerWidth <= 768;
-        // On mobile, hints should NOT appear on any buttons
-        if (isMobile && el.closest('button, .icon-btn, .btn, [role="button"], input, select')) {
+        // On mobile, tooltips are allowed for .help-interactive elements (e.g. Speed, Simple Mode)
+        if (isMobile && !el.closest('.help-interactive')) {
             return;
         }
 
@@ -6167,7 +6208,7 @@ function initCustomTooltips() {
         const leftPos = Math.max(8, Math.min(window.innerWidth - tooltipWidth - 8, rect.left + rect.width / 2 - tooltipWidth / 2));
         tooltip.style.left = leftPos + 'px';
 
-        if (rect.bottom + tooltip.offsetHeight + 12 > window.innerHeight && rect.top - tooltip.offsetHeight - 8 > 0) {
+        if (rect.top - tooltip.offsetHeight - 8 > 0) {
             tooltip.style.top = (rect.top - tooltip.offsetHeight - 8) + 'px';
         } else {
             tooltip.style.top = (rect.bottom + 8) + 'px';
@@ -6198,16 +6239,12 @@ function initCustomTooltips() {
         }
     });
 
-    // Touch hold-down (long-press ~300ms) handling for hints
+    // Touch tap / hold handling for .help-interactive hints on mobile
     document.addEventListener('touchstart', (e) => {
-        const helpEl = e.target.closest('.help-interactive, [data-tooltip], [title]');
+        const helpEl = e.target.closest('.help-interactive');
         if (!helpEl) return;
-
-        if (holdTimer) clearTimeout(holdTimer);
-        holdTimer = setTimeout(() => {
-            showTooltipForElement(helpEl);
-            if (navigator.vibrate) try { navigator.vibrate(20); } catch (_) { }
-        }, 300);
+        showTooltipForElement(helpEl);
+        if (navigator.vibrate) try { navigator.vibrate(20); } catch (_) { }
     }, { passive: true });
 
     const cancelHold = () => {
