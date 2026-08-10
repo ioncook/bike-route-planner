@@ -409,14 +409,6 @@ function miterInsideCorners(coords) {
         displayIndexToRawIndex = coords.map((_, i) => i);
         return coords;
     }
-    // On 3D terrain mode, return raw coordinates to prevent 3D elevation raycast distortion on zoom or page load
-    const is3DTerrain = (map && map.getTerrain && map.getTerrain()) ||
-        (document.getElementById('hillshade-select')?.value === 'terrain');
-    if (is3DTerrain) {
-        rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
-        displayIndexToRawIndex = coords.map((_, i) => i);
-        return coords;
-    }
     const pxOffset = (getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1) + 1) * (isRouteLeftHandDriving ? -1 : 1);
     if (pxOffset < 1) { // No visible offset at low zooms
         rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
@@ -446,35 +438,31 @@ function miterInsideCorners(coords) {
             continue;
         }
 
-        // Subdivide sharp left turns (d <= -120°) into two smooth sub-bends around p2.
-        // This keeps each sub-bend under 120°, allowing MapLibre WebGL to render native, seamless joins without gaps or staples!
-        if (d <= -120) {
-            const sc = map.project(p2);
-            const s1 = map.project(p1);
-            const s3 = map.project(p3);
+        // Subdivide sharp turns (|d| >= 120° and <= 170°) into two smooth sub-bends around p2.
+        // This keeps each sub-bend under 120°, allowing MapLibre WebGL to render native, seamless joins without gaps at all zoom levels!
+        if (Math.abs(d) >= 120 && Math.abs(d) <= 170) {
+            const d1 = haversineDistance(p1, p2);
+            const d2 = haversineDistance(p2, p3);
+            const shift1 = Math.min(3, d1 * 0.2);
+            const shift2 = Math.min(3, d2 * 0.2);
 
-            const ivX = sc.x - s1.x, ivY = sc.y - s1.y;
-            const iLen = Math.sqrt(ivX * ivX + ivY * ivY);
-            const ovX = s3.x - sc.x, ovY = s3.y - sc.y;
-            const oLen = Math.sqrt(ovX * ovX + ovY * ovY);
+            const r1 = d1 > 0 ? shift1 / d1 : 0;
+            const r2 = d2 > 0 ? shift2 / d2 : 0;
 
-            if (iLen >= 2 && oLen >= 2) {
-                const shiftR = Math.min(4, iLen * 0.25, oLen * 0.25);
-                const idX = ivX / iLen, idY = ivY / iLen;
-                const odX = ovX / oLen, odY = ovY / oLen;
+            const mPt1 = [
+                p2[0] - r1 * (p2[0] - p1[0]),
+                p2[1] - r1 * (p2[1] - p1[1])
+            ];
+            const mPt2 = [
+                p2[0] + r2 * (p3[0] - p2[0]),
+                p2[1] + r2 * (p3[1] - p2[1])
+            ];
 
-                const c1 = { x: sc.x - shiftR * idX, y: sc.y - shiftR * idY };
-                const c2 = { x: sc.x + shiftR * odX, y: sc.y + shiftR * odY };
-
-                const mPt1 = map.unproject([c1.x, c1.y]);
-                const mPt2 = map.unproject([c2.x, c2.y]);
-
-                result.push([mPt1.lng, mPt1.lat]);
-                result.push([mPt2.lng, mPt2.lat]);
-                mapping.push([currentLen, currentLen + 1]);
-                toRaw.push(i, i);
-                continue;
-            }
+            result.push(mPt1);
+            result.push(mPt2);
+            mapping.push([currentLen, currentLen + 1]);
+            toRaw.push(i, i);
+            continue;
         }
 
         // Only fix right turns > 30° — these are inside corners for positive offset.
@@ -485,75 +473,77 @@ function miterInsideCorners(coords) {
             continue;
         }
 
-        const sc = map.project(p2);
-        const s1 = map.project(p1);
-        const s3 = map.project(p3);
+        const latRad = p2[1] * Math.PI / 180;
+        const cosLat = Math.cos(latRad);
+        const metersPerPx = 78271.51696 * cosLat / Math.pow(2, map.getZoom());
+        const distMeters = Math.min(20, Math.abs(pxOffset) * metersPerPx);
 
-        const ivX = sc.x - s1.x, ivY = sc.y - s1.y;
-        const iLen = Math.sqrt(ivX * ivX + ivY * ivY);
-        if (iLen < 1) {
+        // Convert p1, p2, p3 to local Mercator meters relative to p2
+        const dx1 = (p1[0] - p2[0]) * 111319.5 * cosLat;
+        const dy1 = (p1[1] - p2[1]) * 111319.5;
+        const len1 = Math.sqrt(dx1 * dx1 + dy1 * dy1);
+
+        const dx3 = (p3[0] - p2[0]) * 111319.5 * cosLat;
+        const dy3 = (p3[1] - p2[1]) * 111319.5;
+        const len3 = Math.sqrt(dx3 * dx3 + dy3 * dy3);
+
+        if (len1 < 0.1 || len3 < 0.1) {
             result.push(p2);
             mapping.push([currentLen, currentLen]);
             toRaw.push(i);
             continue;
         }
-        const idX = ivX / iLen, idY = ivY / iLen;
 
-        const ovX = s3.x - sc.x, ovY = s3.y - sc.y;
-        const oLen = Math.sqrt(ovX * ovX + ovY * ovY);
-        if (oLen < 1) {
-            result.push(p2);
-            mapping.push([currentLen, currentLen]);
-            toRaw.push(i);
-            continue;
-        }
-        const odX = ovX / oLen, odY = ovY / oLen;
+        const idX = -dx1 / len1, idY = -dy1 / len1;
+        const odX = dx3 / len3, odY = dy3 / len3;
 
-        // Right-hand normals for incoming and outgoing directions
-        const niX = -idY, niY = idX;
-        const noX = -odY, noY = odX;
+        // Right-hand normals
+        const mult = pxOffset < 0 ? -1 : 1;
+        const niX = -idY * mult, niY = idX * mult;
+        const noX = -odY * mult, noY = odX * mult;
 
-        // The two offset line anchor points (at the corner vertex, shifted to the right)
-        const ax = sc.x + niX * pxOffset, ay = sc.y + niY * pxOffset;
-        const bx = sc.x + noX * pxOffset, by = sc.y + noY * pxOffset;
+        // Offset line anchors
+        const ax = niX * distMeters, ay = niY * distMeters;
+        const bx = noX * distMeters, by = noY * distMeters;
 
-        // Intersect: line through (ax,ay) dir (idX,idY) vs line through (bx,by) dir (odX,odY)
         const cross = idX * odY - idY * odX;
-        if (Math.abs(cross) < 1e-10) {
+        if (Math.abs(cross) < 1e-6) {
             result.push(p2);
             mapping.push([currentLen, currentLen]);
             toRaw.push(i);
             continue;
         }
+
         const t = ((bx - ax) * odY - (by - ay) * odX) / cross;
         const s = ((bx - ax) * idY - (by - ay) * idX) / cross;
 
-        // The maximum distance we are willing to shift the vertex along the incoming/outgoing segments
-        // to avoid shifting it past the midpoint of the segment.
-        const maxShiftI = iLen * 0.45;
-        const maxShiftO = oLen * 0.45;
+        const maxShift1 = len1 * 0.4;
+        const maxShift2 = len3 * 0.4;
 
-        // Clamp t to be within [-maxShiftI, 0]
         let clampedT = t;
         if (clampedT > 0) clampedT = 0;
-        if (clampedT < -maxShiftI) clampedT = -maxShiftI;
+        if (clampedT < -maxShift1) clampedT = -maxShift1;
 
-        // Clamp s to be within [0, maxShiftO]
         let clampedS = s;
         if (clampedS < 0) clampedS = 0;
-        if (clampedS > maxShiftO) clampedS = maxShiftO;
+        if (clampedS > maxShift2) clampedS = maxShift2;
 
-        // Split the corner vertex into two bevel points C1 and C2
-        const cx1 = sc.x + clampedT * idX;
-        const cy1 = sc.y + clampedT * idY;
-        const cx2 = sc.x + clampedS * odX;
-        const cy2 = sc.y + clampedS * odY;
+        const mx1 = clampedT * idX;
+        const my1 = clampedT * idY;
+        const mx2 = clampedS * odX;
+        const my2 = clampedS * odY;
 
-        const mPt1 = map.unproject([cx1, cy1]);
-        const mPt2 = map.unproject([cx2, cy2]);
+        const mPt1 = [
+            p2[0] + mx1 / (111319.5 * cosLat),
+            p2[1] + my1 / 111319.5
+        ];
+        const mPt2 = [
+            p2[0] + mx2 / (111319.5 * cosLat),
+            p2[1] + my2 / 111319.5
+        ];
 
-        result.push([mPt1.lng, mPt1.lat]);
-        result.push([mPt2.lng, mPt2.lat]);
+        result.push(mPt1);
+        result.push(mPt2);
         mapping.push([currentLen, currentLen + 1]);
         toRaw.push(i, i);
     }
@@ -742,15 +732,10 @@ function offsetLatLng(lngLat, offsetMeters, bearingDegrees) {
 function updateTurnaroundJoins() {
     if (!currentRouteGeoJSON || !map.getSource('turnarounds')) return;
 
-    const coords = currentRouteGeoJSON.coordinates;
+    const coords = currentDisplayCoords || currentRouteGeoJSON.coordinates;
     const zoom = map.getZoom();
     const mult = isRouteLeftHandDriving ? -1 : 1;
     const pxOffset = getPixelOffset(zoom) * mult;
-
-    if (Math.abs(pxOffset) < 0.5) {
-        map.getSource('turnarounds').setData({ type: 'FeatureCollection', features: [] });
-        return;
-    }
 
     const turns = [];
     for (let i = 1; i < coords.length - 1; i++) {
@@ -796,16 +781,18 @@ function updateTurnaroundJoins() {
             turnColor = surfaceColors[st] || '#4b5563';
         }
 
+        const effectiveOffset = Math.max(1.5, Math.abs(pxOffset));
+
         if (isHovered) {
             // Bolded turnaround: shift inward dynamically to match outer corners and bridge angle
             const wVal = 10.0;
-            const distOffset = (Math.abs(pxOffset) + wVal / 2) * metersPerPixel;
+            const distOffset = Math.min(30, (effectiveOffset + wVal / 2) * metersPerPixel);
 
             // Scale the shift inward based on the turn's deviation from a perfect 180 degrees.
             // A perfect 180 needs 0 shift (no overshoot), a 160 degree turn needs full shift (no gap).
             const deviation = 180 - Math.abs(d); // 0 to 20
             const shiftFactor = Math.min(1.0, deviation / 20.0);
-            const shiftOffset = (wVal / 2) * shiftFactor * metersPerPixel;
+            const shiftOffset = Math.min(15, (wVal / 2) * shiftFactor * metersPerPixel);
 
             const c1 = offsetLatLng(coords[i], distOffset, bIn + 90 * mult);
             const p1 = offsetLatLng(c1, shiftOffset, bIn + 180); // shift backward along incoming road
@@ -826,7 +813,7 @@ function updateTurnaroundJoins() {
             });
         } else {
             // Untouched normal unhighlighted turnaround: straight perpendicular
-            const distOffset = (Math.abs(pxOffset) + 2.5) * metersPerPixel;
+            const distOffset = Math.min(25, (effectiveOffset + 2.5) * metersPerPixel);
             const p1 = offsetLatLng(coords[i], distOffset, bIn + 90 * mult);
             const p2 = offsetLatLng(coords[i], distOffset, bIn - 90 * mult);
 
@@ -958,8 +945,8 @@ function getDirectDistanceMeters(coord1, coord2) {
     const dLat = (coord2[1] - coord1[1]) * Math.PI / 180;
     const dLng = (coord2[0] - coord1[0]) * Math.PI / 180;
     const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-              Math.cos(coord1[1] * Math.PI / 180) * Math.cos(coord2[1] * Math.PI / 180) *
-              Math.sin(dLng / 2) * Math.sin(dLng / 2);
+        Math.cos(coord1[1] * Math.PI / 180) * Math.cos(coord2[1] * Math.PI / 180) *
+        Math.sin(dLng / 2) * Math.sin(dLng / 2);
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     return R * c;
 }
@@ -1948,16 +1935,18 @@ function getOffsetScreenPt(ci) {
     const coords = currentRouteGeoJSON.coordinates;
     if (ci >= coords.length) return null;
 
+    const displayCoords = currentDisplayCoords || coords;
     let pIdx = ci;
     if (typeof rawIndexToDisplayRange !== 'undefined' && rawIndexToDisplayRange[ci]) {
         pIdx = rawIndexToDisplayRange[ci][0] ?? ci;
     }
+    pIdx = Math.min(pIdx, displayCoords.length - 1);
 
-    const p2 = map.project(coords[pIdx]);
+    const p2 = map.project(displayCoords[pIdx]);
     if (!p2) return null;
 
-    const p1 = (pIdx > 0) ? map.project(coords[pIdx - 1]) : null;
-    const p3 = (pIdx < coords.length - 1) ? map.project(coords[pIdx + 1]) : null;
+    const p1 = (pIdx > 0) ? map.project(displayCoords[pIdx - 1]) : null;
+    const p3 = (pIdx < displayCoords.length - 1) ? map.project(displayCoords[pIdx + 1]) : null;
 
     const pxOffset = (getPixelOffset(map.getZoom()) + 1) * (isRouteLeftHandDriving ? -1 : 1);
     if (Math.abs(pxOffset) < 0.5) {
@@ -2043,7 +2032,7 @@ function updateHoverHighlight(ci, t = 0, lngLat, screenPt) {
     if (waypointPathIndices.length >= 2) {
         let segIdx = -1;
         for (let j = 0; j < waypointPathIndices.length - 1; j++) {
-            if (ci >= waypointPathIndices[j] && ci < waypointPathIndices[j + 1]) {
+            if (ci >= waypointPathIndices[j] && ci <= waypointPathIndices[j + 1]) {
                 segIdx = j; break;
             }
         }
@@ -3490,18 +3479,50 @@ function getFitBoundsPadding() {
     return padding;
 }
 
+function fitBoundsSmart(bounds, extraOptions = {}) {
+    if (!map || !bounds) return;
+    const is3D = (map && map.getTerrain && map.getTerrain()) ||
+        (document.getElementById('hillshade-select')?.value === 'terrain');
+
+    const padding = getFitBoundsPadding();
+    if (is3D) {
+        const exaggeration = typeof getTerrainExaggeration === 'function' ? getTerrainExaggeration() : 2.0;
+        const extraPad = Math.round(35 * exaggeration);
+        padding.top += extraPad;
+        padding.bottom += extraPad;
+        padding.left += extraPad;
+        padding.right += extraPad;
+    }
+
+    const options = {
+        padding,
+        duration: 600,
+        ...extraOptions
+    };
+
+    if (is3D) {
+        const exaggeration = typeof getTerrainExaggeration === 'function' ? getTerrainExaggeration() : 2.0;
+        const maxZoom3D = Math.max(10, 16.0 - (exaggeration * 0.5));
+        if (!options.maxZoom || options.maxZoom > maxZoom3D) {
+            options.maxZoom = maxZoom3D;
+        }
+    }
+
+    map.fitBounds(bounds, options);
+}
+
 function fitRoute() {
     if (!currentRouteGeoJSON || currentRouteGeoJSON.coordinates.length === 0) {
         if (waypoints.length > 0) {
             const bounds = new maplibregl.LngLatBounds();
             waypoints.forEach(wp => bounds.extend(wp));
-            map.fitBounds(bounds, { padding: getFitBoundsPadding(), duration: 600 });
+            fitBoundsSmart(bounds, { duration: 600 });
         }
         return;
     }
     const bounds = new maplibregl.LngLatBounds();
     currentRouteGeoJSON.coordinates.forEach(c => bounds.extend(c));
-    map.fitBounds(bounds, { padding: getFitBoundsPadding(), duration: 600 });
+    fitBoundsSmart(bounds, { duration: 600 });
 }
 
 document.getElementById('fit-route-btn').addEventListener('click', fitRoute);
@@ -3985,7 +4006,7 @@ function importGPX(file) {
 
                 const bounds = new maplibregl.LngLatBounds();
                 coords.forEach(c => bounds.extend(c));
-                map.fitBounds(bounds, { padding: getFitBoundsPadding(), maxZoom: 17, duration: 700 });
+                fitBoundsSmart(bounds, { maxZoom: 17, duration: 700 });
             } else {
                 // Route/waypoints — create markers and route via OSRM / direct
                 const pts = rtepts.length > 0 ? rtepts : wpts;
@@ -4548,14 +4569,18 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
                 elev = lngLat[2];
             }
 
-            const exaggeration = getTerrainExaggeration();
-            const effectiveElev = (elev && !isNaN(elev)) ? Math.max(0, elev * exaggeration) : 0;
+            const is3D = (map && map.getTerrain && map.getTerrain()) ||
+                (document.getElementById('hillshade-select')?.value === 'terrain');
 
-            // Base desired zoom at sea level is 16 (ref camera height ~350m).
-            // Compensate target zoom for local exaggerated terrain height so camera maintains ~350m clearance above ground:
-            const baseZoom = 16;
-            const zoomCorrection = Math.log2(1 + (effectiveElev / 350));
-            const targetZoom = Math.max(10, Math.min(16, baseZoom - zoomCorrection));
+            let targetZoom = 16;
+            if (is3D) {
+                const exaggeration = getTerrainExaggeration();
+                const effectiveElev = (elev && !isNaN(elev)) ? Math.max(0, elev * exaggeration) : 0;
+                // Base desired zoom at sea level is 16 (ref camera height ~350m).
+                // Compensate target zoom for local exaggerated terrain height so camera maintains ~350m clearance above ground:
+                const zoomCorrection = Math.log2(1 + (effectiveElev / 350));
+                targetZoom = Math.max(10, Math.min(16, 16 - zoomCorrection));
+            }
 
             map.flyTo({
                 center: [lngLat[0], lngLat[1]],
@@ -5702,7 +5727,7 @@ function loadUrlState() {
             for (const wp of waypoints) {
                 bounds.extend(wp);
             }
-            map.fitBounds(bounds, { padding: getFitBoundsPadding(), duration: 0 }); // Instant fit on load
+            fitBoundsSmart(bounds, { duration: 0 }); // Instant fit on load
             // After camera settles and tiles load, force an elevation refresh
             map.once('idle', () => {
                 needsElevationUpdate = true;
