@@ -667,7 +667,7 @@ function showHoverSegment(ci) {
     let displayEnd = 0;
     if (rawIndexToDisplayRange && rawIndexToDisplayRange[startIndex] && rawIndexToDisplayRange[endIndex] && currentDisplayCoords) {
         displayStart = rawIndexToDisplayRange[startIndex][0];
-        displayEnd = rawIndexToDisplayRange[endIndex][0];
+        displayEnd = rawIndexToDisplayRange[endIndex][1] ?? rawIndexToDisplayRange[endIndex][0];
         subCoords = currentDisplayCoords.slice(displayStart, displayEnd + 1);
     } else {
         subCoords = currentDisplayCoords ? currentDisplayCoords.slice(startIndex, endIndex + 1) : currentRouteGeoJSON.coordinates.slice(startIndex, endIndex + 1);
@@ -1828,11 +1828,23 @@ function getMiteredOffsetPts(pts, currentOffset) {
     return offsetPts;
 }
 
+let cachedScreenPts = null;
+
+function getCachedScreenPts(dispCoords) {
+    if (routeScreenPtsDirty || !cachedScreenPts || cachedScreenPts.length !== dispCoords.length) {
+        cachedScreenPts = dispCoords.map(c => map.project(c));
+        routeScreenPtsDirty = false;
+    }
+    return cachedScreenPts;
+}
+
 function findClosestPointOnLine(mousePt) {
     if (!currentRouteGeoJSON) return { bestCi: -1 };
     const coords = currentRouteGeoJSON.coordinates;
     const dispCoords = currentDisplayCoords || coords;
     if (!coords || coords.length === 0) return { bestCi: -1 };
+
+    const screenPts = getCachedScreenPts(dispCoords);
 
     const mouseLngLat = map.unproject([mousePt.x, mousePt.y]);
     const mLng = mouseLngLat.lng;
@@ -1860,8 +1872,8 @@ function findClosestPointOnLine(mousePt) {
         const maxLat = Math.max(a[1], b[1]) + limit;
         if (mLng < minLng || mLng > maxLng || mLat < minLat || mLat > maxLat) continue;
 
-        const screenA = map.project(a);
-        const screenB = map.project(b);
+        const screenA = screenPts[i];
+        const screenB = screenPts[i + 1];
         if (!screenA || !screenB) continue;
 
         const abx = screenB.x - screenA.x, aby = screenB.y - screenA.y;
