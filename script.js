@@ -31,25 +31,28 @@ const RASTER_BASEMAPS = {
 
 let currentBasemap = localStorage.getItem('route_basemap') || 'cyclosm';
 
+// Apply stored theme immediately to avoid any flash of dark theme
+const storedInitialTheme = localStorage.getItem('route_theme');
+if (storedInitialTheme === 'light') {
+    document.body.classList.add('light-mode');
+}
+
 // Create a persistent cover that hides the map until the initial load and cycle hack is completely finished.
 // This perfectly answers the request to "only make it visually load on the second load".
 const initialCover = document.createElement('div');
 initialCover.id = 'initial-map-cover';
-initialCover.style.position = 'fixed';
-initialCover.style.inset = '0';
-initialCover.style.backgroundColor = '#111';
-initialCover.style.zIndex = '10000000';
-initialCover.style.transition = 'opacity 0.5s ease-in-out';
-initialCover.style.pointerEvents = 'auto';
+if (storedInitialTheme === 'light') {
+    initialCover.classList.add('light-mode');
+}
 
 initialCover.innerHTML = `
-    <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; gap:16px; color:#94a3b8; font-family:'Inter', sans-serif;">
+    <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; gap:16px; font-family:'Inter', sans-serif;">
         <svg class="initial-spinner" width="44" height="44" viewBox="0 0 16 16" fill="none">
-            <circle cx="8" cy="8" r="7" stroke="#1e293b" stroke-width="2"/>
-            <path d="M8 1a7 7 0 0 1 7 7" stroke="#34d399" stroke-width="2" stroke-linecap="round"/>
+            <circle class="spinner-track" cx="8" cy="8" r="7" stroke-width="2"/>
+            <path class="spinner-head" d="M8 1a7 7 0 0 1 7 7" stroke-width="2" stroke-linecap="round"/>
         </svg>
         <div id="initial-loading-text" style="font-size: 0.9rem; font-weight: 500; letter-spacing: 0.02em;">Loading route...</div>
-        <button id="initial-clear-route-btn" style="margin-top: 4px; padding: 7px 15px; background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 8px; font-size: 0.85rem; font-weight: 500; cursor: pointer; transition: all 0.2s ease; display: flex; align-items: center; gap: 6px;" onmouseover="this.style.background='rgba(239,68,68,0.25)'" onmouseout="this.style.background='rgba(239,68,68,0.15)'">
+        <button id="initial-clear-route-btn">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <polyline points="3 6 5 6 21 6"></polyline>
                 <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
@@ -57,10 +60,6 @@ initialCover.innerHTML = `
             Clear Route & Reload
         </button>
     </div>
-    <style>
-        @keyframes spin { 100% { transform: rotate(360deg); } }
-        .initial-spinner { animation: spin 0.8s linear infinite; }
-    </style>
 `;
 
 document.addEventListener('click', (e) => {
@@ -145,6 +144,7 @@ let middleClickStartX = null, middleClickStartY = null;
 
 function buildRasterStyle(tileUrl) {
     const tiles = Array.isArray(tileUrl) ? tileUrl : [tileUrl];
+    const isLight = document.body.classList.contains('light-mode') || localStorage.getItem('route_theme') === 'light';
     return {
         version: 8,
         sources: {
@@ -156,7 +156,7 @@ function buildRasterStyle(tileUrl) {
             }
         },
         layers: [
-            { id: 'bg', type: 'background', paint: { 'background-color': '#111' } },
+            { id: 'bg', type: 'background', paint: { 'background-color': isLight ? '#ffffff' : '#111111' } },
             { id: 'basemap-layer', type: 'raster', source: 'basemap' }
         ]
     };
@@ -2783,7 +2783,7 @@ map.on('mouseup', (e) => {
             pendingRightClickTimer = null;
         }
         lastRightClickTimestamp = 0;
-        map.flyTo({ bearing: 0, pitch: 0 });
+        map.flyTo({ bearing: 0, pitch: 0, speed: 2.8, curve: 1.4 });
         return;
     }
     lastRightClickTimestamp = now;
@@ -3499,7 +3499,8 @@ function fitBoundsSmart(bounds, extraOptions = {}) {
 
     const options = {
         padding,
-        duration: 600,
+        speed: 2.8,
+        curve: 1.4,
         ...extraOptions
     };
 
@@ -3519,20 +3520,20 @@ function fitRoute() {
         if (waypoints.length > 0) {
             const bounds = new maplibregl.LngLatBounds();
             waypoints.forEach(wp => bounds.extend(wp));
-            fitBoundsSmart(bounds, { duration: 600 });
+            fitBoundsSmart(bounds);
         }
         return;
     }
     const bounds = new maplibregl.LngLatBounds();
     currentRouteGeoJSON.coordinates.forEach(c => bounds.extend(c));
-    fitBoundsSmart(bounds, { duration: 600 });
+    fitBoundsSmart(bounds);
 }
 
 document.getElementById('fit-route-btn').addEventListener('click', fitRoute);
 document.getElementById('reverse-route-btn')?.addEventListener('click', reverseRoute);
 document.getElementById('current-location-btn')?.addEventListener('click', () => requestLocation(true));
 document.getElementById('reset-orientation-btn')?.addEventListener('click', () => {
-    map.flyTo({ bearing: 0, pitch: 0 });
+    map.flyTo({ bearing: 0, pitch: 0, speed: 2.8, curve: 1.4 });
 });
 
 // --- Search and Shortcuts ---
@@ -3620,7 +3621,7 @@ document.getElementById('reset-orientation-btn')?.addEventListener('click', () =
         const lng = parseFloat(item.lon);
         const lat = parseFloat(item.lat);
         // Fly to location only — do NOT add a waypoint
-        map.flyTo({ center: [lng, lat], zoom: 12, speed: 2.4 });
+        map.flyTo({ center: [lng, lat], zoom: 12, speed: 2.8, curve: 1.4 });
         showWeatherPopup({ lng, lat });
         collapseSearch();
     }
@@ -3704,7 +3705,7 @@ document.getElementById('reset-orientation-btn')?.addEventListener('click', () =
                                 row.addEventListener('click', () => {
                                     const lng = parseFloat(item.lon);
                                     const lat = parseFloat(item.lat);
-                                    map.flyTo({ center: [lng, lat], zoom: 12, speed: 2.4 });
+                                    map.flyTo({ center: [lng, lat], zoom: 12, speed: 2.8, curve: 1.4 });
                                     showWeatherPopup({ lng, lat });
                                     closeMobileSearch();
                                 });
@@ -3880,7 +3881,7 @@ window.addEventListener('keydown', (e) => {
         }
     } else if (key === currentKeybindings.resetOrientation) {
         e.preventDefault();
-        map.flyTo({ bearing: 0, pitch: 0 });
+        map.flyTo({ bearing: 0, pitch: 0, speed: 2.8, curve: 1.4 });
     } else if (key === currentKeybindings.centerLocation) {
         e.preventDefault();
         requestLocation(true);
@@ -3918,10 +3919,16 @@ document.getElementById('high-perf-check')?.addEventListener('change', (e) => {
 // Settings Handlers
 document.getElementById('theme').addEventListener('change', (e) => {
     localStorage.setItem('route_theme', e.target.value);
-    if (e.target.value === 'light') {
+    const isLight = e.target.value === 'light';
+    if (isLight) {
         document.body.classList.add('light-mode');
+        document.documentElement.classList.add('light-mode');
     } else {
         document.body.classList.remove('light-mode');
+        document.documentElement.classList.remove('light-mode');
+    }
+    if (map && map.getLayer && map.getLayer('bg')) {
+        map.setPaintProperty('bg', 'background-color', isLight ? '#ffffff' : '#111111');
     }
     updateChartTheme();
 });
@@ -4588,7 +4595,7 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
             map.flyTo({
                 center: [lngLat[0], lngLat[1]],
                 zoom: targetZoom,
-                speed: 1.2,
+                speed: 2.8,
                 curve: 1.4,
                 essential: true
             });
@@ -5763,8 +5770,8 @@ function requestLocation(fly = false) {
         const options = {
             center: [lngLat.lng, lngLat.lat],
             zoom: 13,
-            speed: 1.5,
-            curve: 1.2
+            speed: 2.8,
+            curve: 1.4
         };
         if (fly) {
             map.flyTo(options);
@@ -5787,8 +5794,8 @@ function requestLocation(fly = false) {
             const options = {
                 center: [freshLng, freshLat],
                 zoom: 13,
-                speed: 1.5,
-                curve: 1.2
+                speed: 2.8,
+                curve: 1.4
             };
 
             if (!userLocationMarker) {
