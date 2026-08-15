@@ -1073,14 +1073,6 @@ function getWpIconImage(index, total) {
 
 const hoverInfoEl = document.createElement('div');
 hoverInfoEl.id = 'hover-info';
-hoverInfoEl.style.cssText = [
-    'position:absolute', 'pointer-events:none', 'display:none',
-    'background:rgba(20,20,30,0.85)', 'color:#fff',
-    'padding:5px 10px', 'border-radius:8px', 'font-size:0.78rem',
-    'font-family:Inter,sans-serif', 'white-space:nowrap',
-    'border:1px solid rgba(255,255,255,0.12)', 'z-index:9999',
-    'backdrop-filter:blur(4px)', 'transform:translate(-50%,-140%)'
-].join(';');
 
 // Lightweight DOM-based hover circle element to avoid WebGL state flushes
 const hoverCircleEl = document.createElement('div');
@@ -1614,16 +1606,15 @@ function setupRouteLayers() {
         });
     }
 
-    // Preview pin created as an HTML Marker using the same pinSvg shape.
+    // Preview pin created as an HTML Marker matching placed waypoints
     // Instantiated once and shown/hidden during drag.
     if (!window._dragPreviewMarker) {
         const pinEl = document.createElement('div');
-        pinEl.style.cssText = 'pointer-events:none; opacity:0.5;';
-        pinEl.innerHTML = pinSvg('#4b5563', '', 0); // Remove border (strokeWidth=0), Dark Grey
+        pinEl.style.cssText = 'pointer-events:none; opacity:0.9; filter:drop-shadow(0 2px 2px rgba(0,0,0,0.4));';
         window._dragPreviewMarker = new maplibregl.Marker({ element: pinEl, anchor: 'center' })
             .setLngLat([0, 0]);
-        // Don't add to map yet — added on first drag
         window._dragPreviewMarker._pinEl = pinEl;
+        updateDragPreviewAppearance(1, 2);
     }
 
     // Hover circle is handled via lightweight DOM elements to avoid WebGL state flushes
@@ -2353,24 +2344,32 @@ function refreshMarkerIcons() {
         }
     });
 
-    if (window._dragPreviewMarker) {
-        const el = window._dragPreviewMarker.getElement();
-        if (waypointStyle === 'circle') {
-            el.style.width = '22px';
-            el.style.height = '22px';
-            el.innerHTML = circleSvg('#4b5563', '', 1, 22); // Grey circle, 1px white stroke
-            window._dragPreviewMarker.setOffset([0, 0]);
-        } else if (waypointStyle === 'flag') {
-            el.style.width = '26px';
-            el.style.height = '34px';
-            el.innerHTML = flagSvg('#4b5563', '');
-            window._dragPreviewMarker.setOffset([9, -16]);
-        } else {
-            el.style.width = '24px';
-            el.style.height = '34px';
-            el.innerHTML = pinSvg('#4b5563', '', 0); // Grey pin, no stroke
-            window._dragPreviewMarker.setOffset([0, -17]);
-        }
+    updateDragPreviewAppearance(waypoints.length, waypoints.length + 1);
+}
+
+function updateDragPreviewAppearance(insertIdx = 1, total = 2) {
+    if (!window._dragPreviewMarker) return;
+    const waypointStyle = localStorage.getItem('route_waypoint_style') || 'circle';
+    const el = window._dragPreviewMarker.getElement();
+    el.style.opacity = '0.9';
+    el.style.pointerEvents = 'none';
+    el.style.filter = 'drop-shadow(0 2px 2px rgba(0,0,0,0.4))';
+
+    if (waypointStyle === 'circle') {
+        el.style.width = '22px';
+        el.style.height = '22px';
+        el.innerHTML = createMarkerIcon(insertIdx, total);
+        window._dragPreviewMarker.setOffset([0, 0]);
+    } else if (waypointStyle === 'flag') {
+        el.style.width = '26px';
+        el.style.height = '34px';
+        el.innerHTML = createMarkerIcon(insertIdx, total);
+        window._dragPreviewMarker.setOffset([9, -16]);
+    } else {
+        el.style.width = '24px';
+        el.style.height = '34px';
+        el.innerHTML = createMarkerIcon(insertIdx, total);
+        window._dragPreviewMarker.setOffset([0, -17]);
     }
 }
 
@@ -2523,6 +2522,7 @@ function onLineDown(e) {
 
     const prevWp = waypoints[insertIdx - 1];
     const nextWp = waypoints[insertIdx];
+    updateDragPreviewAppearance(insertIdx, waypoints.length + 1);
 
     const onMove = (moveEvent) => {
         const lngLat = moveEvent.lngLat;
@@ -4922,7 +4922,7 @@ function initChart() {
             responsive: true,
             maintainAspectRatio: false,
             layout: {
-                padding: window.innerWidth <= 768 ? 4 : { top: 10, right: 10, left: 10, bottom: 0 }
+                padding: window.innerWidth <= 768 ? { top: 10, right: 4, left: 2, bottom: 0 } : { top: 10, right: 10, left: 5, bottom: 0 }
             },
             interaction: { mode: 'routeHover', intersect: false },
             onLeave: () => {
@@ -5008,9 +5008,10 @@ function initChart() {
                     grid: { color: '#333' },
                     ticks: {
                         color: '#aaa',
+                        autoSkip: false,
                         padding: window.innerWidth <= 768 ? 2 : 3,
-                        callback: function (value) {
-                            if (value === 0) return "Elev.";
+                        callback: function (value, index, ticks) {
+                            if (index === 0) return "Elev.";
                             return value;
                         }
                     }

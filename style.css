@@ -1277,7 +1277,28 @@ body.right-click-dragging #map canvas {
 }
 
 #hover-info {
+    position: absolute;
+    pointer-events: none;
+    display: none;
+    background: rgba(20, 20, 30, 0.85);
+    color: #ffffff;
+    padding: 5px 10px;
+    border-radius: 8px;
+    font-size: 0.78rem;
+    font-family: Inter, sans-serif;
+    white-space: nowrap;
+    border: 1px solid rgba(255, 255, 255, 0.12);
     z-index: 9999 !important;
+    backdrop-filter: blur(4px);
+    transform: translate(-50%, -140%);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+}
+
+body.light-mode #hover-info {
+    background: rgba(255, 255, 255, 0.92);
+    color: #111827;
+    border: 1px solid rgba(0, 0, 0, 0.15);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
 }
 
 /* Hide markers completely when they are behind 3D terrain/horizon */
