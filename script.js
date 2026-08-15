@@ -409,8 +409,8 @@ function miterInsideCorners(coords) {
         displayIndexToRawIndex = coords.map((_, i) => i);
         return coords;
     }
-    const pxOffset = (getPixelOffset(map.getZoom()) * (window.devicePixelRatio || 1) + 1) * (isRouteLeftHandDriving ? -1 : 1);
-    if (pxOffset < 1) { // No visible offset at low zooms
+    const pxOffset = getPixelOffset(map.getZoom()) * (isRouteLeftHandDriving ? -1 : 1);
+    if (Math.abs(pxOffset) < 0.1) { // No visible offset at low zooms
         rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
         displayIndexToRawIndex = coords.map((_, i) => i);
         return coords;
@@ -422,29 +422,56 @@ function miterInsideCorners(coords) {
 
     for (let i = 1; i < coords.length - 1; i++) {
         const currentLen = result.length;
-        const p1 = coords[i - 1], p2 = coords[i], p3 = coords[i + 1];
+        const p2 = coords[i];
 
-        // Signed deflection angle. Positive = right turn.
-        let d = getBearing(p2, p3) - getBearing(p1, p2);
-        while (d > 180) d -= 360;
-        while (d < -180) d += 360;
-
-        // Reserve staples strictly for true 170+ degree U-turn turnarounds.
-        // Keep p2 untouched so the route display line reaches coords[i] directly and connects seamlessly to the turnaround staple without a gap.
-        if (Math.abs(d) > 170) {
+        let prevIdx = i - 1;
+        while (prevIdx >= 0 && haversineDistance(coords[prevIdx], p2) < 0.5) prevIdx--;
+        if (prevIdx < 0) {
             result.push(p2);
             mapping.push([currentLen, currentLen]);
             toRaw.push(i);
             continue;
         }
 
-        // Subdivide sharp turns (|d| >= 120° and <= 170°) into two smooth sub-bends around p2.
-        // This keeps each sub-bend under 120°, allowing MapLibre WebGL to render native, seamless joins without gaps at all zoom levels!
-        if (Math.abs(d) >= 120 && Math.abs(d) <= 170) {
+        let nextIdx = i + 1;
+        while (nextIdx < coords.length && haversineDistance(p2, coords[nextIdx]) < 0.5) nextIdx++;
+        if (nextIdx >= coords.length) {
+            result.push(p2);
+            mapping.push([currentLen, currentLen]);
+            toRaw.push(i);
+            continue;
+        }
+
+        const p1 = coords[prevIdx], p3 = coords[nextIdx];
+
+        // Signed deflection angle. Positive = right turn.
+        let d = getBearing(p2, p3) - getBearing(p1, p2);
+        while (d > 180) d -= 360;
+        while (d < -180) d += 360;
+
+        const latRad = p2[1] * Math.PI / 180;
+        const cosLat = Math.cos(latRad);
+        const metersPerPx = 78271.51696 * cosLat / Math.pow(2, map.getZoom());
+        const distMeters = Math.abs(pxOffset) * metersPerPx;
+
+        // Reserve staples strictly for true dead-end turnarounds (|d| >= 170°).
+        // Keep p2 untouched so the route display line reaches coords[i] directly and connects seamlessly to the turnaround staple without a gap.
+        if (Math.abs(d) >= 170) {
+            result.push(p2);
+            mapping.push([currentLen, currentLen]);
+            toRaw.push(i);
+            continue;
+        }
+
+        // Subdivide sharp turns (|d| >= 110° and < 170°) into two smooth sub-bends around p2.
+        // This splits acute hairpin turns into two gentle sub-bends under 85°, eliminating the inside crossover loop completely!
+        if (Math.abs(d) >= 110 && Math.abs(d) < 170) {
             const d1 = haversineDistance(p1, p2);
             const d2 = haversineDistance(p2, p3);
-            const shift1 = Math.min(3, d1 * 0.2);
-            const shift2 = Math.min(3, d2 * 0.2);
+            const isInside = (pxOffset > 0 && d > 0) || (pxOffset < 0 && d < 0);
+            const maxMeters = isInside ? Math.max(6 * metersPerPx, distMeters * 1.2) : 3 * metersPerPx;
+            const shift1 = Math.min(maxMeters, d1 * (isInside ? 0.8 : 0.4));
+            const shift2 = Math.min(maxMeters, d2 * (isInside ? 0.8 : 0.4));
 
             const r1 = d1 > 0 ? shift1 / d1 : 0;
             const r2 = d2 > 0 ? shift2 / d2 : 0;
@@ -472,11 +499,6 @@ function miterInsideCorners(coords) {
             toRaw.push(i);
             continue;
         }
-
-        const latRad = p2[1] * Math.PI / 180;
-        const cosLat = Math.cos(latRad);
-        const metersPerPx = 78271.51696 * cosLat / Math.pow(2, map.getZoom());
-        const distMeters = Math.min(20, Math.abs(pxOffset) * metersPerPx);
 
         // Convert p1, p2, p3 to local Mercator meters relative to p2
         const dx1 = (p1[0] - p2[0]) * 111319.5 * cosLat;
@@ -708,10 +730,10 @@ function showHoverSegment(ci) {
     window.activeHoverEnd = endIndex;
     updateTurnaroundJoins();
 
-    // Exclusive-start range: corner at a waypoint boundary (idx==endIndex) is included in the
-    // approach segment but excluded from the departure segment — avoids double-bolding.
-    map.setFilter('turnaround-highlight-layer', ['all', ['>', ['get', 'idx'], startIndex], ['<=', ['get', 'idx'], endIndex]]);
-    map.setFilter('turnaround-layer', ['any', ['<=', ['get', 'idx'], startIndex], ['>', ['get', 'idx'], endIndex]]);
+    // Inclusive range: corner at a waypoint boundary (idx >= startIndex && idx <= endIndex)
+    // is included whenever hovering either the approach segment or departure segment.
+    map.setFilter('turnaround-highlight-layer', ['all', ['>=', ['get', 'idx'], startIndex], ['<=', ['get', 'idx'], endIndex]]);
+    map.setFilter('turnaround-layer', ['any', ['<', ['get', 'idx'], startIndex], ['>', ['get', 'idx'], endIndex]]);
 }
 
 function offsetLatLng(lngLat, offsetMeters, bearingDegrees) {
@@ -732,23 +754,23 @@ function offsetLatLng(lngLat, offsetMeters, bearingDegrees) {
 function updateTurnaroundJoins() {
     if (!currentRouteGeoJSON || !map.getSource('turnarounds')) return;
 
-    const coords = currentDisplayCoords || currentRouteGeoJSON.coordinates;
+    const coords = currentRouteGeoJSON.coordinates;
     const zoom = map.getZoom();
     const mult = isRouteLeftHandDriving ? -1 : 1;
     const pxOffset = getPixelOffset(zoom) * mult;
 
     const turns = [];
     for (let i = 1; i < coords.length - 1; i++) {
-        // Find preceding coordinate at least 1 meter away from coords[i]
+        // Find preceding coordinate at least 0.5 meter away from coords[i]
         let prevIdx = i - 1;
-        while (prevIdx >= 0 && haversineDistance(coords[prevIdx], coords[i]) < 1) {
+        while (prevIdx >= 0 && haversineDistance(coords[prevIdx], coords[i]) < 0.5) {
             prevIdx--;
         }
         if (prevIdx < 0) continue;
 
-        // Find succeeding coordinate at least 1 meter away from coords[i]
+        // Find succeeding coordinate at least 0.5 meter away from coords[i]
         let nextIdx = i + 1;
-        while (nextIdx < coords.length && haversineDistance(coords[i], coords[nextIdx]) < 1) {
+        while (nextIdx < coords.length && haversineDistance(coords[i], coords[nextIdx]) < 0.5) {
             nextIdx++;
         }
         if (nextIdx >= coords.length) continue;
@@ -761,8 +783,8 @@ function updateTurnaroundJoins() {
         while (d > 180) d -= 360;
         while (d < -180) d += 360;
 
-        // Reserve staples strictly for true 170+ degree U-turn turnarounds
-        if (Math.abs(d) <= 170) continue;
+        // Reserve staples strictly for true dead-end turnarounds (|d| >= 170°)
+        if (Math.abs(d) < 170) continue;
 
         const latRad = coords[i][1] * Math.PI / 180;
         const metersPerPixel = 78271.51696 * Math.cos(latRad) / Math.pow(2, zoom);
@@ -781,54 +803,21 @@ function updateTurnaroundJoins() {
             turnColor = surfaceColors[st] || '#4b5563';
         }
 
-        const effectiveOffset = Math.max(1.5, Math.abs(pxOffset));
+        const offsetDist = Math.abs(pxOffset) * metersPerPixel;
+        const p1 = offsetLatLng(coords[i], offsetDist, bIn + 90 * mult);
+        const p2 = offsetLatLng(coords[i], offsetDist, bOut + 90 * mult);
 
-        if (isHovered) {
-            // Bolded turnaround: shift inward dynamically to match outer corners and bridge angle
-            const wVal = 10.0;
-            const distOffset = Math.min(30, (effectiveOffset + wVal / 2) * metersPerPixel);
-
-            // Scale the shift inward based on the turn's deviation from a perfect 180 degrees.
-            // A perfect 180 needs 0 shift (no overshoot), a 160 degree turn needs full shift (no gap).
-            const deviation = 180 - Math.abs(d); // 0 to 20
-            const shiftFactor = Math.min(1.0, deviation / 20.0);
-            const shiftOffset = Math.min(15, (wVal / 2) * shiftFactor * metersPerPixel);
-
-            const c1 = offsetLatLng(coords[i], distOffset, bIn + 90 * mult);
-            const p1 = offsetLatLng(c1, shiftOffset, bIn + 180); // shift backward along incoming road
-
-            const c2 = offsetLatLng(coords[i], distOffset, bOut + 90 * mult);
-            const p2 = offsetLatLng(c2, shiftOffset, bOut); // shift forward along outgoing road
-
-            turns.push({
-                type: 'Feature',
-                properties: {
-                    idx: i,
-                    color: turnColor
-                },
-                geometry: {
-                    type: 'LineString',
-                    coordinates: [p1, p2]
-                }
-            });
-        } else {
-            // Untouched normal unhighlighted turnaround: straight perpendicular
-            const distOffset = Math.min(25, (effectiveOffset + 2.5) * metersPerPixel);
-            const p1 = offsetLatLng(coords[i], distOffset, bIn + 90 * mult);
-            const p2 = offsetLatLng(coords[i], distOffset, bIn - 90 * mult);
-
-            turns.push({
-                type: 'Feature',
-                properties: {
-                    idx: i,
-                    color: turnColor
-                },
-                geometry: {
-                    type: 'LineString',
-                    coordinates: [p1, p2]
-                }
-            });
-        }
+        turns.push({
+            type: 'Feature',
+            properties: {
+                idx: i,
+                color: turnColor
+            },
+            geometry: {
+                type: 'LineString',
+                coordinates: [p1, p2]
+            }
+        });
     }
     map.getSource('turnarounds').setData({ type: 'FeatureCollection', features: turns });
 }
@@ -1521,27 +1510,13 @@ function setupRouteLayers() {
             id: 'turnaround-layer',
             type: 'line',
             source: 'turnarounds',
-            layout: { 'line-join': 'miter', 'line-cap': 'butt' },
+            layout: { 'line-join': 'round', 'line-cap': 'round' },
             paint: {
                 'line-color': ['get', 'color'],
                 'line-width': 5,
                 'line-opacity': 0.97
             }
         });
-    if (!map.getLayer('turnaround-highlight-layer'))
-        map.addLayer({
-            id: 'turnaround-highlight-layer',
-            type: 'line',
-            source: 'turnarounds',
-            layout: { 'line-join': 'miter', 'line-cap': 'butt' },
-            paint: {
-                'line-color': ['get', 'color'],
-                'line-width': 8,
-                'line-opacity': 1.0
-            },
-            filter: ['==', ['get', 'idx'], -1] // Initially hide
-        });
-
     // Highlight for the active segment being hovered
     if (!map.getSource('hover-segment'))
         map.addSource('hover-segment', { type: 'geojson', data: { type: 'FeatureCollection', features: [] }, lineMetrics: true });
@@ -1550,12 +1525,26 @@ function setupRouteLayers() {
             id: 'hover-segment-layer',
             type: 'line',
             source: 'hover-segment',
-            layout: { 'line-join': 'miter', 'line-cap': 'round' },
+            layout: { 'line-join': 'round', 'line-cap': 'round' },
             paint: {
                 'line-width': 8,
                 'line-opacity': 1.0,
                 'line-offset': ['interpolate', ['linear'], ['zoom'], 8, 0, 12, 2, 15, 4, 18, 6, 24, 6]
             }
+        });
+
+    if (!map.getLayer('turnaround-highlight-layer'))
+        map.addLayer({
+            id: 'turnaround-highlight-layer',
+            type: 'line',
+            source: 'turnarounds',
+            layout: { 'line-join': 'round', 'line-cap': 'round' },
+            paint: {
+                'line-color': ['get', 'color'],
+                'line-width': 8,
+                'line-opacity': 1.0
+            },
+            filter: ['==', ['get', 'idx'], -1] // Initially hide
         });
 
     // Dragging guides (rubber-band lines) — solid grey, no dash
@@ -1671,12 +1660,12 @@ map.on('style.load', () => {
         isFirstLoad = false;
     }
 
-    let lastZoom = map.getZoom();
+    let lastRebuildZoom = map.getZoom();
     const updateView = () => {
         routeScreenPtsDirty = true;
         const currentZoom = map.getZoom();
-        if (currentZoom !== lastZoom) {
-            lastZoom = currentZoom;
+        if (currentZoom !== lastRebuildZoom) {
+            lastRebuildZoom = currentZoom;
             updateTurnaroundJoins();
             rebuildMapGradient(); // Miter point depends on zoom — refresh display coords
         }
@@ -1689,11 +1678,7 @@ map.on('style.load', () => {
     };
     map.on('moveend', updateView);
     map.on('zoom', () => {
-        const currentZoom = map.getZoom();
-        if (currentZoom !== lastZoom) {
-            lastZoom = currentZoom;
-            updateTurnaroundJoins();
-        }
+        updateTurnaroundJoins();
     });
     map.on('zoomend', () => { isZooming = false; updateView(); updateDistanceMarkers(); });
     map.on('zoomstart', () => { isZooming = true; });
@@ -2093,6 +2078,12 @@ function clearHoverHighlight(force) {
         }
         if (map.getLayer('hover-segment-layer')) {
             map.setLayoutProperty('hover-segment-layer', 'visibility', 'none');
+        }
+        if (map.getLayer('turnaround-highlight-layer')) {
+            map.setFilter('turnaround-highlight-layer', ['==', ['get', 'idx'], -1]);
+        }
+        if (map.getLayer('turnaround-layer')) {
+            map.setFilter('turnaround-layer', null);
         }
     }
 }
