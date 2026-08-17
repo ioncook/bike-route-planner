@@ -463,12 +463,18 @@ function miterInsideCorners(coords) {
             continue;
         }
 
-        // Subdivide sharp turns (|d| >= 110° and < 170°) into two smooth sub-bends around p2.
-        // This splits acute hairpin turns into two gentle sub-bends under 85°, eliminating the inside crossover loop completely!
-        if (Math.abs(d) >= 110 && Math.abs(d) < 170) {
+        const isInside = (pxOffset > 0 && d > 0) || (pxOffset < 0 && d < 0);
+
+        // Subdivide sharp turns into two smooth sub-bends around p2:
+        // - Inside corners (sharp right turns >= 110°): eliminates inside crossover loops.
+        // - Outside corners (sharp left turns >= 120°): bridges the acute outside corner seamlessly.
+        // - All turns < 120° (non-sharp left turns and 90° corners): stay completely sharp as untouched single points.
+        const shouldSubdivide = (isInside && Math.abs(d) >= 110 && Math.abs(d) < 170) ||
+            (!isInside && Math.abs(d) >= 120 && Math.abs(d) < 170);
+
+        if (shouldSubdivide) {
             const d1 = haversineDistance(p1, p2);
             const d2 = haversineDistance(p2, p3);
-            const isInside = (pxOffset > 0 && d > 0) || (pxOffset < 0 && d < 0);
             const maxMeters = isInside ? Math.max(6 * metersPerPx, distMeters * 1.2) : 3 * metersPerPx;
             const shift1 = Math.min(maxMeters, d1 * (isInside ? 0.8 : 0.4));
             const shift2 = Math.min(maxMeters, d2 * (isInside ? 0.8 : 0.4));
@@ -492,82 +498,10 @@ function miterInsideCorners(coords) {
             continue;
         }
 
-        // Only fix right turns > 30° — these are inside corners for positive offset.
-        if (d < 30) {
-            result.push(p2);
-            mapping.push([currentLen, currentLen]);
-            toRaw.push(i);
-            continue;
-        }
-
-        // Convert p1, p2, p3 to local Mercator meters relative to p2
-        const dx1 = (p1[0] - p2[0]) * 111319.5 * cosLat;
-        const dy1 = (p1[1] - p2[1]) * 111319.5;
-        const len1 = Math.sqrt(dx1 * dx1 + dy1 * dy1);
-
-        const dx3 = (p3[0] - p2[0]) * 111319.5 * cosLat;
-        const dy3 = (p3[1] - p2[1]) * 111319.5;
-        const len3 = Math.sqrt(dx3 * dx3 + dy3 * dy3);
-
-        if (len1 < 0.1 || len3 < 0.1) {
-            result.push(p2);
-            mapping.push([currentLen, currentLen]);
-            toRaw.push(i);
-            continue;
-        }
-
-        const idX = -dx1 / len1, idY = -dy1 / len1;
-        const odX = dx3 / len3, odY = dy3 / len3;
-
-        // Right-hand normals
-        const mult = pxOffset < 0 ? -1 : 1;
-        const niX = -idY * mult, niY = idX * mult;
-        const noX = -odY * mult, noY = odX * mult;
-
-        // Offset line anchors
-        const ax = niX * distMeters, ay = niY * distMeters;
-        const bx = noX * distMeters, by = noY * distMeters;
-
-        const cross = idX * odY - idY * odX;
-        if (Math.abs(cross) < 1e-6) {
-            result.push(p2);
-            mapping.push([currentLen, currentLen]);
-            toRaw.push(i);
-            continue;
-        }
-
-        const t = ((bx - ax) * odY - (by - ay) * odX) / cross;
-        const s = ((bx - ax) * idY - (by - ay) * idX) / cross;
-
-        const maxShift1 = len1 * 0.4;
-        const maxShift2 = len3 * 0.4;
-
-        let clampedT = t;
-        if (clampedT > 0) clampedT = 0;
-        if (clampedT < -maxShift1) clampedT = -maxShift1;
-
-        let clampedS = s;
-        if (clampedS < 0) clampedS = 0;
-        if (clampedS > maxShift2) clampedS = maxShift2;
-
-        const mx1 = clampedT * idX;
-        const my1 = clampedT * idY;
-        const mx2 = clampedS * odX;
-        const my2 = clampedS * odY;
-
-        const mPt1 = [
-            p2[0] + mx1 / (111319.5 * cosLat),
-            p2[1] + my1 / 111319.5
-        ];
-        const mPt2 = [
-            p2[0] + mx2 / (111319.5 * cosLat),
-            p2[1] + my2 / 111319.5
-        ];
-
-        result.push(mPt1);
-        result.push(mPt2);
-        mapping.push([currentLen, currentLen + 1]);
-        toRaw.push(i, i);
+        // All non-hairpin turns (< 120°) keep p2 untouched so MapLibre renders native crisp miter corners with zero rounding.
+        result.push(p2);
+        mapping.push([currentLen, currentLen]);
+        toRaw.push(i);
     }
     mapping.push([result.length, result.length]);
     toRaw.push(coords.length - 1);
@@ -1454,7 +1388,7 @@ function setupRouteLayers() {
             id: 'route-gradient-layer',
             type: 'line',
             source: 'route-gradient',
-            layout: { 'line-join': 'miter', 'line-cap': 'round' },
+            layout: { 'line-join': 'miter', 'line-miter-limit': 4, 'line-cap': 'round' },
             paint: {
                 'line-color': 'rgb(34,197,94)',
                 'line-width': 5,
@@ -1517,7 +1451,7 @@ function setupRouteLayers() {
             id: 'hover-segment-layer',
             type: 'line',
             source: 'hover-segment',
-            layout: { 'line-join': 'round', 'line-cap': 'round' },
+            layout: { 'line-join': 'miter', 'line-miter-limit': 4, 'line-cap': 'round' },
             paint: {
                 'line-width': 8,
                 'line-opacity': 1.0,
