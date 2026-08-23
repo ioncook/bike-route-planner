@@ -216,6 +216,11 @@ body {
     display: none !important;
 }
 
+/* Hide mobile search overlay on desktop */
+.mobile-search-overlay {
+    display: none;
+}
+
 /* Search bar wrapper with expansion logic */
 .search-wrapper {
     display: flex;
