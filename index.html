@@ -24,25 +24,25 @@
 
 <body>
     <div id="app">
-        <!-- Mobile Search Screen Overlay -->
-        <div id="mobile-search-screen" class="mobile-search-overlay" style="display: none;">
-            <div class="mobile-search-header">
-                <button id="mobile-search-back" class="icon-btn" aria-label="Go back">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
-                        stroke-linecap="round" stroke-linejoin="round">
-                        <line x1="19" y1="12" x2="5" y2="12"></line>
-                        <polyline points="12 19 5 12 12 5"></polyline>
-                    </svg>
-                </button>
-                <div class="mobile-search-input-wrapper">
-                    <input type="text" id="mobile-map-search" placeholder="Search locations..." autocomplete="off">
-                    <button id="mobile-search-clear" class="search-clear-btn" style="display: none;">&times;</button>
-                </div>
-            </div>
-            <div id="mobile-search-dropdown" class="mobile-search-results"></div>
-        </div>
-
         <main id="map-container">
+            <!-- Mobile Search Screen Overlay -->
+            <div id="mobile-search-screen" class="mobile-search-overlay">
+                <div class="mobile-search-header">
+                    <button id="mobile-search-back" class="icon-btn" aria-label="Go back">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                            stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="19" y1="12" x2="5" y2="12"></line>
+                            <polyline points="12 19 5 12 12 5"></polyline>
+                        </svg>
+                    </button>
+                    <div class="mobile-search-input-wrapper">
+                        <input type="text" id="mobile-map-search" placeholder="Search locations..." autocomplete="off">
+                        <button id="mobile-search-clear" class="search-clear-btn" style="display: none;">&times;</button>
+                    </div>
+                </div>
+                <div id="mobile-search-dropdown" class="mobile-search-results"></div>
+            </div>
+
             <div id="top-bar">
                 <div class="header-brand" style="display: flex; align-items: center; gap: 10px;">
                     <a href="https://ioncook.github.io" target="_blank"

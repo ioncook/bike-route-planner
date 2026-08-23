@@ -1133,13 +1133,16 @@ body.light-mode .custom-tooltip {
 
     /* Mobile Search Screen Overlay */
     .mobile-search-overlay {
-        position: fixed !important;
+        position: absolute !important;
+        inset: 0 !important;
         top: 0 !important;
         left: 0 !important;
         right: 0 !important;
         bottom: 0 !important;
+        width: 100% !important;
+        height: 100% !important;
         background: var(--bg-panel) !important;
-        z-index: 99999 !important;
+        z-index: 10000001 !important;
         display: flex !important;
         flex-direction: column !important;
         padding: calc(env(safe-area-inset-top) + 12px) 16px 16px 16px !important;
