@@ -880,6 +880,9 @@ body.light-mode .custom-tooltip {
     overflow: hidden;
     font-family: 'Inter', sans-serif;
     cursor: move;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
 }
 
 .stats-panel.show {
