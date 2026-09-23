@@ -1602,7 +1602,10 @@ map.on('style.load', () => {
         } catch (_) { }
     };
     map.on('moveend', updateView);
+    map.on('pitchend', updateView);
+    map.on('rotateend', () => { routeScreenPtsDirty = true; });
     map.on('zoom', () => {
+        routeScreenPtsDirty = true;
         updateTurnaroundJoins();
     });
     map.on('zoomend', () => { isZooming = false; updateView(); updateDistanceMarkers(); });
@@ -1631,8 +1634,16 @@ map.on('movestart', () => {
     }
 });
 
-// Change cursor when hovering the route
-map.on('mouseenter', 'route-line', () => { map.getCanvas().style.cursor = 'pointer'; });
+// Change cursor when hovering the route and prime screen coordinates asynchronously/ahead of mousemove
+map.on('mouseenter', 'route-line', () => {
+    map.getCanvas().style.cursor = 'pointer';
+    if (window.innerWidth <= 768) return;
+    const coords = currentRouteGeoJSON?.coordinates;
+    const dispCoords = currentDisplayCoords || coords;
+    if (dispCoords && (routeScreenPtsDirty || !cachedScreenPts)) {
+        getCachedScreenPts(dispCoords);
+    }
+});
 map.on('mouseleave', 'route-line', () => {
     if (!isDraggingLine) {
         map.getCanvas().style.cursor = '';
@@ -1739,10 +1750,21 @@ function getMiteredOffsetPts(pts, currentOffset) {
 }
 
 let cachedScreenPts = null;
+let cachedTerrainScreenPts = [];
+
+function fastProjectCoord(coord) {
+    if (map && map.transform) {
+        if (typeof map.transform.locationToScreenPoint === 'function') {
+            return map.transform.locationToScreenPoint(maplibregl.LngLat.convert(coord));
+        }
+    }
+    return map.project(coord);
+}
 
 function getCachedScreenPts(dispCoords) {
     if (routeScreenPtsDirty || !cachedScreenPts || cachedScreenPts.length !== dispCoords.length) {
-        cachedScreenPts = dispCoords.map(c => map.project(c));
+        cachedScreenPts = dispCoords.map(c => fastProjectCoord(c));
+        cachedTerrainScreenPts = [];
         routeScreenPtsDirty = false;
     }
     return cachedScreenPts;
@@ -1756,61 +1778,105 @@ function findClosestPointOnLine(mousePt) {
 
     const screenPts = getCachedScreenPts(dispCoords);
 
-    const mouseLngLat = map.unproject([mousePt.x, mousePt.y]);
-    const mLng = mouseLngLat.lng;
-    const mLat = mouseLngLat.lat;
-
-    const zoom = map.getZoom();
-    const limit = zoom < 10 ? 0.05 : 0.005;
-
     let bestDistSq = Infinity;
     let bestCost = Infinity;
     let bestCi = -1;
     let bestT = 0;
     let bestProj = { x: 0, y: 0 };
 
+    const zoom = map.getZoom();
     const currentOffset = getPixelOffset(zoom) * (isRouteLeftHandDriving ? -1 : 1);
+    const mX = mousePt.x;
+    const mY = mousePt.y;
+    const hasTerrain = !!(map.getTerrain && map.getTerrain());
 
-    for (let i = 0; i < dispCoords.length - 1; i++) {
-        const a = dispCoords[i];
-        const b = dispCoords[i + 1];
-        if (!a || !b) continue;
+    // Step 1: Find candidate segments
+    const candidates = [];
 
-        const minLng = Math.min(a[0], b[0]) - limit;
-        const maxLng = Math.max(a[0], b[0]) + limit;
-        const minLat = Math.min(a[1], b[1]) - limit;
-        const maxLat = Math.max(a[1], b[1]) + limit;
-        if (mLng < minLng || mLng > maxLng || mLat < minLat || mLat > maxLat) continue;
+    if (hasTerrain) {
+        // In 3D terrain mode, mouse coordinates map to geographic coordinates via unproject.
+        // Screen-space 2D coordinates on mountains are displaced, but geographic distance is invariant.
+        const mouseLngLat = map.unproject([mX, mY]);
+        const mLng = mouseLngLat.lng;
+        const mLat = mouseLngLat.lat;
+        // Search window in geographic degrees (~300m radius depending on zoom)
+        const geoMargin = Math.max(0.002, 0.05 / Math.pow(2, Math.max(0, zoom - 10)));
 
-        const screenA = screenPts[i];
-        const screenB = screenPts[i + 1];
+        for (let i = 0; i < dispCoords.length - 1; i++) {
+            const a = dispCoords[i];
+            const b = dispCoords[i + 1];
+            if (!a || !b) continue;
+
+            const minLng = (a[0] < b[0] ? a[0] : b[0]) - geoMargin;
+            const maxLng = (a[0] > b[0] ? a[0] : b[0]) + geoMargin;
+            const minLat = (a[1] < b[1] ? a[1] : b[1]) - geoMargin;
+            const maxLat = (a[1] > b[1] ? a[1] : b[1]) + geoMargin;
+            if (mLng < minLng || mLng > maxLng || mLat < minLat || mLat > maxLat) continue;
+
+            const midLng = (a[0] + b[0]) * 0.5;
+            const midLat = (a[1] + b[1]) * 0.5;
+            const dLng = midLng - mLng;
+            const dLat = midLat - mLat;
+            candidates.push({ i, dist: dLng * dLng + dLat * dLat });
+        }
+    } else {
+        const margin = 80;
+        for (let i = 0; i < dispCoords.length - 1; i++) {
+            const screenA = screenPts[i];
+            const screenB = screenPts[i + 1];
+            if (!screenA || !screenB) continue;
+
+            const minX = (screenA.x < screenB.x ? screenA.x : screenB.x) - margin;
+            const maxX = (screenA.x > screenB.x ? screenA.x : screenB.x) + margin;
+            const minY = (screenA.y < screenB.y ? screenA.y : screenB.y) - margin;
+            const maxY = (screenA.y > screenB.y ? screenA.y : screenB.y) + margin;
+            if (mX < minX || mX > maxX || mY < minY || mY > maxY) continue;
+
+            const midX = (screenA.x + screenB.x) * 0.5;
+            const midY = (screenA.y + screenB.y) * 0.5;
+            candidates.push({ i, dist: (midX - mX) * (midX - mX) + (midY - mY) * (midY - mY) });
+        }
+    }
+
+    if (candidates.length > 20) {
+        candidates.sort((a, b) => a.dist - b.dist);
+        candidates.length = 20;
+    }
+
+    // Step 2: Evaluate candidates with true 3D screen endpoints
+    for (let k = 0; k < candidates.length; k++) {
+        const i = candidates[k].i;
+        let screenA, screenB;
+        if (hasTerrain) {
+            screenA = cachedTerrainScreenPts[i] || (cachedTerrainScreenPts[i] = map.project(dispCoords[i]));
+            screenB = cachedTerrainScreenPts[i + 1] || (cachedTerrainScreenPts[i + 1] = map.project(dispCoords[i + 1]));
+        } else {
+            screenA = screenPts[i];
+            screenB = screenPts[i + 1];
+        }
         if (!screenA || !screenB) continue;
 
         const abx = screenB.x - screenA.x, aby = screenB.y - screenA.y;
-        const len = Math.sqrt(abx * abx + aby * aby);
-        if (len === 0) continue;
-
-        const nx = -aby / len, ny = abx / len;
-        const aOffset = { x: screenA.x + nx * currentOffset, y: screenA.y + ny * currentOffset };
-        const bOffset = { x: screenB.x + nx * currentOffset, y: screenB.y + ny * currentOffset };
-
-        const segX = bOffset.x - aOffset.x, segY = bOffset.y - aOffset.y;
-        const segLenSq = segX * segX + segY * segY;
+        const segLenSq = abx * abx + aby * aby;
         if (segLenSq === 0) continue;
 
-        let t = ((mousePt.x - aOffset.x) * segX + (mousePt.y - aOffset.y) * segY) / segLenSq;
-        t = Math.max(0, Math.min(1, t));
+        const len = Math.sqrt(segLenSq);
+        const nx = -aby / len, ny = abx / len;
+        const aOffX = screenA.x + nx * currentOffset, aOffY = screenA.y + ny * currentOffset;
+        const bOffX = screenB.x + nx * currentOffset, bOffY = screenB.y + ny * currentOffset;
 
-        const pProjX = aOffset.x + t * segX, pProjY = aOffset.y + t * segY;
-        const dx = pProjX - mousePt.x, dy = pProjY - mousePt.y;
+        const sX = bOffX - aOffX, sY = bOffY - aOffY;
+        const sLenSq = sX * sX + sY * sY;
+        if (sLenSq === 0) continue;
+
+        let t = ((mX - aOffX) * sX + (mY - aOffY) * sY) / sLenSq;
+        if (t < 0) t = 0; else if (t > 1) t = 1;
+
+        const pProjX = aOffX + t * sX, pProjY = aOffY + t * sY;
+        const dx = pProjX - mX, dy = pProjY - mY;
         const dSq = dx * dx + dy * dy;
 
-        const rawI = (displayIndexToRawIndex && displayIndexToRawIndex[i] !== undefined) ? displayIndexToRawIndex[i] : i;
-        const indexDiff = (bestCiGlobal !== -1) ? Math.abs(rawI - bestCiGlobal) : 0;
-        const cost = dSq + indexDiff * 1e-6;
-
-        if (cost < bestCost) {
-            bestCost = cost;
+        if (dSq < bestDistSq) {
             bestDistSq = dSq;
             bestCi = i;
             bestT = t;
@@ -1822,7 +1888,7 @@ function findClosestPointOnLine(mousePt) {
     if (displayIndexToRawIndex && bestCi !== -1) {
         rawCi = displayIndexToRawIndex[bestCi] ?? bestCi;
     }
-    return { bestCi: rawCi, bestT, bestDistSq, bestProj };
+    return { bestCi: rawCi, displayCi: bestCi, bestT, bestDistSq, bestProj };
 }
 
 let isHoveringMarker = false;
@@ -1841,12 +1907,20 @@ map.on('mousemove', 'route-line', (e) => {
     if (now - lastHoverTime < 16) return; // 60fps throttle
     lastHoverTime = now;
 
-    const { bestCi, bestT, bestDistSq, bestProj } = findClosestPointOnLine(e.point);
+    const { bestCi, displayCi, bestT, bestDistSq, bestProj } = findClosestPointOnLine(e.point);
 
     if (bestCi !== -1) {
         bestCiGlobal = bestCi;
-        const projectedLngLat = map.unproject([bestProj.x, bestProj.y]);
-        updateHoverHighlight(bestCi, bestT, [projectedLngLat.lng, projectedLngLat.lat], bestProj);
+        const coords = currentRouteGeoJSON.coordinates;
+        const dispCoords = currentDisplayCoords || coords;
+        const dIdx = (displayCi !== undefined && displayCi >= 0) ? displayCi : bestCi;
+        const c1 = dispCoords[dIdx] || coords[bestCi];
+        const c2 = dispCoords[Math.min(dIdx + 1, dispCoords.length - 1)] || c1;
+        const lng = c1[0] + bestT * (c2[0] - c1[0]);
+        const lat = c1[1] + bestT * (c2[1] - c1[1]);
+
+        // bestProj is already the exact projected point on the offset 3D segment in screen space
+        updateHoverHighlight(bestCi, bestT, [lng, lat], bestProj);
     } else {
         clearHoverHighlight();
     }
@@ -1870,7 +1944,7 @@ function getOffsetScreenPt(ci) {
     const p1 = (pIdx > 0) ? map.project(displayCoords[pIdx - 1]) : null;
     const p3 = (pIdx < displayCoords.length - 1) ? map.project(displayCoords[pIdx + 1]) : null;
 
-    const pxOffset = (getPixelOffset(map.getZoom()) + 1) * (isRouteLeftHandDriving ? -1 : 1);
+    const pxOffset = getPixelOffset(map.getZoom()) * (isRouteLeftHandDriving ? -1 : 1);
     if (Math.abs(pxOffset) < 0.5) {
         return p2;
     }
@@ -1981,13 +2055,13 @@ function ensureHoverFrameLoopRunning() {
             if (screenPt) {
                 updateHoverHighlight(activeStatIdx, 0, lngLat, screenPt);
             }
+            hoverFrameLoopId = requestAnimationFrame(loop);
+        } else {
+            hoverFrameLoopId = null;
         }
-        hoverFrameLoopId = requestAnimationFrame(loop);
     }
     hoverFrameLoopId = requestAnimationFrame(loop);
 }
-
-ensureHoverFrameLoopRunning();
 
 function clearHoverHighlight(force) {
     if (isFlyToActive && !force) return;
@@ -4457,6 +4531,7 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
             if (isDraggingWindow || isDraggingStats || isResizing) return;
             if (ci !== undefined && ci >= 0 && currentRouteGeoJSON && currentRouteGeoJSON.coordinates && currentRouteGeoJSON.coordinates.length > ci) {
                 activeStatIdx = ci;
+                ensureHoverFrameLoopRunning();
                 const coords = currentRouteGeoJSON.coordinates;
                 const lngLat = coords[ci];
                 const screenPt = getOffsetScreenPt(ci);
@@ -4493,6 +4568,7 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
             if (isDraggingWindow || isResizing) return;
             if (ci === undefined || ci < 0 || !currentRouteGeoJSON || !currentRouteGeoJSON.coordinates || currentRouteGeoJSON.coordinates.length <= ci) return;
             activeStatIdx = ci;
+            ensureHoverFrameLoopRunning();
             isFlyToActive = true;
             const lngLat = currentRouteGeoJSON.coordinates[ci];
 
