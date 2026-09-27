@@ -9,6 +9,8 @@
     --text-muted: #aaaaaa;
     --border: #333333;
     --btn-bg: #252525;
+    --radius-sm: 3px;
+    --radius-md: 5px;
 }
 
 * {
@@ -89,7 +91,7 @@ body {
     width: 100%;
     padding: 14px;
     border: none;
-    border-radius: 8px;
+    border-radius: var(--radius-sm, 2px);
     font-size: 1rem;
     font-weight: 600;
     cursor: pointer;
@@ -253,7 +255,7 @@ body {
     color: var(--text-main);
     padding: 0 12px;
     height: 28px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm, 2px);
     font-size: 0.9rem;
     outline: none;
     transition: border-color 0.2s, box-shadow 0.2s;
@@ -277,7 +279,7 @@ body {
 }
 
 #clear-route {
-    border-radius: 7px;
+    border-radius: var(--radius-sm, 2px);
 }
 
 .search-wrapper.expanded #search-toggle {
@@ -292,7 +294,7 @@ body {
     justify-content: center;
     background: var(--btn-bg);
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius-sm, 2px);
     padding: 0;
     /* Remove internal padding to avoid highlight 'lines' */
     gap: 0;
@@ -392,7 +394,7 @@ body {
     width: 320px;
     background: var(--bg-panel);
     border: 1px solid var(--border);
-    border-radius: 12px;
+    border-radius: var(--radius-md, 4px);
     z-index: 10000;
     box-shadow: 0 12px 36px rgba(0, 0, 0, 0.35);
     overflow: hidden;
@@ -434,7 +436,7 @@ body.light-mode #search-dropdown {
     align-items: center;
     background: var(--btn-bg);
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius-sm, 2px);
     padding: 0;
     height: 32px;
     overflow: hidden;
@@ -486,7 +488,7 @@ body.light-mode #search-dropdown {
     box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.5);
     z-index: 5000000 !important;
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius-md, 4px);
     padding: 12px;
     display: none;
 }
@@ -528,7 +530,7 @@ body.light-mode #search-dropdown {
     background: var(--btn-bg);
     color: var(--text-main);
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--radius-sm, 2px);
     padding: 4px 6px;
     outline: none;
     width: 120px;
@@ -615,7 +617,7 @@ body.is-dragging-window #stats-panel * {
     height: 100%;
     background: var(--bg-panel);
     border: 1px solid var(--border);
-    border-radius: 12px;
+    border-radius: var(--radius-md, 4px);
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
     display: flex;
     flex-direction: column;
@@ -762,7 +764,7 @@ body.is-dragging-window #stats-panel * {
     background: rgba(18, 18, 18, 0.95);
     color: white;
     padding: 6px 12px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm, 2px);
     font-size: 0.75rem;
     font-weight: 500;
     pointer-events: none;
@@ -796,7 +798,7 @@ body.light-mode .custom-tooltip {
 .weather-popup .maplibregl-popup-content {
     background: var(--bg-panel) !important;
     color: var(--text-main) !important;
-    border-radius: 12px !important;
+    border-radius: var(--radius-md, 4px) !important;
     padding: 6px 10px 10px !important;
     box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4) !important;
     border: 1px solid var(--border) !important;
@@ -836,7 +838,7 @@ body.light-mode .custom-tooltip {
     background: rgba(255, 255, 255, 0.06);
     border: 1px solid var(--border);
     padding: 0 10px !important;
-    border-radius: 8px;
+    border-radius: var(--radius-sm, 2px);
     font-weight: 600;
     transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, transform 0.05s ease;
     display: inline-flex !important;
@@ -870,7 +872,7 @@ body.light-mode .custom-tooltip {
     width: 280px;
     background: var(--bg-panel);
     border: 1px solid var(--border);
-    border-radius: 12px;
+    border-radius: var(--radius-md, 4px);
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
     backdrop-filter: blur(12px);
     -webkit-backdrop-filter: blur(12px);
@@ -1019,7 +1021,7 @@ body.light-mode .custom-tooltip {
 
     .mode-toggle .mode-btn.active {
         display: flex !important;
-        border-radius: 6px !important;
+        border-radius: var(--radius-sm, 2px) !important;
     }
 
     /* Float settings menu below the top bar with a gap */
@@ -1041,9 +1043,9 @@ body.light-mode .custom-tooltip {
         width: 260px !important;
         max-width: calc(100vw - 20px) !important;
         border-top-left-radius: 0px !important;
-        border-top-right-radius: 12px !important;
-        border-bottom-left-radius: 12px !important;
-        border-bottom-right-radius: 12px !important;
+        border-top-right-radius: var(--radius-md, 4px) !important;
+        border-bottom-left-radius: var(--radius-md, 4px) !important;
+        border-bottom-right-radius: var(--radius-md, 4px) !important;
     }
 
     /* Rebuild the sidebar as a clean vertical pill */
@@ -1060,7 +1062,7 @@ body.light-mode .custom-tooltip {
         box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5) !important;
         z-index: 2999 !important;
         /* Under settings menu (3000) */
-        border-radius: 8px !important;
+        border-radius: var(--radius-sm, 2px) !important;
         border: 1px solid var(--border) !important;
         gap: 0 !important;
     }
@@ -1074,13 +1076,13 @@ body.light-mode .custom-tooltip {
     }
 
     #main-actions .icon-btn:first-child {
-        border-top-left-radius: 8px !important;
-        border-top-right-radius: 8px !important;
+        border-top-left-radius: var(--radius-sm, 2px) !important;
+        border-top-right-radius: var(--radius-sm, 2px) !important;
     }
 
     #main-actions .icon-btn:last-child {
-        border-bottom-left-radius: 8px !important;
-        border-bottom-right-radius: 8px !important;
+        border-bottom-left-radius: var(--radius-sm, 2px) !important;
+        border-bottom-right-radius: var(--radius-sm, 2px) !important;
     }
 
     #elevation-panel {
@@ -1090,7 +1092,7 @@ body.light-mode .custom-tooltip {
         top: auto !important;
         width: 100% !important;
         height: 240px !important;
-        border-radius: 12px 12px 0 0 !important;
+        border-radius: var(--radius-md, 4px) var(--radius-md, 4px) 0 0 !important;
         border-bottom: none !important;
         transform: none !important;
         padding-bottom: calc(env(safe-area-inset-bottom) * 0.5) !important;
@@ -1119,7 +1121,7 @@ body.light-mode .custom-tooltip {
         height: 100% !important;
         display: flex;
         flex-direction: column;
-        border-radius: 12px 12px 0 0 !important;
+        border-radius: var(--radius-md, 4px) var(--radius-md, 4px) 0 0 !important;
     }
 
     #elevation-panel .window-content {
@@ -1185,7 +1187,7 @@ body.light-mode .custom-tooltip {
         color: var(--text-main) !important;
         padding: 0 36px 0 12px !important;
         height: 40px !important;
-        border-radius: 8px !important;
+        border-radius: var(--radius-sm, 2px) !important;
         font-size: 1rem !important;
         outline: none !important;
         transition: border-color 0.2s !important;
@@ -1218,7 +1220,7 @@ body.light-mode .custom-tooltip {
     .mobile-search-results .search-result-row {
         padding: 14px 12px !important;
         background: rgba(255, 255, 255, 0.03) !important;
-        border-radius: 8px !important;
+        border-radius: var(--radius-sm, 2px) !important;
         font-size: 0.95rem !important;
         color: var(--text-main) !important;
         cursor: pointer !important;
@@ -1304,7 +1306,7 @@ body.right-click-dragging #map canvas {
     background: rgba(20, 20, 30, 0.85);
     color: #ffffff;
     padding: 5px 10px;
-    border-radius: 8px;
+    border-radius: var(--radius-sm, 2px);
     font-size: 0.78rem;
     font-family: Inter, sans-serif;
     white-space: nowrap;
@@ -1338,7 +1340,7 @@ body.light-mode #hover-info {
     color: var(--text-main);
     border: 1px solid var(--border);
     padding: 12px 22px;
-    border-radius: 10px;
+    border-radius: var(--radius-md, 4px);
     font-family: 'Inter', sans-serif;
     font-size: 13px;
     font-weight: 500;
@@ -1425,7 +1427,7 @@ body.light-mode #hover-info {
     background: rgba(239, 68, 68, 0.15);
     color: #f87171;
     border: 1px solid rgba(239, 68, 68, 0.3);
-    border-radius: 8px;
+    border-radius: var(--radius-sm, 2px);
     font-size: 0.85rem;
     font-weight: 500;
     cursor: pointer;

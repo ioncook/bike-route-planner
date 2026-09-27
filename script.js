@@ -6167,7 +6167,7 @@ function renderKeybindings() {
         let displayKey = currentKeybindings[action] ? currentKeybindings[action].toUpperCase() : 'NONE';
         if (displayKey === ' ') displayKey = 'SPACE';
         keyBtn.textContent = displayKey;
-        keyBtn.style.cssText = 'min-width:85px; background:var(--btn-bg); border:1px solid var(--border); color:var(--primary); padding:8px 12px; border-radius:8px; font-size:0.75rem; font-family:monospace; font-weight:600; cursor:pointer; transition: all 0.2s;';
+        keyBtn.style.cssText = 'min-width:85px; background:var(--btn-bg); border:1px solid var(--border); color:var(--primary); padding:8px 12px; border-radius:var(--radius-sm, 2px); font-size:0.75rem; font-family:monospace; font-weight:600; cursor:pointer; transition: all 0.2s;';
         if (!currentKeybindings[action]) {
             keyBtn.style.color = 'var(--text-muted)';
             keyBtn.style.opacity = '0.6';
