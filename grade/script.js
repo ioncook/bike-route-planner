@@ -171,12 +171,46 @@ function getSegmentMidpoint(coordinates) {
     }
 }
 
-// HSL color interpolator for tooltip grades matching map colors
+// Color interpolator for tooltip grades matching map colors
+// Rich deep green for <1%, lime green at 1.5-2%, yellow 2-5%, orange 5-9%, maxing out at 15% with deep red
 function getGradeColor(grade) {
-    const g = Math.min(Math.max(grade, 0), 20);
-    const ratio = g / 20;
-    const hue = 142 - ratio * 142; // green (142) to red (0)
-    return `hsl(${hue}, 80%, 45%)`;
+    const g = Math.max(parseFloat(grade) || 0, 0);
+
+    // Color stops: [grade, [r, g, b]]
+    const stops = [
+        [0,   [21, 128, 61]],   // Rich deep forest green (#15803d)
+        [0.8, [22, 163, 74]],   // Solid green (#16a34a)
+        [1.2, [101, 163, 13]],  // Green-lime transition (#65a30d)
+        [2,   [163, 230, 53]],  // Lime green (#a3e635)
+        [3.5, [234, 179, 8]],   // Yellow (#eab308)
+        [5,   [245, 158, 11]],  // Warm yellow / amber (#f59e0b)
+        [7,   [249, 115, 22]],  // Bright orange (#f97316)
+        [9,   [234, 88, 12]],   // Deep orange (#ea580c)
+        [12,  [220, 38, 38]],   // Red (#dc2626)
+        [15,  [153, 27, 27]]    // Deep red (#991b1b)
+    ];
+
+    if (g <= stops[0][0]) {
+        const c = stops[0][1];
+        return `rgb(${c[0]}, ${c[1]}, ${c[2]})`;
+    }
+    if (g >= stops[stops.length - 1][0]) {
+        const c = stops[stops.length - 1][1];
+        return `rgb(${c[0]}, ${c[1]}, ${c[2]})`;
+    }
+
+    for (let i = 0; i < stops.length - 1; i++) {
+        const [g0, c0] = stops[i];
+        const [g1, c1] = stops[i + 1];
+        if (g >= g0 && g <= g1) {
+            const t = (g - g0) / (g1 - g0);
+            const r = Math.round(c0[0] + t * (c1[0] - c0[0]));
+            const gr = Math.round(c0[1] + t * (c1[1] - c0[1]));
+            const b = Math.round(c0[2] + t * (c1[2] - c0[2]));
+            return `rgb(${r}, ${gr}, ${b})`;
+        }
+    }
+    return 'rgb(153, 27, 27)';
 }
 
 // Perpendicular distance squared from point (px, py) to line segment (x1, y1) - (x2, y2)
@@ -383,7 +417,18 @@ function setupGradeLayers() {
                 'line-opacity': 0
             },
             filter: [
-                '!in', 'class', 'footway', 'pedestrian', 'steps', 'construction', 'service', 'track', 'path', 'bridleway'
+                'all',
+                // Exclude rail/transit, ferry, aerialway, and raceway
+                ['!in', 'class', 'rail', 'transit', 'subway', 'ferry', 'aerialway', 'raceway'],
+                // Exclude pedestrian-only or foot-only ways and construction, but ALLOW cycleways/bike paths
+                [
+                    'any',
+                    // Allow all standard rideable road classes
+                    ['in', 'class', 'motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'minor', 'residential', 'living_street', 'unclassified'],
+                    // Allow designated cycleways or paths with bicycle access
+                    ['==', 'subclass', 'cycleway'],
+                    ['in', 'bicycle', 'yes', 'designated', 'permissive']
+                ]
             ]
         });
     }
@@ -425,9 +470,16 @@ function setupGradeLayers() {
                 ],
                 'line-color': [
                     'interpolate', ['linear'], ['get', 'grade'],
-                    0, '#22c55e',      // flat (green)
-                    10, '#eab308',     // 10% (yellow)
-                    20, '#ef4444'      // 20%+ (red)
+                    0, '#15803d',      // 0%: Rich deep forest green
+                    0.8, '#16a34a',    // 0.8%: Solid green (keeps <1% strongly green)
+                    1.2, '#65a30d',    // 1.2%: Green-lime transition
+                    2, '#a3e635',      // 2%: Lime green
+                    3.5, '#eab308',    // 3.5%: Yellow
+                    5, '#f59e0b',      // 5%: Warm yellow / amber
+                    7, '#f97316',      // 7%: Bright orange
+                    9, '#ea580c',      // 9%: Deep orange
+                    12, '#dc2626',     // 12%: Red
+                    15, '#991b1b'      // 15%+: Deep red
                 ],
                 'line-opacity': opacityVal,
                 'line-opacity-transition': { duration: 0 }
@@ -729,6 +781,11 @@ async function fetchAndProcessViewport() {
         const uniqueRoads = new Map();
 
         for (const f of features) {
+            const props = f.properties || {};
+            // Safety guard: reject any rail, subway, transit, or train features
+            if (props.class === 'rail' || props.class === 'transit' || props.subclass === 'subway' || props.subclass === 'rail' || props.subclass === 'tram') {
+                continue;
+            }
             if (f.geometry.type === 'LineString') {
                 const coords = f.geometry.coordinates;
                 if (!coords || coords.length < 2) continue;
@@ -1002,5 +1059,116 @@ if (document.getElementById('hillshade-select')) {
 const storedExaggeration = localStorage.getItem('route_exaggeration') || '2.0';
 if (document.getElementById('terrain-exaggeration')) {
     document.getElementById('terrain-exaggeration').value = storedExaggeration;
+}
+
+// User location marker & tracking
+let userLocationMarker = null;
+let userLocationWatchId = null;
+
+function updateUserLocationPin() {
+    const showCheck = document.getElementById('show-location-check');
+    const isEnabled = showCheck ? showCheck.checked : false;
+    localStorage.setItem('route_show_location_check', isEnabled);
+
+    if (!isEnabled) {
+        if (userLocationWatchId !== null) {
+            navigator.geolocation.clearWatch(userLocationWatchId);
+            userLocationWatchId = null;
+        }
+        if (userLocationMarker) {
+            userLocationMarker.remove();
+            userLocationMarker = null;
+        }
+        return;
+    }
+
+    if (!("geolocation" in navigator)) return;
+
+    if (userLocationWatchId === null) {
+        userLocationWatchId = navigator.geolocation.watchPosition(
+            (pos) => {
+                const lngLat = [pos.coords.longitude, pos.coords.latitude];
+                if (!userLocationMarker) {
+                    const el = document.createElement('div');
+                    el.style.width = '20px';
+                    el.style.height = '20px';
+                    el.style.backgroundColor = '#3b82f6';
+                    el.style.border = '3px solid #ffffff';
+                    el.style.borderRadius = '50%';
+                    el.style.boxShadow = '0 0 6px rgba(0,0,0,0.4), 0 0 0 4px rgba(59, 130, 246, 0.4)';
+                    el.style.cursor = 'default';
+                    userLocationMarker = new maplibregl.Marker({ element: el, anchor: 'center' })
+                        .setLngLat(lngLat)
+                        .addTo(map);
+                } else {
+                    userLocationMarker.setLngLat(lngLat);
+                }
+            },
+            () => {},
+            { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+        );
+    }
+}
+
+function requestLocation(fly = true) {
+    if (userLocationMarker) {
+        const lngLat = userLocationMarker.getLngLat();
+        const options = {
+            center: [lngLat.lng, lngLat.lat],
+            zoom: 14,
+            speed: 2.8,
+            curve: 1.4
+        };
+        if (fly) {
+            map.flyTo(options);
+        } else {
+            map.jumpTo({ center: options.center, zoom: options.zoom });
+        }
+    }
+
+    if (!("geolocation" in navigator)) return;
+
+    navigator.geolocation.getCurrentPosition(
+        (pos) => {
+            const freshLng = pos.coords.longitude;
+            const freshLat = pos.coords.latitude;
+            const options = {
+                center: [freshLng, freshLat],
+                zoom: 14,
+                speed: 2.8,
+                curve: 1.4
+            };
+
+            // Ensure dot is shown when centering
+            const showCheck = document.getElementById('show-location-check');
+            if (showCheck && !showCheck.checked) {
+                showCheck.checked = true;
+                updateUserLocationPin();
+            }
+
+            if (userLocationMarker) {
+                userLocationMarker.setLngLat([freshLng, freshLat]);
+            }
+            if (fly) {
+                map.flyTo(options);
+            } else {
+                map.jumpTo({ center: options.center, zoom: options.zoom });
+            }
+        },
+        (err) => {
+            console.warn("Geolocation failed or denied:", err);
+        },
+        { enableHighAccuracy: true, timeout: 8000, maximumAge: 10000 }
+    );
+}
+
+// Hook up current location button & setting
+document.getElementById('current-location-btn')?.addEventListener('click', () => requestLocation(true));
+const locationCheck = document.getElementById('show-location-check');
+if (locationCheck) {
+    const savedLoc = localStorage.getItem('route_show_location_check');
+    locationCheck.checked = savedLoc !== 'false'; // default on if supported
+    locationCheck.addEventListener('change', updateUserLocationPin);
+    updateUserLocationPin();
 }
 

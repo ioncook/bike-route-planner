@@ -7,7 +7,7 @@
         content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>Grade Map - Bike Route Planner</title>
     <link rel="icon" href="../favicon.png">
-    <link rel="stylesheet" href="../style.css?v=23">
+    <link rel="stylesheet" href="../style.css?v=30">
     <!-- MapLibre CSS -->
     <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@^5.0.0/dist/maplibre-gl.css" />
     <!-- Google Fonts -->
@@ -91,7 +91,7 @@
 
         .legend-gradient {
             height: 10px;
-            background: linear-gradient(to right, #22c55e 0%, #eab308 50%, #ef4444 100%);
+            background: linear-gradient(to right, #15803d 0%, #16a34a 5.3%, #65a30d 8%, #a3e635 13.3%, #eab308 23.3%, #f59e0b 33.3%, #f97316 46.7%, #ea580c 60%, #dc2626 80%, #991b1b 100%);
             border-radius: var(--radius-sm, 3px);
         }
 
@@ -292,7 +292,13 @@
                             <input type="number" id="terrain-exaggeration" step="0.1" min="0" max="20" value="2.0"
                                 style="width: 60px; background:var(--bg-panel); color:var(--text-main); border:1px solid var(--border); border-radius:var(--radius-sm, 2px); padding:2px 5px;">
                         </div>
-
+                        <div class="setting-row">
+                            <span>Show My Location</span>
+                            <label class="switch">
+                                <input type="checkbox" id="show-location-check">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -314,9 +320,11 @@
                 <div class="legend-title">Slope Grade</div>
                 <div class="legend-gradient"></div>
                 <div class="legend-labels">
-                    <span>Flat (0%)</span>
-                    <span>10%</span>
-                    <span>20%+</span>
+                    <span>0%</span>
+                    <span>2%</span>
+                    <span>5%</span>
+                    <span>9%</span>
+                    <span>15%+</span>
                 </div>
             </div>
         </main>
@@ -324,7 +332,7 @@
 
     <!-- MapLibre JS -->
     <script src="https://unpkg.com/maplibre-gl@^5.0.0/dist/maplibre-gl.js"></script>
-    <script src="script.js?v=16"></script>
+    <script src="script.js?v=22"></script>
     <script>
         // Inline settings toggler helper matching style.css logic
         function toggleSettings(e) {

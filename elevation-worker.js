@@ -100,32 +100,49 @@ function densifyCoords(coords, maxSpacing = 15.0) {
 }
 
 function smoothElevationsForWay(elevations, coords) {
-    if (elevations.length < 3) return elevations;
+    if (elevations.length < 2) return elevations;
     const smoothed = [...elevations];
+
+    // Pass 1: Remove single-point spikes where a point jumps relative to both neighbors
     for (let pass = 0; pass < 2; pass++) {
-        for (let i = 1; i < elevations.length - 1; i++) {
+        for (let i = 1; i < smoothed.length - 1; i++) {
             const v = smoothed[i], prev = smoothed[i - 1], next = smoothed[i + 1];
             if (v == null || prev == null || next == null) continue;
             const d1 = getDistance(coords[i - 1], coords[i]);
             const d2 = getDistance(coords[i], coords[i + 1]);
             const rise1 = Math.abs(v - prev);
             const rise2 = Math.abs(v - next);
-            if (d1 > 0 && d2 > 0 && (rise1 / d1 > 0.4) && (rise2 / d2 > 0.4)) {
+            if (d1 > 0 && d2 > 0 && (rise1 / d1 > 0.25) && (rise2 / d2 > 0.25)) {
                 smoothed[i] = (prev + next) / 2;
             }
         }
     }
+
+    // Pass 2: Clamp single-step cliff artifacts (e.g. edge-of-tile or step jumps where step > 25% gradient)
+    for (let i = 1; i < smoothed.length; i++) {
+        if (smoothed[i] == null || smoothed[i - 1] == null) continue;
+        const d = getDistance(coords[i - 1], coords[i]);
+        if (d > 0) {
+            const maxDelta = d * 0.25; // max 25% road gradient between consecutive densified points
+            const delta = smoothed[i] - smoothed[i - 1];
+            if (Math.abs(delta) > maxDelta) {
+                smoothed[i] = smoothed[i - 1] + Math.sign(delta) * maxDelta;
+            }
+        }
+    }
+
+    // Pass 3: Windowed moving average
     const result = [];
-    for (let i = 0; i < elevations.length; i++) {
+    for (let i = 0; i < smoothed.length; i++) {
         let sum = 0, count = 0;
         for (let k = -2; k <= 2; k++) {
-            const idx = Math.min(Math.max(i + k, 0), elevations.length - 1);
+            const idx = Math.min(Math.max(i + k, 0), smoothed.length - 1);
             if (smoothed[idx] != null) {
                 sum += smoothed[idx];
                 count++;
             }
         }
-        result.push(count > 0 ? sum / count : elevations[i]);
+        result.push(count > 0 ? sum / count : smoothed[i]);
     }
     return result;
 }
@@ -237,14 +254,14 @@ self.onmessage = async (e) => {
             }
         }
 
-        // Determine tiles needed
+        // Determine tiles needed - ensure both primary tile and all potential bilinear neighbors are pre-fetched
         const tilesNeeded = new Set();
         for (const coord of uniqueCoordsArray) {
             const { tileX, tileY, pxX, pxY } = lngLatToTilePixel(coord[0], coord[1], zoom);
             tilesNeeded.add(`${zoom}/${tileX}/${tileY}`);
-            if (pxX > 254) tilesNeeded.add(`${zoom}/${tileX + 1}/${tileY}`);
-            if (pxY > 254) tilesNeeded.add(`${zoom}/${tileX}/${tileY + 1}`);
-            if (pxX > 254 && pxY > 254) tilesNeeded.add(`${zoom}/${tileX + 1}/${tileY + 1}`);
+            if (pxX >= 254) tilesNeeded.add(`${zoom}/${tileX + 1}/${tileY}`);
+            if (pxY >= 254) tilesNeeded.add(`${zoom}/${tileX}/${tileY + 1}`);
+            if (pxX >= 254 && pxY >= 254) tilesNeeded.add(`${zoom}/${tileX + 1}/${tileY + 1}`);
         }
 
         // Fetch tiles and cache
@@ -318,8 +335,8 @@ self.onmessage = async (e) => {
 
             for (const seg of segments) {
                 const baseline = Math.max(60.0, seg.distance);
-                const dStart = seg.centerDist - baseline / 2;
-                const dEnd = seg.centerDist + baseline / 2;
+                const dStart = Math.max(0, seg.centerDist - baseline / 2);
+                const dEnd = Math.min(totalDist, seg.centerDist + baseline / 2);
                 const coordStart = getPointAtDistInWorker(dStart);
                 const coordEnd = getPointAtDistInWorker(dEnd);
 
@@ -328,44 +345,28 @@ self.onmessage = async (e) => {
 
                 if (elevStart !== null && elevEnd !== null) {
                     const rise = Math.abs(elevEnd - elevStart);
-                    const actualRun = Math.max(50.0, Math.min(dEnd, totalDist) - Math.max(0, dStart));
+                    const actualRun = Math.max(50.0, dEnd - dStart);
                     seg.gradePercent = (rise / actualRun) * 100;
                 } else {
                     seg.gradePercent = 0;
                 }
             }
 
-            // Calculate overall average grade for the way using first/last non-null elevations
-            let firstElev = null;
-            let lastElev = null;
-            for (let i = 0; i < smoothedElevs.length; i++) {
-                if (smoothedElevs[i] !== null) {
-                    firstElev = smoothedElevs[i];
-                    break;
-                }
-            }
-            for (let i = smoothedElevs.length - 1; i >= 0; i--) {
-                if (smoothedElevs[i] !== null) {
-                    lastElev = smoothedElevs[i];
-                    break;
-                }
-            }
-            const overallGrade = (firstElev !== null && lastElev !== null && totalDist > 0)
-                ? (Math.abs(lastElev - firstElev) / totalDist) * 100
-                : 0;
+            // Calculate robust overall grade using median of segments
+            const validGrades = segments.map(s => s.gradePercent).filter(g => Number.isFinite(g) && g >= 0).sort((a, b) => a - b);
+            const medianGrade = validGrades.length > 0 ? validGrades[Math.floor(validGrades.length / 2)] : 0;
+            const threshold = Math.max(medianGrade * 2.2 + 2.5, 8.0);
 
-            const threshold = Math.max(overallGrade * 2.2 + 2.5, 4.5);
-
-            // Apply neighbor-grade adoption threshold checks
+            // Pass 1: Replace any anomalous segments where grade exceeds threshold or is physically improbable (>25%)
             for (let i = 0; i < segments.length; i++) {
                 const seg = segments[i];
-                if (seg.gradePercent > threshold) {
+                if (seg.gradePercent > threshold || seg.gradePercent > 25.0) {
                     let leftGrade = null;
-                    if (i > 0 && segments[i - 1].gradePercent <= threshold) {
+                    if (i > 0 && segments[i - 1].gradePercent <= threshold && segments[i - 1].gradePercent <= 25.0) {
                         leftGrade = segments[i - 1].gradePercent;
                     }
                     let rightGrade = null;
-                    if (i < segments.length - 1 && segments[i + 1].gradePercent <= threshold) {
+                    if (i < segments.length - 1 && segments[i + 1].gradePercent <= threshold && segments[i + 1].gradePercent <= 25.0) {
                         rightGrade = segments[i + 1].gradePercent;
                     }
 
@@ -376,10 +377,12 @@ self.onmessage = async (e) => {
                     } else if (rightGrade !== null) {
                         seg.gradePercent = rightGrade;
                     } else {
-                        seg.gradePercent = overallGrade;
+                        seg.gradePercent = Math.min(medianGrade, 25.0);
                     }
                 }
-                seg.grade = Math.min(seg.gradePercent, 20);
+                // Cap gradePercent to 25% (very steep road maximum)
+                seg.gradePercent = Math.min(seg.gradePercent, 25.0);
+                seg.grade = Math.min(seg.gradePercent, 15);
 
                 const segElevStart = getElevationAtPoint(seg.coordinates[0], wayItem.denseCoords, smoothedElevs);
                 const segElevEnd = getElevationAtPoint(seg.coordinates[seg.coordinates.length - 1], wayItem.denseCoords, smoothedElevs);
@@ -404,9 +407,9 @@ self.onmessage = async (e) => {
     for (const coord of coords) {
         const { tileX, tileY, pxX, pxY } = lngLatToTilePixel(coord[0], coord[1], zoom);
         tilesNeeded.add(`${zoom}/${tileX}/${tileY}`);
-        if (pxX > 254) tilesNeeded.add(`${zoom}/${tileX + 1}/${tileY}`);
-        if (pxY > 254) tilesNeeded.add(`${zoom}/${tileX}/${tileY + 1}`);
-        if (pxX > 254 && pxY > 254) tilesNeeded.add(`${zoom}/${tileX + 1}/${tileY + 1}`);
+        if (pxX >= 254) tilesNeeded.add(`${zoom}/${tileX + 1}/${tileY}`);
+        if (pxY >= 254) tilesNeeded.add(`${zoom}/${tileX}/${tileY + 1}`);
+        if (pxX >= 254 && pxY >= 254) tilesNeeded.add(`${zoom}/${tileX + 1}/${tileY + 1}`);
     }
 
     const localCache = new Map();

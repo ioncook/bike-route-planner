@@ -316,7 +316,8 @@ body {
 }
 
 .icon-btn-group.active {
-    border-color: var(--primary);
+    border-color: var(--primary) !important;
+    box-shadow: 0 0 0 0.5px var(--primary);
 }
 
 .icon-btn-group:has(.search-wrapper).active {
@@ -430,7 +431,6 @@ body.light-mode #search-dropdown {
 }
 
 /* Settings Menu Styles */
-/* Mode Switch */
 .mode-toggle {
     display: flex;
     align-items: center;
@@ -860,6 +860,7 @@ body.light-mode .custom-tooltip {
 
 #total-distance.active {
     border-color: var(--primary) !important;
+    box-shadow: 0 0 0 0.5px var(--primary);
     color: var(--primary) !important;
     background: var(--bg-panel) !important;
 }
@@ -1001,14 +1002,54 @@ body.light-mode .custom-tooltip {
         align-items: center !important;
     }
 
-    /* Ensure all wrappers and button groups retain their 32px height */
-    .settings-dropdown,
-    .icon-btn-group:not(#main-actions),
+    .settings-dropdown {
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        height: 32px !important;
+        width: 32px !important;
+        min-width: 32px !important;
+        box-sizing: border-box !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: none !important;
+        background: transparent !important;
+    }
+
+    .icon-btn-group:not(#main-actions) {
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        height: 32px !important;
+        width: 32px !important;
+        min-width: 32px !important;
+        box-sizing: border-box !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: 1px solid var(--border) !important;
+    }
+
     .mode-toggle {
         display: flex !important;
         align-items: center !important;
+        justify-content: center !important;
         height: 32px !important;
+        width: 32px !important;
+        min-width: 32px !important;
+        box-sizing: border-box !important;
         margin: 0 !important;
+        padding: 0 !important;
+        border: none !important;
+        background: transparent !important;
+    }
+
+    .icon-btn-group:not(#main-actions) .icon-btn {
+        width: 100% !important;
+        height: 100% !important;
+        padding: 0 !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
     }
 
     .mode-toggle .mode-btn {
@@ -1021,31 +1062,36 @@ body.light-mode .custom-tooltip {
 
     .mode-toggle .mode-btn.active {
         display: flex !important;
+        width: 100% !important;
+        height: 100% !important;
+        box-sizing: border-box !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        align-items: center !important;
+        justify-content: center !important;
         border-radius: var(--radius-sm, 2px) !important;
+        box-shadow: none !important;
     }
 
     /* Float settings menu below the top bar with a gap */
     .settings-content {
         position: fixed !important;
-        top: var(--top-bar-height, 48px) !important;
+        top: calc(var(--top-bar-height, 48px) + 10px) !important;
         right: 10px !important;
         left: auto !important;
         width: 280px !important;
         max-width: calc(100vw - 20px) !important;
-        max-height: 80vh !important;
+        max-height: calc(80vh - 10px) !important;
     }
 
     .stats-panel {
         position: fixed !important;
-        top: var(--top-bar-height, 48px) !important;
-        left: 0px !important;
+        top: calc(var(--top-bar-height, 48px) + 10px) !important;
+        left: 10px !important;
         right: auto !important;
         width: 260px !important;
         max-width: calc(100vw - 20px) !important;
-        border-top-left-radius: 0px !important;
-        border-top-right-radius: var(--radius-md, 4px) !important;
-        border-bottom-left-radius: var(--radius-md, 4px) !important;
-        border-bottom-right-radius: var(--radius-md, 4px) !important;
+        border-radius: var(--radius-md, 4px) !important;
     }
 
     /* Rebuild the sidebar as a clean vertical pill */
