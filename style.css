@@ -29,13 +29,39 @@
 }
 
 body.light-mode {
+    --primary: #2563eb;
+    --primary-hover: #1d4ed8;
+    --danger: #dc2626;
     --bg-dark: #ffffff;
     --bg-panel: #ffffff;
-    --header-bg: #ffffff;
-    --text-main: #222222;
-    --text-muted: #666666;
-    --border: #cccccc;
-    --btn-bg: #e5e5e5;
+    --header-bg: #f1f5f9;
+    --text-main: #0f172a;
+    --text-muted: #334155;
+    --border: #94a3b8;
+    --btn-bg: #e2e8f0;
+}
+
+body.light-mode #elevation-panel .window-header {
+    background: #f1f5f9;
+    border-bottom: 1px solid var(--border);
+}
+
+body.light-mode .icon-btn-group-danger {
+    background: rgba(220, 38, 38, 0.2) !important;
+    border-color: rgba(220, 38, 38, 0.4) !important;
+}
+
+body.light-mode .icon-btn-group-danger .icon-btn {
+    color: #dc2626 !important;
+    opacity: 1 !important;
+}
+
+body.light-mode .text-success {
+    color: #16a34a !important;
+}
+
+body.light-mode .text-danger {
+    color: #dc2626 !important;
 }
 
 #map,
@@ -787,7 +813,7 @@ body.light-mode .custom-tooltip {
     background: rgba(255, 255, 255, 0.95);
     color: #111;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-    border: 1px solid #ddd;
+    border: 1px solid var(--border);
 }
 
 /* Weather and Location Popup */
