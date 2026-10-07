@@ -7,7 +7,7 @@
         content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>Bike Route Planner</title>
     <link rel="icon" href="favicon.png">
-    <link rel="stylesheet" href="style.css?v=151">
+    <link rel="stylesheet" href="style.css?v=152">
     <script>
         if (localStorage.getItem('route_theme') === 'light') {
             document.documentElement.classList.add('light-mode');
@@ -157,7 +157,7 @@
                         </svg>
                     </button>
                     <div class="icon-btn-divider"></div>
-                    <button id="gpx-import-btn" class="icon-btn" title="Import GPX" aria-label="Import GPX">
+                    <button id="gpx-import-btn" class="icon-btn" title="Import Route" aria-label="Import Route">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
@@ -165,7 +165,7 @@
                             <line x1="12" y1="3" x2="12" y2="15" />
                         </svg>
                     </button>
-                    <button id="gpx-download-btn" class="icon-btn" title="Download GPX" aria-label="Download GPX">
+                    <button id="gpx-download-btn" class="icon-btn" title="Download Route" aria-label="Download Route">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
@@ -175,7 +175,8 @@
                     </button>
                 </div>
 
-                <input type="file" id="gpx-file-input" accept=".gpx" style="display:none;">
+                <input type="file" id="gpx-file-input" accept=".gpx,.fit,.tcx,.kml,.geojson,.json"
+                    style="display:none;">
                 <div class="mode-toggle">
                     <button id="mode-bike" class="mode-btn active" title="Cycling (Paved routes)">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -290,6 +291,16 @@
                                 <option value="circle">Circles</option>
                                 <option value="pin">Pins</option>
                                 <option value="flag">Flags</option>
+                            </select>
+                        </div>
+                        <div class="setting-row">
+                            <span>Export Format</span>
+                            <select id="export-format-select">
+                                <option value="gpx">GPX (.gpx)</option>
+                                <option value="fit">Garmin FIT (.fit)</option>
+                                <option value="tcx">TCX (.tcx)</option>
+                                <option value="kml">KML (.kml)</option>
+                                <option value="geojson">GeoJSON (.geojson)</option>
                             </select>
                         </div>
                         <div class="setting-row">

@@ -3988,98 +3988,549 @@ document.getElementById('units').addEventListener('change', (e) => {
 
 
 
-// GPX Import: supports track (trkpt) and route/waypoint (rtept, wpt) formats
-function importGPX(file) {
-    const reader = new FileReader();
-    reader.onload = async e => {
-        try {
-            const xml = new DOMParser().parseFromString(e.target.result, 'application/xml');
-            const trkpts = [...xml.querySelectorAll('trkpt')];
-            const rtepts = [...xml.querySelectorAll('rtept')];
-            const wpts = [...xml.querySelectorAll('wpt')];
+// ==========================================
+// Multi-Format Route Import & Export Engine
+// Supports GPX, FIT (.fit), TCX (.tcx), KML (.kml), GeoJSON (.geojson/.json)
+// ==========================================
 
-            // Clear current route
-            waypoints = [];
-            markers.forEach(m => m.remove());
-            markers = [];
-            segmentModes = [];
-            segmentGPXPaths = [];
-            currentRouteGeoJSON = null;
+// Garmin FIT 16-entry CRC table
+const FIT_CRC_TABLE = [
+    0x0000, 0xCC01, 0xD801, 0x1400, 0xF001, 0x3C00, 0x2800, 0xE401,
+    0xA001, 0x6C00, 0x7800, 0xB401, 0x5000, 0x9C01, 0x8801, 0x4400
+];
 
-            if (trkpts.length > 0) {
-                // GPS track — use coordinates directly, place markers at start/end only
-                const coords = trkpts
-                    .map(pt => [parseFloat(pt.getAttribute('lon')), parseFloat(pt.getAttribute('lat'))])
-                    .filter(c => !isNaN(c[0]) && !isNaN(c[1]));
-                if (coords.length < 2) { alert('GPX track has fewer than 2 valid points.'); return; }
-
-                createMarker({ lng: coords[0][0], lat: coords[0][1] });
-                createMarker({ lng: coords[coords.length - 1][0], lat: coords[coords.length - 1][1] });
-
-                // Set segment mode to GPX and store coordinates in segmentGPXPaths
-                segmentModes = ['gpx'];
-                segmentGPXPaths = [coords];
-
-                await updateRoute();
-
-                const bounds = new maplibregl.LngLatBounds();
-                coords.forEach(c => bounds.extend(c));
-                fitBoundsSmart(bounds, { maxZoom: 17, duration: 700 });
-            } else {
-                // Route/waypoints — create markers and route via OSRM / direct
-                const pts = rtepts.length > 0 ? rtepts : wpts;
-                if (pts.length < 2) { alert('GPX has fewer than 2 waypoints.'); return; }
-                pts.forEach(pt => {
-                    const lat = parseFloat(pt.getAttribute('lat'));
-                    const lng = parseFloat(pt.getAttribute('lon'));
-                    if (!isNaN(lat) && !isNaN(lng)) createMarker({ lng, lat });
-                });
-                updateRoute();
-            }
-        } catch (err) {
-            console.error('GPX import error:', err);
-            alert('Failed to parse GPX file. Make sure it is a valid .gpx file.');
-        }
-    };
-    reader.readAsText(file);
+function computeFitCRC(crc, byte) {
+    let tmp = FIT_CRC_TABLE[crc & 0xF];
+    crc = (crc >> 4) & 0x0FFF;
+    crc = crc ^ tmp ^ FIT_CRC_TABLE[byte & 0xF];
+    tmp = FIT_CRC_TABLE[crc & 0xF];
+    crc = (crc >> 4) & 0x0FFF;
+    crc = crc ^ tmp ^ FIT_CRC_TABLE[(byte >> 4) & 0xF];
+    return crc;
 }
 
-// GPX Export: download current route as a standard .gpx track file
-function downloadGPX() {
-    if (!currentRouteGeoJSON) { alert('No route to download.'); return; }
-    const coords = currentRouteGeoJSON.coordinates;
-    const chartPts = elevationChart?.data?.datasets?.[0]?.data;
+// Minimal binary FIT course decoder
+function parseFITRoute(buffer) {
+    const view = new DataView(buffer);
+    if (view.byteLength < 14) throw new Error('File is too short to be a FIT file.');
+    const headerSize = view.getUint8(0);
+    const tag = String.fromCharCode(view.getUint8(8), view.getUint8(9), view.getUint8(10), view.getUint8(11));
+    if (tag !== '.FIT') throw new Error('Invalid FIT header signature.');
 
-    const trkpts = coords.map((c, i) => {
-        let eleTag = '';
-        if (chartPts && chartPts.length > 1) {
-            const ratio = i / (coords.length - 1);
-            const ci = Math.round(ratio * (chartPts.length - 1));
-            const displayElev = chartPts[ci]?.y;
-            if (displayElev != null) {
-                // Convert display value back to metres
-                const elevM = currentUnits === 'imperial' ? displayElev / 3.28084 : displayElev;
-                eleTag = `\n        <ele>${elevM.toFixed(1)}</ele>`;
-            }
+    let offset = headerSize;
+    const dataEnd = headerSize + view.getUint32(4, true);
+    const localDefs = new Map();
+    const coords = [];
+
+    while (offset < dataEnd && offset < view.byteLength) {
+        const header = view.getUint8(offset++);
+        if ((header & 0x80) !== 0) {
+            // Compressed timestamp data message
+            const localNum = (header >> 5) & 0x03;
+            const def = localDefs.get(localNum);
+            if (!def) break;
+            offset += def.size;
+            continue;
         }
+
+        const isDefinition = (header & 0x40) !== 0;
+        const localNum = header & 0x0F;
+
+        if (isDefinition) {
+            const hasDevData = (header & 0x20) !== 0;
+            offset++; // reserved
+            const arch = view.getUint8(offset++);
+            const littleEndian = (arch === 0);
+            const globalMsgNum = view.getUint16(offset, littleEndian);
+            offset += 2;
+            const fieldCount = view.getUint8(offset++);
+            const fields = [];
+            let totalSize = 0;
+            for (let f = 0; f < fieldCount; f++) {
+                const fNum = view.getUint8(offset++);
+                const fSize = view.getUint8(offset++);
+                const fBase = view.getUint8(offset++);
+                fields.push({ num: fNum, size: fSize, base: fBase, offset: totalSize });
+                totalSize += fSize;
+            }
+            if (hasDevData) {
+                const devFieldCount = view.getUint8(offset++);
+                for (let d = 0; d < devFieldCount; d++) {
+                    offset += 2;
+                    const dSize = view.getUint8(offset++);
+                    totalSize += dSize;
+                }
+            }
+            localDefs.set(localNum, { globalMsgNum, littleEndian, fields, size: totalSize });
+        } else {
+            // Data message
+            const def = localDefs.get(localNum);
+            if (!def) break;
+            if (offset + def.size > view.byteLength) break;
+
+            if (def.globalMsgNum === 20) { // Record message
+                let lat = null;
+                let lon = null;
+                let ele = null;
+                for (const f of def.fields) {
+                    const fPos = offset + f.offset;
+                    if (f.num === 0 && f.size === 4) { // position_lat (sint32 semicircles)
+                        const val = view.getInt32(fPos, def.littleEndian);
+                        if (val !== 0x7FFFFFFF) lat = val * (180 / 2147483648);
+                    } else if (f.num === 1 && f.size === 4) { // position_long (sint32 semicircles)
+                        const val = view.getInt32(fPos, def.littleEndian);
+                        if (val !== 0x7FFFFFFF) lon = val * (180 / 2147483648);
+                    } else if (f.num === 2 && f.size === 2) { // altitude (uint16, 5/m - 500m)
+                        const val = view.getUint16(fPos, def.littleEndian);
+                        if (val !== 0xFFFF) ele = (val / 5) - 500;
+                    }
+                }
+                if (lat != null && lon != null && !isNaN(lat) && !isNaN(lon)) {
+                    coords.push(ele != null ? [lon, lat, ele] : [lon, lat]);
+                }
+            }
+            offset += def.size;
+        }
+    }
+    return coords;
+}
+
+// Garmin FIT Course builder
+function buildFITCourse(coords, elevations, courseName = 'Bike Route') {
+    const records = [];
+    const baseEpoch = Math.floor(Date.now() / 1000) - 631065600; // FIT Epoch (1989-12-31 00:00:00 UTC)
+    let cumulativeDistMeters = 0;
+
+    for (let i = 0; i < coords.length; i++) {
+        const c = coords[i];
+        if (i > 0) {
+            const prev = coords[i - 1];
+            cumulativeDistMeters += getSegmentDistanceMeters(prev[1], prev[0], c[1], c[0]);
+        }
+        const timeSec = baseEpoch + Math.round(cumulativeDistMeters / 6.0); // approx 21.6 km/h
+        const eleM = elevations?.[i] != null ? elevations[i] : (c[2] != null ? c[2] : 0);
+        records.push({
+            lon: c[0],
+            lat: c[1],
+            dist: cumulativeDistMeters,
+            ele: eleM,
+            time: timeSec
+        });
+    }
+
+    const payload = [];
+
+    // Definition Msg: File ID (Global 0, Local 0)
+    payload.push(
+        0x40, 0x00, 0x00, 0x00, 0x00, 0x04,
+        0, 1, 0x00,       // type: enum
+        1, 2, 0x84,       // manufacturer: uint16
+        2, 2, 0x84,       // product: uint16
+        4, 4, 0x86        // time_created: uint32
+    );
+    // Data Msg: File ID (Course = 6)
+    const fileIdData = new Uint8Array(9);
+    const fidView = new DataView(fileIdData.buffer);
+    fidView.setUint8(0, 6); // Course
+    fidView.setUint16(1, 1, true); // Garmin
+    fidView.setUint16(3, 1, true);
+    fidView.setUint32(5, baseEpoch, true);
+    payload.push(0x00, ...fileIdData);
+
+    // Definition Msg: Course (Global 31, Local 1)
+    payload.push(
+        0x41, 0x00, 0x00, 31, 0x00, 0x02,
+        4, 1, 0x00,       // sport: enum (2 = cycling)
+        5, 16, 0x07       // name: string 16 bytes
+    );
+    // Data Msg: Course
+    const courseData = new Uint8Array(17);
+    courseData[0] = 2; // Cycling
+    const enc = new TextEncoder().encode(courseName.slice(0, 15));
+    courseData.set(enc, 1);
+    payload.push(0x01, ...courseData);
+
+    // Definition Msg: Record (Global 20, Local 2)
+    payload.push(
+        0x42, 0x00, 0x00, 20, 0x00, 0x05,
+        253, 4, 0x86,     // timestamp: uint32
+        0, 4, 0x85,       // position_lat: sint32
+        1, 4, 0x85,       // position_long: sint32
+        2, 2, 0x84,       // altitude: uint16
+        5, 4, 0x86        // distance: uint32 (cm: meters * 100)
+    );
+
+    // Record Data messages
+    const recBuf = new Uint8Array(18);
+    const recView = new DataView(recBuf.buffer);
+    for (const r of records) {
+        payload.push(0x02);
+        recView.setUint32(0, r.time, true);
+        recView.setInt32(4, Math.round(r.lat * (2147483648 / 180)), true);
+        recView.setInt32(8, Math.round(r.lon * (2147483648 / 180)), true);
+        const altRaw = Math.max(0, Math.min(65534, Math.round((r.ele + 500) * 5)));
+        recView.setUint16(12, altRaw, true);
+        recView.setUint32(14, Math.round(r.dist * 100), true);
+        payload.push(...recBuf);
+    }
+
+    const dataBytes = new Uint8Array(payload);
+    const header = new Uint8Array(14);
+    const hView = new DataView(header.buffer);
+    hView.setUint8(0, 14);     // Header size
+    hView.setUint8(1, 0x20);   // Protocol 2.0
+    hView.setUint16(2, 2132, true); // Profile 21.32
+    hView.setUint32(4, dataBytes.length, true);
+    header[8] = 0x2E; header[9] = 0x46; header[10] = 0x49; header[11] = 0x54; // '.FIT'
+
+    // Compute header CRC
+    let hCrc = 0;
+    for (let i = 0; i < 12; i++) hCrc = computeFitCRC(hCrc, header[i]);
+    hView.setUint16(12, hCrc, true);
+
+    // Full file CRC
+    let fileCrc = 0;
+    for (let i = 0; i < header.length; i++) fileCrc = computeFitCRC(fileCrc, header[i]);
+    for (let i = 0; i < dataBytes.length; i++) fileCrc = computeFitCRC(fileCrc, dataBytes[i]);
+
+    const result = new Uint8Array(14 + dataBytes.length + 2);
+    result.set(header, 0);
+    result.set(dataBytes, 14);
+    const rView = new DataView(result.buffer);
+    rView.setUint16(14 + dataBytes.length, fileCrc, true);
+    return result;
+}
+
+function getSegmentDistanceMeters(lat1, lon1, lat2, lon2) {
+    const R = 6371000;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Extract elevation array matching coordinates
+function getRouteElevationArray(coords) {
+    const chartPts = elevationChart?.data?.datasets?.[0]?.data;
+    if (!chartPts || chartPts.length < 2) return null;
+    return coords.map((c, i) => {
+        const ratio = i / Math.max(1, coords.length - 1);
+        const ci = Math.round(ratio * (chartPts.length - 1));
+        const displayElev = chartPts[ci]?.y;
+        if (displayElev == null) return c[2] != null ? c[2] : 0;
+        return currentUnits === 'imperial' ? displayElev / 3.28084 : displayElev;
+    });
+}
+
+// Unified parser for all route file formats
+async function parseRouteData(file) {
+    const name = file.name.toLowerCase();
+    if (name.endsWith('.fit')) {
+        const buffer = await file.arrayBuffer();
+        const coords = parseFITRoute(buffer);
+        if (coords.length < 2) throw new Error('FIT file contains fewer than 2 coordinate points.');
+        return { type: 'track', coords };
+    }
+
+    const text = await file.text();
+
+    if (name.endsWith('.geojson') || name.endsWith('.json')) {
+        const json = JSON.parse(text);
+        const coords = [];
+        const extractCoords = obj => {
+            if (!obj) return;
+            if (obj.type === 'FeatureCollection' && Array.isArray(obj.features)) {
+                obj.features.forEach(extractCoords);
+            } else if (obj.type === 'Feature' && obj.geometry) {
+                extractCoords(obj.geometry);
+            } else if (obj.type === 'LineString' && Array.isArray(obj.coordinates)) {
+                coords.push(...obj.coordinates);
+            } else if (obj.type === 'MultiLineString' && Array.isArray(obj.coordinates)) {
+                obj.coordinates.forEach(ls => coords.push(...ls));
+            }
+        };
+        extractCoords(json);
+        const valid = coords.filter(c => Array.isArray(c) && !isNaN(c[0]) && !isNaN(c[1]));
+        if (valid.length < 2) throw new Error('GeoJSON does not contain a valid LineString with at least 2 points.');
+        return { type: 'track', coords: valid };
+    }
+
+    const xml = new DOMParser().parseFromString(text, 'application/xml');
+    const parserError = xml.querySelector('parsererror');
+    if (parserError && !name.endsWith('.kml') && !name.endsWith('.tcx')) {
+        throw new Error('XML parsing failed: ' + parserError.textContent);
+    }
+
+    // TCX Format
+    const trackpoints = [...xml.querySelectorAll('Trackpoint')];
+    if (trackpoints.length > 0) {
+        const coords = [];
+        trackpoints.forEach(tp => {
+            const latEl = tp.querySelector('LatitudeDegrees');
+            const lonEl = tp.querySelector('LongitudeDegrees');
+            const altEl = tp.querySelector('AltitudeMeters');
+            if (latEl && lonEl) {
+                const lat = parseFloat(latEl.textContent.trim());
+                const lon = parseFloat(lonEl.textContent.trim());
+                const ele = altEl ? parseFloat(altEl.textContent.trim()) : null;
+                if (!isNaN(lat) && !isNaN(lon)) {
+                    coords.push(ele != null && !isNaN(ele) ? [lon, lat, ele] : [lon, lat]);
+                }
+            }
+        });
+        if (coords.length >= 2) return { type: 'track', coords };
+    }
+
+    // KML Format
+    const coordNodes = [...xml.querySelectorAll('coordinates')];
+    if (coordNodes.length > 0) {
+        const coords = [];
+        coordNodes.forEach(node => {
+            const raw = node.textContent.trim().split(/\s+/);
+            raw.forEach(tuple => {
+                const parts = tuple.split(',').map(p => parseFloat(p.trim()));
+                if (parts.length >= 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+                    coords.push(parts.length >= 3 && !isNaN(parts[2]) ? [parts[0], parts[1], parts[2]] : [parts[0], parts[1]]);
+                }
+            });
+        });
+        if (coords.length >= 2) return { type: 'track', coords };
+    }
+
+    // GPX Tracks
+    const trkpts = [...xml.querySelectorAll('trkpt')];
+    if (trkpts.length > 0) {
+        const coords = trkpts
+            .map(pt => {
+                const lon = parseFloat(pt.getAttribute('lon'));
+                const lat = parseFloat(pt.getAttribute('lat'));
+                const eleEl = pt.querySelector('ele');
+                const ele = eleEl ? parseFloat(eleEl.textContent) : null;
+                return (ele != null && !isNaN(ele)) ? [lon, lat, ele] : [lon, lat];
+            })
+            .filter(c => !isNaN(c[0]) && !isNaN(c[1]));
+        if (coords.length >= 2) return { type: 'track', coords };
+    }
+
+    // GPX Route / Waypoints
+    const rtepts = [...xml.querySelectorAll('rtept')];
+    const wpts = [...xml.querySelectorAll('wpt')];
+    const pts = rtepts.length > 0 ? rtepts : wpts;
+    if (pts.length >= 2) {
+        const markers = pts.map(pt => ({
+            lat: parseFloat(pt.getAttribute('lat')),
+            lng: parseFloat(pt.getAttribute('lon'))
+        })).filter(m => !isNaN(m.lat) && !isNaN(m.lng));
+        if (markers.length >= 2) return { type: 'waypoints', markers };
+    }
+
+    throw new Error('No recognized route or track data found in file.');
+}
+
+// Master Import Function
+async function importRouteFile(file) {
+    try {
+        const result = await parseRouteData(file);
+
+        // Clear current route
+        waypoints = [];
+        markers.forEach(m => m.remove());
+        markers = [];
+        segmentModes = [];
+        segmentGPXPaths = [];
+        currentRouteGeoJSON = null;
+
+        if (result.type === 'track') {
+            const coords = result.coords;
+            createMarker({ lng: coords[0][0], lat: coords[0][1] });
+            createMarker({ lng: coords[coords.length - 1][0], lat: coords[coords.length - 1][1] });
+
+            segmentModes = ['gpx'];
+            segmentGPXPaths = [coords.map(c => [c[0], c[1]])];
+
+            await updateRoute();
+
+            const bounds = new maplibregl.LngLatBounds();
+            coords.forEach(c => bounds.extend([c[0], c[1]]));
+            fitBoundsSmart(bounds, { maxZoom: 17, duration: 700 });
+        } else if (result.type === 'waypoints') {
+            result.markers.forEach(pt => createMarker({ lng: pt.lng, lat: pt.lat }));
+            updateRoute();
+        }
+    } catch (err) {
+        console.error('Route import error:', err);
+        alert('Failed to import route file: ' + (err.message || 'Unsupported format.'));
+    }
+}
+
+// Master Export Function
+function exportRoute(format = 'gpx') {
+    if (!currentRouteGeoJSON || !currentRouteGeoJSON.coordinates?.length) {
+        alert('No route to download.');
+        return;
+    }
+
+    const coords = currentRouteGeoJSON.coordinates;
+    const elevations = getRouteElevationArray(coords);
+    const title = 'bike-route';
+
+    if (format === 'fit') {
+        const fitBytes = buildFITCourse(coords, elevations, 'Bike Route');
+        const blob = new Blob([fitBytes], { type: 'application/octet-stream' });
+        triggerDownload(blob, `${title}.fit`);
+    } else if (format === 'tcx') {
+        const tcx = buildTCX(coords, elevations, 'Bike Route');
+        const blob = new Blob([tcx], { type: 'application/vnd.garmin.tcx+xml' });
+        triggerDownload(blob, `${title}.tcx`);
+    } else if (format === 'kml') {
+        const kml = buildKML(coords, elevations, 'Bike Route');
+        const blob = new Blob([kml], { type: 'application/vnd.google-earth.kml+xml' });
+        triggerDownload(blob, `${title}.kml`);
+    } else if (format === 'geojson') {
+        const geojson = buildGeoJSON(coords, elevations);
+        const blob = new Blob([geojson], { type: 'application/geo+json' });
+        triggerDownload(blob, `${title}.geojson`);
+    } else {
+        // GPX fallback
+        const gpx = buildGPX(coords, elevations, 'Bike Route');
+        const blob = new Blob([gpx], { type: 'application/gpx+xml' });
+        triggerDownload(blob, `${title}.gpx`);
+    }
+}
+
+function triggerDownload(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function buildGPX(coords, elevations, name = 'Bike Route') {
+    const trkpts = coords.map((c, i) => {
+        const ele = elevations?.[i] != null ? elevations[i] : (c[2] != null ? c[2] : null);
+        const eleTag = ele != null ? `\n        <ele>${Number(ele).toFixed(1)}</ele>` : '';
         return `      <trkpt lat="${c[1].toFixed(6)}" lon="${c[0].toFixed(6)}">${eleTag}\n      </trkpt>`;
     }).join('\n');
 
-    const gpx = `<?xml version="1.0" encoding="UTF-8"?>
+    return `<?xml version="1.0" encoding="UTF-8"?>
 <gpx version="1.1" creator="Bike Route Planner" xmlns="http://www.topografix.com/GPX/1/1">
   <trk>
-    <name>Bike Route</name>
+    <name>${name}</name>
     <trkseg>
 ${trkpts}
     </trkseg>
   </trk>
 </gpx>`;
+}
 
-    const blob = new Blob([gpx], { type: 'application/gpx+xml' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = 'bike-route.gpx'; a.click();
-    URL.revokeObjectURL(url);
+function buildTCX(coords, elevations, name = 'Bike Route') {
+    const baseTime = new Date();
+    let cumulativeDist = 0;
+
+    const trackpoints = coords.map((c, i) => {
+        if (i > 0) {
+            const prev = coords[i - 1];
+            cumulativeDist += getSegmentDistanceMeters(prev[1], prev[0], c[1], c[0]);
+        }
+        const ptTime = new Date(baseTime.getTime() + Math.round((cumulativeDist / 6.0) * 1000)).toISOString();
+        const ele = elevations?.[i] != null ? elevations[i] : (c[2] != null ? c[2] : 0);
+        return `          <Trackpoint>
+            <Time>${ptTime}</Time>
+            <Position>
+              <LatitudeDegrees>${c[1].toFixed(6)}</LatitudeDegrees>
+              <LongitudeDegrees>${c[0].toFixed(6)}</LongitudeDegrees>
+            </Position>
+            <AltitudeMeters>${Number(ele).toFixed(1)}</AltitudeMeters>
+            <DistanceMeters>${cumulativeDist.toFixed(1)}</DistanceMeters>
+          </Trackpoint>`;
+    }).join('\n');
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<TrainingCenterDatabase xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2">
+  <Courses>
+    <Course>
+      <Name>${name}</Name>
+      <Lap>
+        <TotalTimeSeconds>${Math.round(cumulativeDist / 6.0)}</TotalTimeSeconds>
+        <DistanceMeters>${cumulativeDist.toFixed(1)}</DistanceMeters>
+        <BeginPosition>
+          <LatitudeDegrees>${coords[0][1].toFixed(6)}</LatitudeDegrees>
+          <LongitudeDegrees>${coords[0][0].toFixed(6)}</LongitudeDegrees>
+        </BeginPosition>
+        <EndPosition>
+          <LatitudeDegrees>${coords[coords.length - 1][1].toFixed(6)}</LatitudeDegrees>
+          <LongitudeDegrees>${coords[coords.length - 1][0].toFixed(6)}</LongitudeDegrees>
+        </EndPosition>
+        <Intensity>Active</Intensity>
+      </Lap>
+      <Track>
+${trackpoints}
+      </Track>
+    </Course>
+  </Courses>
+</TrainingCenterDatabase>`;
+}
+
+function buildKML(coords, elevations, name = 'Bike Route') {
+    const coordinatesStr = coords.map((c, i) => {
+        const ele = elevations?.[i] != null ? elevations[i] : (c[2] != null ? c[2] : 0);
+        return `${c[0].toFixed(6)},${c[1].toFixed(6)},${Number(ele).toFixed(1)}`;
+    }).join(' ');
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>${name}</name>
+    <Placemark>
+      <name>${name}</name>
+      <LineString>
+        <extrude>1</extrude>
+        <tessellate>1</tessellate>
+        <altitudeMode>clampToGround</altitudeMode>
+        <coordinates>${coordinatesStr}</coordinates>
+      </LineString>
+    </Placemark>
+  </Document>
+</kml>`;
+}
+
+function buildGeoJSON(coords, elevations) {
+    const coordinates3D = coords.map((c, i) => {
+        const ele = elevations?.[i] != null ? elevations[i] : (c[2] != null ? c[2] : 0);
+        return [Number(c[0].toFixed(6)), Number(c[1].toFixed(6)), Number(Number(ele).toFixed(1))];
+    });
+
+    const data = {
+        type: 'FeatureCollection',
+        features: [
+            {
+                type: 'Feature',
+                properties: {
+                    name: 'Bike Route',
+                    generator: 'Bike Route Planner'
+                },
+                geometry: {
+                    type: 'LineString',
+                    coordinates: coordinates3D
+                }
+            }
+        ]
+    };
+    return JSON.stringify(data, null, 2);
+}
+
+// Backward compatibility alias
+function downloadGPX() {
+    exportRoute('gpx');
+}
+function importGPX(file) {
+    importRouteFile(file);
 }
 
 function applyTerrain() {
@@ -4696,6 +5147,24 @@ function loadStoredSettings() {
         updateDistanceUI();
     }
 
+    // Export format setting — default to 'gpx'
+    const savedExportFormat = localStorage.getItem('route_export_format') || 'gpx';
+    const exportSelect = document.getElementById('export-format-select');
+    if (exportSelect) {
+        exportSelect.value = savedExportFormat;
+        exportSelect.addEventListener('change', (e) => {
+            localStorage.setItem('route_export_format', e.target.value);
+            const dlBtn = document.getElementById('gpx-download-btn');
+            if (dlBtn) {
+                dlBtn.title = `Download Route (.${e.target.value})`;
+            }
+        });
+        const dlBtn = document.getElementById('gpx-download-btn');
+        if (dlBtn) {
+            dlBtn.title = `Download Route (.${savedExportFormat})`;
+        }
+    }
+
     // Initialize speed input and unit label
     updateSpeedSettingUI();
     document.getElementById('base-speed-input').addEventListener('input', (e) => {
@@ -4782,15 +5251,25 @@ document.getElementById('show-location-check')?.addEventListener('change', () =>
     updateUserLocationPin();
 });
 
-// Wire up GPX buttons
-document.getElementById('gpx-import-btn').addEventListener('click', () => {
+// Wire up Route Import / Export buttons
+const downloadBtn = document.getElementById('gpx-download-btn');
+
+document.getElementById('gpx-import-btn')?.addEventListener('click', () => {
     document.getElementById('gpx-file-input').click();
 });
-document.getElementById('gpx-file-input').addEventListener('change', (e) => {
+document.getElementById('gpx-file-input')?.addEventListener('change', (e) => {
     const file = e.target.files[0];
-    if (file) { importGPX(file); e.target.value = ''; }
+    if (file) { importRouteFile(file); e.target.value = ''; }
 });
-document.getElementById('gpx-download-btn').addEventListener('click', downloadGPX);
+
+downloadBtn?.addEventListener('click', () => {
+    if (!currentRouteGeoJSON || !currentRouteGeoJSON.coordinates?.length) {
+        alert('No route to download.');
+        return;
+    }
+    const format = localStorage.getItem('route_export_format') || 'gpx';
+    exportRoute(format);
+});
 
 Chart.Interaction.modes.routeHover = function (chart, e, options, useFinalPosition) {
     const items = [];
