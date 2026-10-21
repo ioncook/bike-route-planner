@@ -197,6 +197,31 @@ function getMercatorDistance(c1, c2) {
 }
 let routeScreenPts = null;
 
+function isTransitPoint(idx) {
+    if (!waypointPathIndices || waypointPathIndices.length < 2) return false;
+    for (let segI = 0; segI < waypointPathIndices.length - 1; segI++) {
+        if (segmentModes[segI] === 'transit') {
+            if (idx > waypointPathIndices[segI] && idx < waypointPathIndices[segI + 1]) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+function isTransitSegment(idx) {
+    if (!waypointPathIndices || waypointPathIndices.length < 2) return false;
+    for (let segI = 0; segI < waypointPathIndices.length - 1; segI++) {
+        if (segmentModes[segI] === 'transit') {
+            if (idx >= waypointPathIndices[segI] && idx < waypointPathIndices[segI + 1]) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+
 // Performance settings — display only. Backend elevation always uses max resolution.
 const PERF_MAP_POINTS = 8000;
 const PERF_INTERACTION_POINTS = 10000; // Unused for decimation now, keeping as logic reference
@@ -273,9 +298,15 @@ function updateAllButtonTooltips() {
     }
     const hikeBtn = document.getElementById('mode-hike');
     if (hikeBtn) {
-        const text = modeKey ? `Hiking (Allow unpaved) (${modeKey})` : 'Hiking (Allow unpaved)';
+        const text = modeKey ? `Hiking/MTB (Allow unpaved) (${modeKey})` : 'Hiking/MTB (Allow unpaved)';
         if (hikeBtn.hasAttribute('data-tooltip')) hikeBtn.setAttribute('data-tooltip', text);
         else hikeBtn.setAttribute('title', text);
+    }
+    const transitBtn = document.getElementById('mode-transit');
+    if (transitBtn) {
+        const text = modeKey ? `Gap (Skip segment) (${modeKey})` : 'Gap (Skip segment)';
+        if (transitBtn.hasAttribute('data-tooltip')) transitBtn.setAttribute('data-tooltip', text);
+        else transitBtn.setAttribute('title', text);
     }
 }
 
@@ -586,8 +617,22 @@ function rebuildMapGradient() {
         if (frac <= lastFrac) continue;
         lastFrac = frac;
         const rawIdx = displayIndexToRawIndex[i];
+        let isTransitPoint = false;
+        if (waypointPathIndices && waypointPathIndices.length >= 2) {
+            for (let segI = 0; segI < waypointPathIndices.length - 1; segI++) {
+                if (segmentModes[segI] === 'transit') {
+                    if (rawIdx >= waypointPathIndices[segI] && rawIdx <= waypointPathIndices[segI + 1]) {
+                        isTransitPoint = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         let color = 'rgb(34,197,94)';
-        if (currentMapColorMode === 'grade') {
+        if (isTransitPoint) {
+            color = 'rgba(0,0,0,0)';
+        } else if (currentMapColorMode === 'grade') {
             color = getColorForGrade(grades[Math.min(rawIdx + 1, grades.length - 1)] ?? 0);
         } else if (currentMapColorMode === 'road') {
             const rt = routeRoadTypes[Math.min(rawIdx, routeRoadTypes.length - 1)] || 'other';
@@ -614,6 +659,12 @@ function showHoverSegment(ci) {
         if (ci >= waypointPathIndices[j] && ci <= waypointPathIndices[j + 1]) { segIdx = j; break; }
     }
     if (segIdx === -1 || segIdx === lastSegIdx) return;
+    if (segmentModes[segIdx] === 'transit') {
+        if (map.getLayer('hover-segment-layer')) {
+            map.setLayoutProperty('hover-segment-layer', 'visibility', 'none');
+        }
+        return;
+    }
     lastSegIdx = segIdx;
     const startIndex = waypointPathIndices[segIdx];
     const endIndex = waypointPathIndices[segIdx + 1];
@@ -629,8 +680,11 @@ function showHoverSegment(ci) {
         subCoords = currentDisplayCoords ? currentDisplayCoords.slice(startIndex, endIndex + 1) : currentRouteGeoJSON.coordinates.slice(startIndex, endIndex + 1);
     }
 
+    const segMode = segmentModes[segIdx] || 'bike';
     const stops = ['interpolate', ['linear'], ['line-progress']];
-    if (isHighPerformance) {
+    if (segMode === 'transit') {
+        stops.push(0, '#94a3b8', 1, '#94a3b8');
+    } else if (isHighPerformance) {
         stops.push(0, '#2563eb', 1, '#2563eb');
     } else if (routeGrades && displayMercatorDistances && displayMercTotalDist > 0 && subCoords) {
         const startMerc = displayMercatorDistances[displayStart];
@@ -1987,6 +2041,10 @@ function updateHoverHighlight(ci, t = 0, lngLat, screenPt) {
         clearHoverHighlight(true);
         return;
     }
+    if (ci !== undefined && ci >= 0 && isTransitPoint(ci)) {
+        clearHoverHighlight();
+        return;
+    }
     if (!screenPt && ci !== undefined && ci >= 0) {
         screenPt = getOffsetScreenPt(ci);
     }
@@ -2610,7 +2668,8 @@ map.on('click', (e) => {
             segmentGPXPaths[lastSegIdx] = null;
         } else if (current === 'bike') next = 'direct';
         else if (current === 'direct') next = 'hike';
-        else if (current === 'hike') next = 'bike';
+        else if (current === 'hike') next = 'transit';
+        else if (current === 'transit') next = 'bike';
         segmentModes[lastSegIdx] = next;
         updateRoute();
         return;
@@ -3005,6 +3064,10 @@ async function fetchOneSegment(from, to, mode, avoidUnpaved, excludeParam, signa
         return { coords: [from, to], dist: turf_distance(from, to) };
     }
 
+    if (mode === 'transit') {
+        return { coords: [from, to], dist: 0, isTransit: true };
+    }
+
     const key = getCacheKey(from, to, mode, avoidUnpaved, excludeParam);
     if (segmentCache.has(key)) {
         return segmentCache.get(key);
@@ -3080,6 +3143,7 @@ async function updateRoute() {
     if (waypoints.length === 0 || waypoints.length === 1) {
         if (map.getSource('route')) map.getSource('route').setData({ type: 'LineString', coordinates: [] });
         if (map.getSource('route-segments')) map.getSource('route-segments').setData({ type: 'FeatureCollection', features: [] });
+        if (map.getSource('route-transit')) map.getSource('route-transit').setData({ type: 'FeatureCollection', features: [] });
         if (map.getSource('route-gradient')) map.getSource('route-gradient').setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [] } });
         if (map.getSource('route-display')) map.getSource('route-display').setData({ type: 'LineString', coordinates: [] });
         if (map.getSource('turnarounds')) map.getSource('turnarounds').setData({ type: 'FeatureCollection', features: [] });
@@ -3106,7 +3170,7 @@ async function updateRoute() {
     let uncachedCount = 0;
     for (let i = 0; i < numSegs; i++) {
         const mode = segmentModes[i] || 'bike';
-        if (mode !== 'direct' && mode !== 'gpx') {
+        if (mode !== 'direct' && mode !== 'gpx' && mode !== 'transit') {
             const avoidUnpaved = (mode !== 'hike');
             let exclude = [];
             if (avoidUnpaved) exclude.push('unpaved');
@@ -3303,16 +3367,20 @@ async function updateRoute() {
     });
 
     if (map.getSource('route')) map.getSource('route').setData(currentRouteGeoJSON);
+    if (map.getSource('route-transit')) map.getSource('route-transit').setData({ type: 'FeatureCollection', features: [] });
+
     rebuildMapGradient();
     routeScreenPtsDirty = true;
     updateDistanceUI();
     currentRouteSegments = segments;
     updateRouteTypesUI(segments);
-    // Calculate waypoint distances for the chart
+    // Calculate waypoint distances for the chart (excluding transit segments)
     let dSum = 0;
     const dArray = [0];
     for (let i = 1; i < rawCoords.length; i++) {
-        dSum += haversineDistance(rawCoords[i - 1], rawCoords[i]);
+        if (!isTransitPoint(i)) {
+            dSum += haversineDistance(rawCoords[i - 1], rawCoords[i]);
+        }
         dArray.push(dSum);
     }
     waypointDistances = waypointPathIndices.map(idx => dArray[idx]);
@@ -3544,6 +3612,9 @@ document.getElementById('reset-orientation-btn')?.addEventListener('click', () =
     map.flyTo({ bearing: 0, pitch: 0, speed: 2.8, curve: 1.4 });
 });
 
+// Store last known user coordinates [lng, lat]
+let currentUserCoords = null;
+
 // --- Search and Shortcuts ---
 
 (function () {
@@ -3651,9 +3722,22 @@ document.getElementById('reset-orientation-btn')?.addEventListener('click', () =
         dropdown.style.display = 'block';
     }
 
+    function getSearchUrl(query) {
+        let url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=5`;
+        if (typeof map !== 'undefined' && map.getBounds) {
+            const bounds = map.getBounds();
+            const left = bounds.getWest();
+            const right = bounds.getEast();
+            const top = bounds.getNorth();
+            const bottom = bounds.getSouth();
+            url += `&viewbox=${left},${top},${right},${bottom}`;
+        }
+        return url;
+    }
+
     async function fetchSuggestions(query) {
         try {
-            const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=5`);
+            const res = await fetch(getSearchUrl(query));
             const data = await res.json();
             renderDropdown(data);
         } catch (_) { }
@@ -3697,7 +3781,7 @@ document.getElementById('reset-orientation-btn')?.addEventListener('click', () =
                 return;
             }
             debounceTimer = setTimeout(() => {
-                fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}&limit=5`)
+                fetch(getSearchUrl(q))
                     .then(res => res.json())
                     .then(data => {
                         if (mobileDropdown) {
@@ -4412,19 +4496,50 @@ function triggerDownload(blob, filename) {
 }
 
 function buildGPX(coords, elevations, name = 'Bike Route') {
-    const trkpts = coords.map((c, i) => {
-        const ele = elevations?.[i] != null ? elevations[i] : (c[2] != null ? c[2] : null);
-        const eleTag = ele != null ? `\n        <ele>${Number(ele).toFixed(1)}</ele>` : '';
-        return `      <trkpt lat="${c[1].toFixed(6)}" lon="${c[0].toFixed(6)}">${eleTag}\n      </trkpt>`;
-    }).join('\n');
+    // If route contains transit segments, split into multiple <trkseg> blocks omitting transit spans
+    const trksegs = [];
+    if (waypointPathIndices && waypointPathIndices.length >= 2 && segmentModes.some(m => m === 'transit')) {
+        let currentSegPts = [];
+        for (let segI = 0; segI < waypointPathIndices.length - 1; segI++) {
+            const mode = segmentModes[segI] || 'bike';
+            const sStart = waypointPathIndices[segI];
+            const sEnd = waypointPathIndices[segI + 1];
+
+            if (mode === 'transit') {
+                if (currentSegPts.length > 0) {
+                    trksegs.push(currentSegPts);
+                    currentSegPts = [];
+                }
+            } else {
+                const startPtIdx = (currentSegPts.length > 0) ? sStart + 1 : sStart;
+                for (let i = startPtIdx; i <= sEnd; i++) {
+                    const c = coords[i];
+                    if (!c) continue;
+                    const ele = elevations?.[i] != null ? elevations[i] : (c[2] != null ? c[2] : null);
+                    const eleTag = ele != null ? `\n        <ele>${Number(ele).toFixed(1)}</ele>` : '';
+                    currentSegPts.push(`      <trkpt lat="${c[1].toFixed(6)}" lon="${c[0].toFixed(6)}">${eleTag}\n      </trkpt>`);
+                }
+            }
+        }
+        if (currentSegPts.length > 0) {
+            trksegs.push(currentSegPts);
+        }
+    } else {
+        const trkpts = coords.map((c, i) => {
+            const ele = elevations?.[i] != null ? elevations[i] : (c[2] != null ? c[2] : null);
+            const eleTag = ele != null ? `\n        <ele>${Number(ele).toFixed(1)}</ele>` : '';
+            return `      <trkpt lat="${c[1].toFixed(6)}" lon="${c[0].toFixed(6)}">${eleTag}\n      </trkpt>`;
+        });
+        trksegs.push(trkpts);
+    }
+
+    const trksegXml = trksegs.map(pts => `    <trkseg>\n${pts.join('\n')}\n    </trkseg>`).join('\n');
 
     return `<?xml version="1.0" encoding="UTF-8"?>
 <gpx version="1.1" creator="Bike Route Planner" xmlns="http://www.topografix.com/GPX/1/1">
   <trk>
     <name>${name}</name>
-    <trkseg>
-${trkpts}
-    </trkseg>
+${trksegXml}
   </trk>
 </gpx>`;
 }
@@ -4571,12 +4686,14 @@ function setRoutingMode(mode) {
     document.getElementById('mode-bike')?.classList.toggle('active', displayMode === 'bike');
     document.getElementById('mode-direct')?.classList.toggle('active', displayMode === 'direct');
     document.getElementById('mode-hike')?.classList.toggle('active', displayMode === 'hike');
+    document.getElementById('mode-transit')?.classList.toggle('active', displayMode === 'transit');
 }
 
 function cycleRoutingMode() {
     let nextMode = 'bike';
     if (currentRoutingMode === 'bike') nextMode = 'direct';
-    else if (currentRoutingMode === 'direct') nextMode = 'hike';
+    else if (currentRoutingMode === 'direct') nextMode = 'transit';
+    else if (currentRoutingMode === 'transit') nextMode = 'hike';
     else if (currentRoutingMode === 'hike') nextMode = 'bike';
     setRoutingMode(nextMode);
 }
@@ -4592,6 +4709,10 @@ document.getElementById('mode-direct')?.addEventListener('click', () => {
 document.getElementById('mode-hike')?.addEventListener('click', () => {
     if (window.innerWidth <= 768) cycleRoutingMode();
     else setRoutingMode('hike');
+});
+document.getElementById('mode-transit')?.addEventListener('click', () => {
+    if (window.innerWidth <= 768) cycleRoutingMode();
+    else setRoutingMode('transit');
 });
 
 document.getElementById('hillshade-select')?.addEventListener('change', applyTerrain);
@@ -4933,7 +5054,9 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
         let maxDownGrade = Infinity;
 
         for (let i = 0; i < smoothedSegmentGrades.length; i++) {
+            if (isTransitPoint(i)) continue;
             const grade = smoothedSegmentGrades[i];
+            if (grade == null || isNaN(grade)) continue;
             if (grade > 0.5) {
                 upSum += grade;
                 upCount++;
@@ -5402,7 +5525,7 @@ function initChart() {
                 pointRadius: 0,
                 pointHoverRadius: 0,
                 tension: 0.1,
-                spanGaps: true,
+                spanGaps: false,
                 order: 2
             }, {
                 label: 'Waypoints',
@@ -5637,6 +5760,10 @@ function initChart() {
         } else {
             ci = Math.min(Math.floor((i / Math.max(1, data.length - 1)) * (coords.length - 1)), coords.length - 2);
         }
+        if (ci >= 0 && isTransitPoint(ci)) {
+            clearHover();
+            return;
+        }
         const ciNext = ci + 1;
 
         // Interpolated geographic position
@@ -5775,9 +5902,12 @@ async function updateElevationProfile() {
             console.warn(`[elev] ${nullCount}/${elevations.length} points have no data (tiles still loading or out of bounds)`);
         }
 
-        // Build pathDistances and mercDistances for map gradient
+        // Build pathDistances and mercDistances for map gradient (excluding transit distance)
         for (let i = 1; i < coords.length; i++) {
-            distMeters += haversineDistance(coords[i - 1], coords[i]);
+            const inTransit = isTransitPoint(i);
+            if (!inTransit) {
+                distMeters += haversineDistance(coords[i - 1], coords[i]);
+            }
             pathDistances.push(distMeters);
             mercDist += getMercatorDistance(coords[i - 1], coords[i]);
             mercDistances.push(mercDist);
@@ -5892,11 +6022,12 @@ async function updateElevationProfile() {
         // Step 2: Prepare chart data and calculate grades
         const filteredChartData = [];
         const pointGrades = elevations.map((v, i) => {
-            if (v == null) return null;
+            if (v == null || isTransitPoint(i)) return null;
 
             let prevVal = null;
             let d1 = 0;
             for (let j = i - 1; j >= 0; j--) {
+                if (isTransitSegment(j)) break; // Don't look across transit gap
                 if (elevations[j] != null) {
                     const dist = haversineDistance(coords[j], coords[i]);
                     if (dist > 2.0) {
@@ -5906,7 +6037,7 @@ async function updateElevationProfile() {
                     }
                 }
             }
-            if (prevVal === null && i > 0 && elevations[i - 1] != null) {
+            if (prevVal === null && i > 0 && !isTransitSegment(i - 1) && elevations[i - 1] != null) {
                 prevVal = elevations[i - 1];
                 d1 = haversineDistance(coords[i - 1], coords[i]);
             }
@@ -5914,6 +6045,7 @@ async function updateElevationProfile() {
             let nextVal = null;
             let d2 = 0;
             for (let j = i + 1; j < elevations.length; j++) {
+                if (isTransitSegment(j - 1)) break; // Don't look across transit gap
                 if (elevations[j] != null) {
                     const dist = haversineDistance(coords[i], coords[j]);
                     if (dist > 2.0) {
@@ -5923,15 +6055,15 @@ async function updateElevationProfile() {
                     }
                 }
             }
-            if (nextVal === null && i < elevations.length - 1 && elevations[i + 1] != null) {
+            if (nextVal === null && i < elevations.length - 1 && !isTransitSegment(i) && elevations[i + 1] != null) {
                 nextVal = elevations[i + 1];
                 d2 = haversineDistance(coords[i], coords[i + 1]);
             }
 
-            if (i === 0) {
+            if (i === 0 || prevVal === null) {
                 return (nextVal != null && d2 > 0) ? (nextVal - v) / d2 * 100 : null;
             }
-            if (i === coords.length - 1) {
+            if (i === coords.length - 1 || nextVal === null) {
                 return (prevVal != null && d1 > 0) ? (v - prevVal) / d1 * 100 : null;
             }
 
@@ -5949,21 +6081,43 @@ async function updateElevationProfile() {
         let filteredMax = -Infinity, filteredMin = Infinity;
         let minElevIdx = 0, maxElevIdx = 0;
         for (let i = 0; i < coords.length; i++) {
+            const inTransit = isTransitPoint(i);
             const dval = elevations[i];
-            if (i > 0) {
-                const d = haversineDistance(coords[i - 1], coords[i]);
-                filteredDist += d;
-            }
+            const distM = pathDistances[i] ?? filteredDist;
+            filteredDist = distM;
             const displayElev = dval != null ? (currentUnits === 'metric' ? dval : dval * 3.28084) : null;
-            filteredChartData.push({ x: getDisplayDistance(filteredDist), y: displayElev ?? null });
-            if (displayElev != null) {
-                if (displayElev > filteredMax) {
-                    filteredMax = displayElev;
-                    maxElevIdx = i;
+            const ptX = getDisplayDistance(distM);
+
+            if (inTransit) {
+                // Inside transit gap: break the chart line
+                if (filteredChartData.length > 0 && filteredChartData[filteredChartData.length - 1].y !== null) {
+                    filteredChartData.push({ x: ptX, y: null });
                 }
-                if (displayElev < filteredMin) {
-                    filteredMin = displayElev;
-                    minElevIdx = i;
+            } else {
+                // If the previous point was inside transit (or was null), ensure null separates before starting new segment
+                let wasJustTransit = false;
+                if (waypointPathIndices && waypointPathIndices.length >= 2) {
+                    for (let segI = 0; segI < waypointPathIndices.length - 1; segI++) {
+                        if (segmentModes[segI] === 'transit' && i === waypointPathIndices[segI + 1]) {
+                            wasJustTransit = true;
+                            break;
+                        }
+                    }
+                }
+                if (wasJustTransit && filteredChartData.length > 0 && filteredChartData[filteredChartData.length - 1].y !== null) {
+                    filteredChartData.push({ x: ptX, y: null });
+                }
+
+                filteredChartData.push({ x: ptX, y: displayElev ?? null });
+                if (displayElev != null) {
+                    if (displayElev > filteredMax) {
+                        filteredMax = displayElev;
+                        maxElevIdx = i;
+                    }
+                    if (displayElev < filteredMin) {
+                        filteredMin = displayElev;
+                        minElevIdx = i;
+                    }
                 }
             }
         }
@@ -5972,13 +6126,26 @@ async function updateElevationProfile() {
         chartData.length = 0; filteredChartData.forEach(p => chartData.push(p));
         maxElev = filteredMax; minElev = filteredMin;
 
-        // Calculate total elevation gain and loss from cleaned elevations
+        // Calculate total elevation gain and loss from cleaned elevations (excluding transit segments)
         let totalGainM = 0, totalLossM = 0;
         for (let i = 1; i < elevations.length; i++) {
             if (elevations[i] != null && elevations[i - 1] != null) {
-                const diff = elevations[i] - elevations[i - 1];
-                if (diff > 0) totalGainM += diff;
-                else totalLossM += diff;
+                let inTransit = false;
+                if (waypointPathIndices && waypointPathIndices.length >= 2) {
+                    for (let segI = 0; segI < waypointPathIndices.length - 1; segI++) {
+                        if (segmentModes[segI] === 'transit') {
+                            if (i > waypointPathIndices[segI] && i <= waypointPathIndices[segI + 1]) {
+                                inTransit = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!inTransit) {
+                    const diff = elevations[i] - elevations[i - 1];
+                    if (diff > 0) totalGainM += diff;
+                    else totalLossM += diff;
+                }
             }
         }
         const gainLabel = currentUnits === 'metric'
@@ -5997,6 +6164,10 @@ async function updateElevationProfile() {
         const targetWindowMeters = 10; // 10m smoothing window
 
         for (let i = 0; i < smoothingGrades.length; i++) {
+            if (isTransitPoint(i)) {
+                smoothedSegmentGrades.push(null);
+                continue;
+            }
             let sum = 0, count = 0;
             let distBack = 0, distFwd = 0;
 
@@ -6006,6 +6177,7 @@ async function updateElevationProfile() {
             }
 
             for (let j = i - 1; j >= 0; j--) {
+                if (isTransitSegment(j)) break; // Do not smooth across transit gap
                 const d = haversineDistance(coords[j], coords[j + 1]);
                 distBack += d;
                 if (distBack > targetWindowMeters / 2) break;
@@ -6016,6 +6188,7 @@ async function updateElevationProfile() {
             }
 
             for (let j = i; j < smoothingGrades.length - 1; j++) {
+                if (isTransitSegment(j)) break; // Do not smooth across transit gap
                 const d = haversineDistance(coords[j], coords[j + 1]);
                 distFwd += d;
                 if (distFwd > targetWindowMeters / 2) break;
@@ -6030,10 +6203,12 @@ async function updateElevationProfile() {
             } else {
                 let fallback = 0;
                 for (let j = i; j >= 0; j--) {
+                    if (isTransitSegment(j)) break;
                     if (smoothingGrades[j] != null) { fallback = smoothingGrades[j]; break; }
                 }
                 if (fallback === 0) {
                     for (let j = i; j < smoothingGrades.length; j++) {
+                        if (isTransitSegment(j - 1)) break;
                         if (smoothingGrades[j] != null) { fallback = smoothingGrades[j]; break; }
                     }
                 }
@@ -6061,18 +6236,21 @@ async function updateElevationProfile() {
             for (let i = 1; i < waypoints.length - 1; i++) {
                 const wpMeters = waypointDistances[i] || 0;
                 const displayWpDist = getDisplayDistance(wpMeters);
-
-                // Find closest index in chartData
-                let closestY = 0;
-                let minDiff = Infinity;
-                for (const pt of chartData) {
-                    if (pt.y === null) continue;
-                    const d = Math.abs(pt.x - displayWpDist);
-                    if (d < minDiff) { minDiff = d; closestY = pt.y; }
+                const wpRawIdx = waypointPathIndices?.[i];
+                let wpY = null;
+                if (wpRawIdx !== undefined && elevations[wpRawIdx] != null) {
+                    wpY = currentUnits === 'metric' ? elevations[wpRawIdx] : elevations[wpRawIdx] * 3.28084;
                 }
-                // Offsets are handled visually in SVG padding to be pixel-perfect and avoid scaling issues
+                if (wpY === null) {
+                    let minDiff = Infinity;
+                    for (const pt of chartData) {
+                        if (pt.y === null) continue;
+                        const d = Math.abs(pt.x - displayWpDist);
+                        if (d < minDiff) { minDiff = d; wpY = pt.y; }
+                    }
+                }
                 const offset = 0;
-                wpData.push({ x: displayWpDist, y: closestY + offset });
+                wpData.push({ x: displayWpDist, y: (wpY ?? 0) + offset });
                 wpStyles.push(getWpIconImage(i, waypoints.length));
             }
         }
@@ -6105,7 +6283,7 @@ async function updateElevationProfile() {
         }
 
         elevationChart.update('none');
-        elevationChart.options.scales.x.max = getDisplayDistance(distMeters);
+        elevationChart.options.scales.x.max = getDisplayDistance(currentDistanceMeters || distMeters);
 
         if (maxElev === -Infinity) maxElev = 100;
         if (minElev === Infinity) minElev = 0;
@@ -6125,7 +6303,9 @@ async function updateElevationProfile() {
         let maxDownIdx = 0;
 
         for (let i = 0; i < smoothedSegmentGrades.length; i++) {
+            if (isTransitPoint(i)) continue;
             const grade = smoothedSegmentGrades[i];
+            if (grade == null || isNaN(grade)) continue;
             if (grade > maxUpGrade) {
                 maxUpGrade = grade;
                 maxUpIdx = i;
@@ -6203,12 +6383,13 @@ function loadUrlState() {
         if (modes.length > 0) {
             const lastMode = modes[modes.length - 1];
             const fallbackMode = lastMode === 'gpx' ? 'bike' : lastMode;
-            if (['bike', 'direct', 'hike'].includes(fallbackMode)) {
+            if (['bike', 'direct', 'hike', 'transit'].includes(fallbackMode)) {
                 currentRoutingMode = fallbackMode;
                 localStorage.setItem('route_routing_mode', fallbackMode);
                 document.getElementById('mode-bike')?.classList.toggle('active', fallbackMode === 'bike');
                 document.getElementById('mode-direct')?.classList.toggle('active', fallbackMode === 'direct');
                 document.getElementById('mode-hike')?.classList.toggle('active', fallbackMode === 'hike');
+                document.getElementById('mode-transit')?.classList.toggle('active', fallbackMode === 'transit');
             }
         }
         const points = routeStr.split(';');
@@ -6278,6 +6459,7 @@ function requestLocation(fly = false) {
         (pos) => {
             const freshLng = pos.coords.longitude;
             const freshLat = pos.coords.latitude;
+            currentUserCoords = [freshLng, freshLat];
             const currentCenter = map.getCenter();
 
             const options = {
@@ -6618,7 +6800,7 @@ updateElevationToggleBtn();
 // --- Keybinding UI Management ---
 const ACTION_NAMES = {
     toggleElevation: 'Toggle Elevation Chart',
-    toggleMode: 'Toggle Routing Mode (Bike/Direct)',
+    toggleMode: 'Toggle Routing Mode (Bike/Direct/Hike/Transit)',
     fitRoute: 'Fit Map to Route',
     toggleSettings: 'Open/Close Settings',
     search: 'Focus Search Bar',
@@ -6870,6 +7052,7 @@ function updateUserLocationPin() {
         userLocationWatchId = navigator.geolocation.watchPosition(
             (pos) => {
                 const lngLat = [pos.coords.longitude, pos.coords.latitude];
+                currentUserCoords = lngLat;
                 if (!userLocationMarker) {
                     const el = document.createElement('div');
                     el.style.width = '20px';
