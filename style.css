@@ -239,6 +239,7 @@ body {
 #map {
     flex-grow: 1;
     width: 100%;
+    touch-action: none;
 }
 
 /* Hide Leaflet Routing Machine text instructions to keep it clean */

@@ -122,8 +122,7 @@ const map = new maplibregl.Map({
     centerClampedToGround: false,
     projection: { type: localStorage.getItem('route_projection') || 'mercator' },
     antialias: false,
-    fadeDuration: 50, // Setting to 0 triggers MapLibre bug where parent tiles are permanently retained when zooming out
-    pixelRatio: window.devicePixelRatio || 1,
+    fadeDuration: 0,
     trackResize: true,
     clickTolerance: 8,
     aroundCenter: false,
@@ -150,16 +149,10 @@ window.addEventListener('mouseup', (e) => {
 });
 
 
-// Enable native map interactions (panning, pinch zoom, rotation, tilt)
-map.dragPan.enable();
+// Enable native right-click tilt/rotate controls (MapLibre's built-in dragRotate is highly optimized)
 map.dragRotate.enable();
-map.touchZoomRotate.enable();
-if (typeof map.touchZoomRotate.enableRotation === 'function') {
-    map.touchZoomRotate.enableRotation();
-}
-map.touchPitch.enable();
+map.touchZoomRotate.enable(); // No 'around: center' — use finger midpoint for pinch zoom/rotate
 map.scrollZoom.enable({ around: 'center' }); // Zoom around center to bypass expensive 3D terrain raycast intersections on scroll
-document.body.classList.remove('routing-active');
 
 // Middle-click popup helper
 let middleClickStartX = null, middleClickStartY = null;
@@ -175,13 +168,12 @@ function buildRasterStyle(tileUrl) {
                 type: 'raster',
                 tiles: tiles,
                 tileSize: 256,
-                roundZoom: true,
                 maxzoom: 20
             }
         },
         layers: [
             { id: 'bg', type: 'background', paint: { 'background-color': isLight ? '#ffffff' : '#111111' } },
-            { id: 'basemap-layer', type: 'raster', source: 'basemap', paint: { 'raster-fade-duration': 50 } }
+            { id: 'basemap-layer', type: 'raster', source: 'basemap' }
         ]
     };
 }
@@ -1928,9 +1920,13 @@ map.on('style.load', () => {
     map.on('rotateend', () => { routeScreenPtsDirty = true; });
     map.on('zoom', () => {
         routeScreenPtsDirty = true;
-        updateTurnaroundJoins();
     });
-    map.on('zoomend', () => { isZooming = false; updateView(); updateDistanceMarkers(); });
+    map.on('zoomend', () => {
+        isZooming = false;
+        updateView();
+        updateTurnaroundJoins();
+        updateDistanceMarkers();
+    });
     map.on('zoomstart', () => { isZooming = true; });
     const updateCompass = () => {
         const compass = document.getElementById('compass-needle-svg');
@@ -9349,7 +9345,6 @@ if (mapCanvas) {
         }, 300);
     };
     mapCanvas.addEventListener('touchstart', onTouchStart, { passive: true });
-    mapCanvas.addEventListener('touchmove', onTouchStart, { passive: true });
     mapCanvas.addEventListener('touchend', onTouchEnd, { passive: true });
     mapCanvas.addEventListener('touchcancel', onTouchEnd, { passive: true });
     mapCanvas.addEventListener('mousedown', onTouchStart, { passive: true });
