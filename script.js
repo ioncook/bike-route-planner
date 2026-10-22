@@ -32,8 +32,10 @@ const RASTER_BASEMAPS = {
 let currentBasemap = localStorage.getItem('route_basemap') || 'cyclosm';
 
 // Apply stored theme immediately to avoid any flash of dark theme
-const storedInitialTheme = localStorage.getItem('route_theme');
-if (storedInitialTheme === 'light') {
+const storedInitialTheme = localStorage.getItem('route_theme') || 'dark';
+if (window.applyAppTheme) {
+    window.applyAppTheme(storedInitialTheme);
+} else if (storedInitialTheme === 'light') {
     document.body.classList.add('light-mode');
 }
 
@@ -78,9 +80,21 @@ document.addEventListener('click', (e) => {
 
 // Wait for DOM content to be ready
 document.addEventListener('DOMContentLoaded', () => {
-    const params = new URLSearchParams(window.location.search);
-    const routeStr = params.get('route');
-    const modeStr = params.get('modes');
+    let params = new URLSearchParams(window.location.search);
+    let routeStr = params.get('route');
+    let modeStr = params.get('modes');
+
+    // On mobile app, check cached route in localStorage if no route in URL query
+    if (!routeStr) {
+        try {
+            const cachedRoute = JSON.parse(localStorage.getItem('cached_active_route') || 'null');
+            if (cachedRoute && cachedRoute.route) {
+                routeStr = cachedRoute.route;
+                if (!modeStr && cachedRoute.modes) modeStr = cachedRoute.modes;
+            }
+        } catch (_) {}
+    }
+
     const modes = modeStr ? modeStr.split(',') : [];
     // Only show the loading cover when there are 2+ waypoints (a real route to fetch) and not a GPX import.
     if (routeStr && routeStr.includes(';') && !modes.includes('gpx')) {
@@ -97,6 +111,7 @@ const cachedZoom = localStorage.getItem('last_map_zoom');
 const initialCenter = cachedCenter ? JSON.parse(cachedCenter) : [0, 0];
 const initialZoom = cachedZoom ? parseFloat(cachedZoom) : 1;
 
+
 const map = new maplibregl.Map({
     container: 'map',
     style: VECTOR_STYLES[currentBasemap] || buildRasterStyle(RASTER_BASEMAPS[currentBasemap]),
@@ -107,7 +122,8 @@ const map = new maplibregl.Map({
     centerClampedToGround: false,
     projection: { type: localStorage.getItem('route_projection') || 'mercator' },
     antialias: false,
-    fadeDuration: 0,
+    fadeDuration: 50, // Setting to 0 triggers MapLibre bug where parent tiles are permanently retained when zooming out
+    pixelRatio: window.devicePixelRatio || 1,
     trackResize: true,
     clickTolerance: 8,
     aroundCenter: false,
@@ -134,10 +150,16 @@ window.addEventListener('mouseup', (e) => {
 });
 
 
-// Enable native right-click tilt/rotate controls (MapLibre's built-in dragRotate is highly optimized)
+// Enable native map interactions (panning, pinch zoom, rotation, tilt)
+map.dragPan.enable();
 map.dragRotate.enable();
-map.touchZoomRotate.enable(); // No 'around: center' — use finger midpoint for pinch zoom/rotate
+map.touchZoomRotate.enable();
+if (typeof map.touchZoomRotate.enableRotation === 'function') {
+    map.touchZoomRotate.enableRotation();
+}
+map.touchPitch.enable();
 map.scrollZoom.enable({ around: 'center' }); // Zoom around center to bypass expensive 3D terrain raycast intersections on scroll
+document.body.classList.remove('routing-active');
 
 // Middle-click popup helper
 let middleClickStartX = null, middleClickStartY = null;
@@ -147,17 +169,19 @@ function buildRasterStyle(tileUrl) {
     const isLight = document.body.classList.contains('light-mode') || localStorage.getItem('route_theme') === 'light';
     return {
         version: 8,
+        glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',
         sources: {
             basemap: {
                 type: 'raster',
                 tiles: tiles,
                 tileSize: 256,
+                roundZoom: true,
                 maxzoom: 20
             }
         },
         layers: [
             { id: 'bg', type: 'background', paint: { 'background-color': isLight ? '#ffffff' : '#111111' } },
-            { id: 'basemap-layer', type: 'raster', source: 'basemap' }
+            { id: 'basemap-layer', type: 'raster', source: 'basemap', paint: { 'raster-fade-duration': 50 } }
         ]
     };
 }
@@ -209,6 +233,18 @@ function isTransitPoint(idx) {
     return false;
 }
 
+function isTransitBoundary(idx) {
+    if (!waypointPathIndices || waypointPathIndices.length < 2) return false;
+    for (let segI = 0; segI < waypointPathIndices.length - 1; segI++) {
+        if (segmentModes[segI] === 'transit') {
+            if (idx === waypointPathIndices[segI] || idx === waypointPathIndices[segI + 1]) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 function isTransitSegment(idx) {
     if (!waypointPathIndices || waypointPathIndices.length < 2) return false;
     for (let segI = 0; segI < waypointPathIndices.length - 1; segI++) {
@@ -219,6 +255,16 @@ function isTransitSegment(idx) {
         }
     }
     return false;
+}
+
+function getSegmentModeAtPoint(idx) {
+    if (!waypointPathIndices || waypointPathIndices.length < 2) return currentRoutingMode;
+    for (let segI = 0; segI < waypointPathIndices.length - 1; segI++) {
+        if (idx >= waypointPathIndices[segI] && idx < waypointPathIndices[segI + 1]) {
+            return segmentModes[segI] || currentRoutingMode;
+        }
+    }
+    return segmentModes[segmentModes.length - 1] || currentRoutingMode;
 }
 
 
@@ -325,15 +371,50 @@ loadKeybindings();
 let elevationChart = null;
 let isUpdatingElevation = false;
 let currentElevationQueryId = 0;
-let lastHoverIdx = -1;
 let currentHoverDispDist = null;
+let currentNavDispDist = null;
+let isNavOnRoute = false;
+let isLiveNavActive = false;
+let isInitialNavCameraSet = false;
+let lastVibratedTurnIndex = -1;
+let currentHeading = 0;
+let lastGpsLngLat = null;
 let isZooming = false;
 let routeScreenPtsDirty = true;
 let bestCiGlobal = -1; // Exported from mousemove for use in dragging
 let waypointPathIndices = []; // Indices in currentRouteGeoJSON.coordinates where waypoints reside
 let lastSegIdx = -1;
+let lastHoverIdx = -1;
 let currentRoutingMode = 'bike'; // 'bike' or 'direct'
 let currentBaseSpeedKmh = parseFloat(localStorage.getItem('route_base_speed')) || 18;
+let routeTurnInstructions = [];
+
+async function snapToNearestRoad(lngLat) {
+    const lng = Array.isArray(lngLat) ? lngLat[0] : (lngLat ? lngLat.lng : NaN);
+    const lat = Array.isArray(lngLat) ? lngLat[1] : (lngLat ? lngLat.lat : NaN);
+    if (isNaN(lng) || isNaN(lat)) return lngLat;
+    const endpoints = [
+        `https://router.project-osrm.org/nearest/v1/cycling/${lng},${lat}`,
+        `https://routing.openstreetmap.de/routed-bike/nearest/v1/bicycle/${lng},${lat}`
+    ];
+    for (const url of endpoints) {
+        try {
+            const resp = await fetchWithTimeout(url, null, 2500);
+            if (!resp.ok) continue;
+            const data = await resp.json();
+            if (data.code === 'Ok' && data.waypoints && data.waypoints[0]?.location) {
+                const loc = data.waypoints[0].location;
+                // Only snap if within 250 meters of a road to avoid jumps
+                if ((data.waypoints[0].distance || 0) <= 250) {
+                    return [loc[0], loc[1]];
+                }
+            }
+        } catch (_) {
+            continue;
+        }
+    }
+    return [lng, lat];
+}
 
 function decodePolyline6(str) {
     let index = 0, lat = 0, lng = 0, coordinates = [];
@@ -435,13 +516,13 @@ function isLeftHandDriving(lng, lat) {
 // both segments so they meet cleanly. Left turns (outside gap) are untouched.
 // Only modifies the display source — currentRouteGeoJSON is never changed.
 function miterInsideCorners(coords) {
-    if (coords.length < 3) {
+    if (coords.length < 3 || map.getZoom() < 14) {
         rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
         displayIndexToRawIndex = coords.map((_, i) => i);
         return coords;
     }
     const pxOffset = getPixelOffset(map.getZoom()) * (isRouteLeftHandDriving ? -1 : 1);
-    if (Math.abs(pxOffset) < 0.1) { // No visible offset at low zooms
+    if (Math.abs(pxOffset) < 1.0) { // No visible offset at low zooms
         rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
         displayIndexToRawIndex = coords.map((_, i) => i);
         return coords;
@@ -454,6 +535,15 @@ function miterInsideCorners(coords) {
     for (let i = 1; i < coords.length - 1; i++) {
         const currentLen = result.length;
         const p2 = coords[i];
+
+        // Never subdivide or displace waypoint pins — the route must reach each waypoint pin directly
+        const isWp = waypoints && waypoints.some(wp => haversineDistance(wp, p2) < 2.0);
+        if (isWp || isTransitSegment(i - 1) || isTransitSegment(i) || isTransitPoint(i) || isTransitBoundary(i)) {
+            result.push(p2);
+            mapping.push([currentLen, currentLen]);
+            toRaw.push(i);
+            continue;
+        }
 
         let prevIdx = i - 1;
         while (prevIdx >= 0 && haversineDistance(coords[prevIdx], p2) < 0.5) prevIdx--;
@@ -546,15 +636,29 @@ function miterInsideCorners(coords) {
 // Build colored GeoJSON segments and upload to the map.
 // Called once after elevation data loads (grade colors) and also immediately
 // Rebuild the route colour gradient using MapLibre's native line-gradient.
-// We set a single LineString source (lineMetrics:true) and drive colour via
-// ['line-progress'] — one continuous gradient, zero segment-boundary artifacts.
+let _activeExtraGradientLayers = 0;
+
+function cleanupExtraGradientLayers() {
+    if (_activeExtraGradientLayers > 0) {
+        for (let i = 1; i <= _activeExtraGradientLayers; i++) {
+            const layerId = 'route-gradient-layer-' + i;
+            const srcId = 'route-gradient-' + i;
+            if (map.getLayer(layerId)) map.removeLayer(layerId);
+            if (map.getSource(srcId)) map.removeSource(srcId);
+        }
+        _activeExtraGradientLayers = 0;
+    }
+}
+
 let _routeGradStops = null;
 function rebuildMapGradient() {
-    if (!currentRouteGeoJSON) return;
+    if (!currentRouteGeoJSON || !currentRouteGeoJSON.coordinates || currentRouteGeoJSON.coordinates.length === 0) {
+        cleanupExtraGradientLayers();
+        return;
+    }
     const coords = currentRouteGeoJSON.coordinates;
 
     const mult = isRouteLeftHandDriving ? -1 : 1;
-
     const offsetExpression = ['interpolate', ['linear'], ['zoom'], 8, 0, 12, 2 * mult, 15, 4 * mult, 18, 6 * mult, 24, 6 * mult];
     if (map.getLayer('route-gradient-layer')) map.setPaintProperty('route-gradient-layer', 'line-offset', offsetExpression);
     if (map.getLayer('route-line')) map.setPaintProperty('route-line', 'line-offset', offsetExpression);
@@ -562,6 +666,7 @@ function rebuildMapGradient() {
     if (map.getLayer('hover-segment-layer')) map.setPaintProperty('hover-segment-layer', 'line-offset', offsetExpression);
 
     if (isHighPerformance) {
+        cleanupExtraGradientLayers();
         rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
         displayIndexToRawIndex = coords.map((_, i) => i);
         currentDisplayCoords = coords;
@@ -582,8 +687,6 @@ function rebuildMapGradient() {
         return;
     }
 
-
-
     // Using miter-corrected coordinates for the map display.
     const displayCoords = miterInsideCorners(coords);
     currentDisplayCoords = displayCoords; // Store for hover snap engine
@@ -597,56 +700,178 @@ function rebuildMapGradient() {
     }
     displayMercTotalDist = dAcc;
 
-    const gradSrc = map.getSource('route-gradient');
-    if (gradSrc) gradSrc.setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: displayCoords } });
+    // Build route-display geometry without transit gaps so hover targets don't span gaps
     const dispSrc = map.getSource('route-display');
-    if (dispSrc) dispSrc.setData({ type: 'LineString', coordinates: displayCoords });
-    routeScreenPtsDirty = true; // Snap engine must reflect the new display line
-
-    const grades = routeGrades;
-    if (!grades || !routeMercatorDistances || routeMercTotalDist <= 0) {
-        if (map.getLayer('route-gradient-layer'))
-            map.setPaintProperty('route-gradient-layer', 'line-gradient',
-                ['interpolate', ['linear'], ['line-progress'], 0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)']);
-        return;
-    }
-    const gradStops = [];
-    let lastFrac = -1;
-    for (let i = 0; i < displayCoords.length; i++) {
-        const frac = Math.min(Math.max(displayMercatorDistances[i] / (displayMercTotalDist || 1), 0), 1);
-        if (frac <= lastFrac) continue;
-        lastFrac = frac;
-        const rawIdx = displayIndexToRawIndex[i];
-        let isTransitPoint = false;
-        if (waypointPathIndices && waypointPathIndices.length >= 2) {
-            for (let segI = 0; segI < waypointPathIndices.length - 1; segI++) {
-                if (segmentModes[segI] === 'transit') {
-                    if (rawIdx >= waypointPathIndices[segI] && rawIdx <= waypointPathIndices[segI + 1]) {
-                        isTransitPoint = true;
-                        break;
-                    }
+    if (dispSrc) {
+        const lineParts = [];
+        let curPart = [];
+        for (let i = 0; i < displayCoords.length; i++) {
+            const rawIdx = (displayIndexToRawIndex && displayIndexToRawIndex[i] !== undefined) ? displayIndexToRawIndex[i] : i;
+            if (isTransitSegment(rawIdx)) {
+                if (curPart.length > 0 && isTransitBoundary(rawIdx)) {
+                    curPart.push(displayCoords[i]);
                 }
+                if (curPart.length > 1) lineParts.push(curPart);
+                curPart = [];
+            } else {
+                curPart.push(displayCoords[i]);
             }
         }
+        if (curPart.length > 1) lineParts.push(curPart);
 
-        let color = 'rgb(34,197,94)';
-        if (isTransitPoint) {
-            color = 'rgba(0,0,0,0)';
-        } else if (currentMapColorMode === 'grade') {
-            color = getColorForGrade(grades[Math.min(rawIdx + 1, grades.length - 1)] ?? 0);
-        } else if (currentMapColorMode === 'road') {
-            const rt = routeRoadTypes[Math.min(rawIdx, routeRoadTypes.length - 1)] || 'other';
-            color = roadColors[rt] || '#6b7280';
-        } else if (currentMapColorMode === 'surface') {
-            const st = routeSurfaceTypes[Math.min(rawIdx, routeSurfaceTypes.length - 1)] || 'unknown';
-            color = surfaceColors[st] || '#4b5563';
+        if (lineParts.length > 1) {
+            dispSrc.setData({ type: 'MultiLineString', coordinates: lineParts });
+        } else {
+            dispSrc.setData({ type: 'LineString', coordinates: displayCoords });
         }
-        gradStops.push(frac, color);
+    }
+    routeScreenPtsDirty = true;
+
+    // Partition route into continuous routed sections (omitting transit gaps)
+    // Each continuous section gets its own LineString with 100% full-opacity gradient stops,
+    // terminating cleanly at its boundary waypoint with zero texture bleed or gap.
+    const continuousSections = [];
+    if (waypointPathIndices && waypointPathIndices.length >= 2 && segmentModes && segmentModes.includes('transit')) {
+        let currentStart = 0;
+        for (let segI = 0; segI < waypointPathIndices.length - 1; segI++) {
+            if (segmentModes[segI] === 'transit') {
+                if (waypointPathIndices[segI] > currentStart) {
+                    continuousSections.push({
+                        startRaw: currentStart,
+                        endRaw: waypointPathIndices[segI]
+                    });
+                }
+                currentStart = waypointPathIndices[segI + 1];
+            }
+        }
+        if (currentStart < coords.length - 1) {
+            continuousSections.push({
+                startRaw: currentStart,
+                endRaw: coords.length - 1
+            });
+        }
+    } else {
+        continuousSections.push({
+            startRaw: 0,
+            endRaw: coords.length - 1
+        });
     }
 
-    if (map.getLayer('route-gradient-layer'))
-        map.setPaintProperty('route-gradient-layer', 'line-gradient',
-            ['interpolate', ['linear'], ['line-progress'], ...gradStops]);
+    const grades = routeGrades;
+
+    for (let sIndex = 0; sIndex < continuousSections.length; sIndex++) {
+        const sec = continuousSections[sIndex];
+        let dispStart = sec.startRaw;
+        let dispEnd = sec.endRaw;
+        if (rawIndexToDisplayRange && rawIndexToDisplayRange[sec.startRaw] && rawIndexToDisplayRange[sec.endRaw]) {
+            dispStart = rawIndexToDisplayRange[sec.startRaw][0];
+            dispEnd = rawIndexToDisplayRange[sec.endRaw][1] ?? rawIndexToDisplayRange[sec.endRaw][0];
+        }
+        const secDisplayCoords = displayCoords.slice(dispStart, dispEnd + 1);
+        if (secDisplayCoords.length < 2) continue;
+
+        let secDist = 0;
+        const secMercDists = [0];
+        for (let j = 1; j < secDisplayCoords.length; j++) {
+            secDist += getMercatorDistance(secDisplayCoords[j - 1], secDisplayCoords[j]);
+            secMercDists.push(secDist);
+        }
+
+        const secGradStops = [];
+        let lastFrac = -1;
+        let prevColor = null;
+
+        for (let j = 0; j < secDisplayCoords.length; j++) {
+            let frac = Math.min(Math.max(secMercDists[j] / (secDist || 1), 0), 1);
+            if (frac <= lastFrac) continue;
+            const displayIdx = dispStart + j;
+            const rawIdx = (displayIndexToRawIndex && displayIndexToRawIndex[displayIdx] !== undefined) ? displayIndexToRawIndex[displayIdx] : displayIdx;
+
+            let color = 'rgb(34,197,94)';
+            if (currentMapColorMode === 'grade' && grades) {
+                color = getColorForGrade(grades[Math.min(rawIdx + 1, grades.length - 1)] ?? 0);
+            } else if (currentMapColorMode === 'road') {
+                const rt = routeRoadTypes[Math.min(rawIdx, routeRoadTypes.length - 1)] || 'other';
+                color = roadColors[rt] || '#6b7280';
+            } else if (currentMapColorMode === 'surface') {
+                const st = routeSurfaceTypes[Math.min(rawIdx, routeSurfaceTypes.length - 1)] || 'unknown';
+                color = surfaceColors[st] || '#4b5563';
+            }
+
+            if (prevColor !== null && prevColor !== color) {
+                const stepDown = Math.max(lastFrac + 0.000001, frac - 0.000001);
+                if (stepDown > lastFrac && stepDown < frac) {
+                    secGradStops.push(stepDown, prevColor);
+                    lastFrac = stepDown;
+                }
+            }
+            secGradStops.push(frac, color);
+            lastFrac = frac;
+            prevColor = color;
+        }
+
+        if (secGradStops.length < 4) {
+            const fallbackColor = prevColor || 'rgb(34,197,94)';
+            secGradStops.length = 0;
+            secGradStops.push(0, fallbackColor, 1, fallbackColor);
+        }
+
+        const srcId = sIndex === 0 ? 'route-gradient' : 'route-gradient-' + sIndex;
+        const layerId = sIndex === 0 ? 'route-gradient-layer' : 'route-gradient-layer-' + sIndex;
+
+        if (sIndex === 0) {
+            const gradSrc = map.getSource(srcId);
+            if (gradSrc) gradSrc.setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: secDisplayCoords } });
+            if (map.getLayer(layerId)) {
+                map.setPaintProperty(layerId, 'line-gradient',
+                    ['interpolate', ['linear'], ['line-progress'], ...secGradStops]);
+                map.setPaintProperty(layerId, 'line-offset', offsetExpression);
+            }
+        } else {
+            if (!map.getSource(srcId)) {
+                map.addSource(srcId, {
+                    type: 'geojson',
+                    data: { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: secDisplayCoords } },
+                    lineMetrics: true,
+                    maxzoom: 24,
+                    buffer: 8, tolerance: 0
+                });
+            } else {
+                map.getSource(srcId).setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: secDisplayCoords } });
+            }
+
+            if (!map.getLayer(layerId)) {
+                map.addLayer({
+                    id: layerId,
+                    type: 'line',
+                    source: srcId,
+                    layout: { 'line-join': 'miter', 'line-miter-limit': 4, 'line-cap': 'round' },
+                    paint: {
+                        'line-color': 'rgb(34,197,94)',
+                        'line-width': 5,
+                        'line-opacity': 0.97,
+                        'line-offset': offsetExpression,
+                        'line-gradient': ['interpolate', ['linear'], ['line-progress'], ...secGradStops]
+                    }
+                }, 'route-line');
+            } else {
+                map.setPaintProperty(layerId, 'line-gradient',
+                    ['interpolate', ['linear'], ['line-progress'], ...secGradStops]);
+                map.setPaintProperty(layerId, 'line-offset', offsetExpression);
+            }
+        }
+    }
+
+    // Clean up any extra section layers from previous routes with more transit segments
+    for (let k = continuousSections.length; k <= _activeExtraGradientLayers; k++) {
+        if (k === 0) continue;
+        const layerId = 'route-gradient-layer-' + k;
+        const srcId = 'route-gradient-' + k;
+        if (map.getLayer(layerId)) map.removeLayer(layerId);
+        if (map.getSource(srcId)) map.removeSource(srcId);
+    }
+    _activeExtraGradientLayers = Math.max(0, continuousSections.length - 1);
+
     updateTurnaroundJoins();
     updateAngleDebugDisplay();
 }
@@ -742,13 +967,19 @@ function offsetLatLng(lngLat, offsetMeters, bearingDegrees) {
 function updateTurnaroundJoins() {
     if (!currentRouteGeoJSON || !map.getSource('turnarounds')) return;
 
-    const coords = currentRouteGeoJSON.coordinates;
     const zoom = map.getZoom();
+    if (zoom < 14) {
+        map.getSource('turnarounds').setData({ type: 'FeatureCollection', features: [] });
+        return;
+    }
+
+    const coords = currentRouteGeoJSON.coordinates;
     const mult = isRouteLeftHandDriving ? -1 : 1;
     const pxOffset = getPixelOffset(zoom) * mult;
 
     const turns = [];
     for (let i = 1; i < coords.length - 1; i++) {
+        if (isTransitSegment(i - 1) || isTransitSegment(i) || isTransitPoint(i) || isTransitBoundary(i)) continue;
         // Find preceding coordinate at least 0.5 meter away from coords[i]
         let prevIdx = i - 1;
         while (prevIdx >= 0 && haversineDistance(coords[prevIdx], coords[i]) < 0.5) {
@@ -971,12 +1202,16 @@ async function checkLongSegmentWarning(idx) {
     let maxSegmentMeters = 0;
 
     if (idx > 0 && waypoints[idx - 1] && waypoints[idx]) {
-        const d = getDirectDistanceMeters(waypoints[idx - 1], waypoints[idx]);
-        if (d > maxSegmentMeters) maxSegmentMeters = d;
+        if (segmentModes[idx - 1] !== 'transit') {
+            const d = getDirectDistanceMeters(waypoints[idx - 1], waypoints[idx]);
+            if (d > maxSegmentMeters) maxSegmentMeters = d;
+        }
     }
     if (idx < waypoints.length - 1 && waypoints[idx] && waypoints[idx + 1]) {
-        const d = getDirectDistanceMeters(waypoints[idx], waypoints[idx + 1]);
-        if (d > maxSegmentMeters) maxSegmentMeters = d;
+        if (segmentModes[idx] !== 'transit') {
+            const d = getDirectDistanceMeters(waypoints[idx], waypoints[idx + 1]);
+            if (d > maxSegmentMeters) maxSegmentMeters = d;
+        }
     }
 
     if (maxSegmentMeters <= LIMIT_METERS) {
@@ -987,11 +1222,7 @@ async function checkLongSegmentWarning(idx) {
     const km = Math.round(maxSegmentMeters / 1000);
 
     const approved = await showLongSegmentDialog(miles, km);
-    if (!approved) {
-        undo();
-        return false;
-    }
-    return true;
+    return approved;
 }
 
 function createMarkerIcon(index, total) {
@@ -1176,8 +1407,12 @@ function hideHoverMarker() {
     }
     lastSegIdx = -1;
     map.getSource('hover-segment')?.setData({ type: 'FeatureCollection', features: [] });
-    map.setFilter('turnaround-highlight-layer', ['==', ['get', 'idx'], -1]);
-    map.setFilter('turnaround-layer', null);
+    if (map.isStyleLoaded()) {
+        try {
+            if (map.getLayer('turnaround-highlight-layer')) map.setFilter('turnaround-highlight-layer', ['==', ['get', 'idx'], -1]);
+            if (map.getLayer('turnaround-layer')) map.setFilter('turnaround-layer', null);
+        } catch (_) {}
+    }
     window.activeHoverStart = -1;
     window.activeHoverEnd = -1;
     updateTurnaroundJoins();
@@ -1199,7 +1434,13 @@ function getPixelOffset(zoom) {
 }
 
 function updateDistanceUI() {
-    if (waypoints.length < 2) {
+    const hasRoute = waypoints.length >= 2;
+    const shareBtn = document.getElementById('share-route-btn');
+    const dlBtn = document.getElementById('gpx-download-btn');
+    if (shareBtn) shareBtn.disabled = !hasRoute;
+    if (dlBtn) dlBtn.disabled = !hasRoute;
+
+    if (!hasRoute) {
         document.getElementById('total-distance').textContent = currentUnits === 'metric' ? '0.00 km' : '0.00 mi';
         return;
     }
@@ -1231,6 +1472,7 @@ function parseRoadTypes(segments) {
     let totalDist = 0;
 
     segments.forEach(seg => {
+        if (seg.isTransit || seg.dist <= 0) return; // Skip transit gap segments
         if (!seg.messages || seg.messages.length < 2) {
             stats.road.other += seg.dist;
             stats.surface.unknown += seg.dist;
@@ -1419,7 +1661,7 @@ function setupRouteLayers() {
     // Single LineString with lineMetrics:true — required for line-gradient paint.
     let gradData = { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [] } };
     if (currentRouteGeoJSON) {
-        gradData.geometry.coordinates = decimateLine(currentRouteGeoJSON.coordinates, PERF_MAP_POINTS);
+        gradData.geometry.coordinates = currentDisplayCoords || currentRouteGeoJSON.coordinates;
     }
 
     if (!map.getSource('route-gradient'))
@@ -1427,6 +1669,7 @@ function setupRouteLayers() {
             type: 'geojson',
             data: gradData,
             lineMetrics: true,
+            maxzoom: 24,
             buffer: 8, tolerance: 0
         });
 
@@ -1434,6 +1677,7 @@ function setupRouteLayers() {
         map.addSource('route-display', {
             type: 'geojson',
             data: { type: 'LineString', coordinates: [] },
+            maxzoom: 24,
             buffer: 8, tolerance: 0
         });
 
@@ -1451,6 +1695,27 @@ function setupRouteLayers() {
                 'line-offset': ['interpolate', ['linear'], ['zoom'], 8, 0, 12, 2, 15, 4, 18, 6, 24, 6]
             }
         });
+
+    // Off-route dynamic guidance arrow pointing from user location dot to closest point on route
+    if (!map.getSource('nav-offroute-arrow-source')) {
+        map.addSource('nav-offroute-arrow-source', {
+            type: 'geojson',
+            data: { type: 'FeatureCollection', features: [] }
+        });
+    }
+    if (!map.getLayer('nav-offroute-arrow-line')) {
+        map.addLayer({
+            id: 'nav-offroute-arrow-line',
+            type: 'line',
+            source: 'nav-offroute-arrow-source',
+            layout: { 'line-join': 'round', 'line-cap': 'round' },
+            paint: {
+                'line-color': '#ef4444',
+                'line-width': 3.5,
+                'line-opacity': 0.9
+            }
+        });
+    }
 
     // Transparent interaction layer (hit target for drag, finger cursor)
     if (!map.getLayer('route-line'))
@@ -1553,15 +1818,15 @@ function setupRouteLayers() {
             source: 'distance-markers-source',
             layout: {
                 'text-field': ['get', 'text'],
-                'text-size': 11,
-                'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
-                'text-allow-overlap': false,
-                'text-ignore-placement': false
+                'text-size': 12,
+                'text-font': ['Noto Sans Bold'],
+                'text-allow-overlap': true,
+                'text-ignore-placement': true
             },
             paint: {
                 'text-color': '#ffffff',
                 'text-halo-color': '#000000',
-                'text-halo-width': 1
+                'text-halo-width': 2
             }
         });
     }
@@ -1620,8 +1885,6 @@ function setupRouteLayers() {
     if (currentRouteGeoJSON && map.getSource('route')) {
         const coords = currentRouteGeoJSON.coordinates;
         map.getSource('route').setData({ type: 'LineString', coordinates: coords });
-        // Gradient source uses decimated coords to avoid WebGL vertex limit (65535)
-        map.getSource('route-gradient').setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: decimateLine(coords, PERF_MAP_POINTS) } });
         if (map.getSource('route-display')) {
             map.getSource('route-display').setData({ type: 'LineString', coordinates: currentDisplayCoords || coords });
         }
@@ -1635,7 +1898,12 @@ map.on('style.load', () => {
     setupRouteLayers();
     if (isFirstLoad) {
         loadStoredSettings();
-        loadUrlState();
+        updateDistanceUI();
+        const openedPendingFile = checkPendingNativeRouteFile();
+        const openedPendingLocation = checkPendingNativeLocation();
+        if (!openedPendingFile && !openedPendingLocation) {
+            loadUrlState();
+        }
         isFirstLoad = false;
     }
 
@@ -1857,6 +2125,8 @@ function findClosestPointOnLine(mousePt) {
         const geoMargin = Math.max(0.002, 0.05 / Math.pow(2, Math.max(0, zoom - 10)));
 
         for (let i = 0; i < dispCoords.length - 1; i++) {
+            const rawIdx = (displayIndexToRawIndex && displayIndexToRawIndex[i] !== undefined) ? displayIndexToRawIndex[i] : i;
+            if (isTransitSegment(rawIdx)) continue;
             const a = dispCoords[i];
             const b = dispCoords[i + 1];
             if (!a || !b) continue;
@@ -1876,6 +2146,8 @@ function findClosestPointOnLine(mousePt) {
     } else {
         const margin = 80;
         for (let i = 0; i < dispCoords.length - 1; i++) {
+            const rawIdx = (displayIndexToRawIndex && displayIndexToRawIndex[i] !== undefined) ? displayIndexToRawIndex[i] : i;
+            if (isTransitSegment(rawIdx)) continue;
             const screenA = screenPts[i];
             const screenB = screenPts[i + 1];
             if (!screenA || !screenB) continue;
@@ -2041,7 +2313,7 @@ function updateHoverHighlight(ci, t = 0, lngLat, screenPt) {
         clearHoverHighlight(true);
         return;
     }
-    if (ci !== undefined && ci >= 0 && isTransitPoint(ci)) {
+    if (ci !== undefined && ci >= 0 && (isTransitPoint(ci) || isTransitSegment(ci))) {
         clearHoverHighlight();
         return;
     }
@@ -2212,6 +2484,7 @@ function createMarker(lngLat, index, initialMode) {
         .addTo(map);
 
     function deleteMarker(m) {
+        if (isLiveNavActive) return;
         isHoveringMarker = false;
         const idx = markers.indexOf(m);
         if (idx > -1) {
@@ -2261,6 +2534,7 @@ function createMarker(lngLat, index, initialMode) {
     let markerWasDragged = false;
     marker.getElement().addEventListener('click', (evt) => {
         evt.stopPropagation();
+        if (isLiveNavActive) return;
         if (!markerWasDragged) {
             deleteMarker(marker);
         }
@@ -2345,17 +2619,31 @@ function createMarker(lngLat, index, initialMode) {
             return;
         }
         isDraggingMarker = false;
+        const origLngLat = window._currentlyDraggingMarkerOriginalLngLat;
         window._currentlyDraggingMarker = null;
         window._currentlyDraggingMarkerOriginalLngLat = null;
         hideHoverMarker();
-        saveHistory();
         const idx = markers.indexOf(marker);
         if (idx > -1) {
-            invalidateGPXSegment(idx);
             const ll = marker.getLngLat();
+            const prevWp = waypoints[idx];
             waypoints[idx] = [ll.lng, ll.lat];
-            updateRoute();
-            checkLongSegmentWarning(idx);
+
+            checkLongSegmentWarning(idx).then((approved) => {
+                if (!approved) {
+                    if (origLngLat) {
+                        marker.setLngLat(origLngLat);
+                        waypoints[idx] = [origLngLat.lng, origLngLat.lat];
+                    } else if (prevWp) {
+                        marker.setLngLat(prevWp);
+                        waypoints[idx] = prevWp;
+                    }
+                    return;
+                }
+                saveHistory();
+                invalidateGPXSegment(idx);
+                updateRoute();
+            });
         }
     });
 
@@ -2535,31 +2823,21 @@ function getInsertIndex(clickedLngLat) {
 }
 
 map.on('mousedown', 'route-line', onLineDown);
-map.on('touchstart', 'route-line', (e) => {
-    if (e.points && e.points.length > 1) return; // ignore pinch — don't interfere with MapLibre gesture tracking
-    // Do NOT call preventDefault() here — it breaks MapLibre's pinch-zoom origin tracking
-    onLineDown(e);
-});
-map.on('touchstart', (e) => {
-    if (e.points && e.points.length > 1) return;
-    if (isDraggingLine || isDraggingMarker || window._currentlyDraggingMarker) return;
-    if (e.originalEvent && (e.originalEvent.target?.closest('.maplibregl-marker') || e.originalEvent.target?.closest('.custom-marker'))) return;
-    const { bestCi, bestDistSq } = findClosestPointOnLine(e.point);
-    if (bestCi !== -1 && bestDistSq <= 25 * 25) {
-        onLineDown(e);
-    }
-});
+map.on('touchstart', 'route-line', onLineDown);
 
 function onLineDown(e) {
+    if (isLiveNavActive) return;
     if (e.type === 'mousedown' && e.originalEvent.button !== 0) return;
     if (isDraggingMarker || (window.innerWidth > 768 && isHoveringMarker) || window._currentlyDraggingMarker || window._isMarkerTouch) return;
-    if (e.originalEvent && (e.originalEvent.target?.closest('.maplibregl-marker') || e.originalEvent.target?.closest('.custom-marker'))) return;
-    e.originalEvent?.stopPropagation();
-
+    
     // Ensure we have a valid snapping point, especially for mobile touchstart
     const { bestCi, bestT, bestDistSq, bestProj } = findClosestPointOnLine(e.point);
-    const highlightThreshold = 25 * 25; // Strict touch radius (25px)
+    const isTouch = e.type === 'touchstart' || (e.originalEvent && e.originalEvent.touches);
+    const highlightThreshold = isTouch ? (45 * 45) : (25 * 25); // Generous 45px touch radius for mobile fingers
     if (bestCi === -1 || bestDistSq > highlightThreshold) return;
+    if (isTransitPoint(bestCi) || isTransitSegment(bestCi)) return; // Do not drag or insert points on transit gap segments
+
+    e.originalEvent?.stopPropagation();
 
     // Sync global state for the up/move handlers
     bestCiGlobal = bestCi;
@@ -2590,8 +2868,17 @@ function onLineDown(e) {
     const nextWp = waypoints[insertIdx];
     updateDragPreviewAppearance(insertIdx, waypoints.length + 1);
 
+    let lastDragLngLat = null;
+
     const onMove = (moveEvent) => {
-        const lngLat = moveEvent.lngLat;
+        let lngLat = moveEvent.lngLat;
+        if (!lngLat && moveEvent.touches && moveEvent.touches.length > 0) {
+            const touch = moveEvent.touches[0];
+            const rect = map.getCanvasContainer().getBoundingClientRect();
+            lngLat = map.unproject([touch.clientX - rect.left, touch.clientY - rect.top]);
+        }
+        if (!lngLat) return;
+        lastDragLngLat = lngLat;
         updateDragGuideSVG(lngLat, prevWp, nextWp);
         const pm = window._dragPreviewMarker;
         if (pm) {
@@ -2608,15 +2895,44 @@ function onLineDown(e) {
         map.off('touchmove', onMove);
         map.off('mouseup', onUp);
         map.off('touchend', onUp);
+        window.removeEventListener('touchmove', onMove);
+        window.removeEventListener('touchend', onUp);
+        window.removeEventListener('touchcancel', onUp);
 
         hideDragGuideSVG();
         hideHoverMarker();
         const pm = window._dragPreviewMarker;
         if (pm && pm._added) { pm.remove(); pm._added = false; }
 
-        createMarker(upEvent.lngLat, insertIdx);
-        updateRoute();
-        checkLongSegmentWarning(insertIdx);
+        let finalLngLat = upEvent?.lngLat;
+        if (!finalLngLat && upEvent?.changedTouches && upEvent.changedTouches.length > 0) {
+            const touch = upEvent.changedTouches[0];
+            const rect = map.getCanvasContainer().getBoundingClientRect();
+            finalLngLat = map.unproject([touch.clientX - rect.left, touch.clientY - rect.top]);
+        }
+        if (!finalLngLat) {
+            finalLngLat = lastDragLngLat;
+        }
+
+        if (finalLngLat) {
+            const newMarker = createMarker(finalLngLat, insertIdx);
+            checkLongSegmentWarning(insertIdx).then((approved) => {
+                if (!approved) {
+                    const idx = markers.indexOf(newMarker);
+                    if (idx > -1) {
+                        markers.splice(idx, 1);
+                        waypoints.splice(idx, 1);
+                        segmentModes.splice(idx > 0 ? idx - 1 : 0, 1);
+                        segmentGPXPaths.splice(idx > 0 ? idx - 1 : 0, 1);
+                        newMarker.remove();
+                        refreshMarkerIcons();
+                    }
+                    return;
+                }
+                saveHistory();
+                updateRoute();
+            });
+        }
         setTimeout(() => wasDraggingLine = false, 50);
         window._activeLineDragCleanup = null;
     };
@@ -2625,6 +2941,9 @@ function onLineDown(e) {
     map.on('touchmove', onMove);
     map.on('mouseup', onUp);
     map.on('touchend', onUp);
+    window.addEventListener('touchmove', onMove, { passive: true });
+    window.addEventListener('touchend', onUp, { passive: true });
+    window.addEventListener('touchcancel', onUp, { passive: true });
 
     window._activeLineDragCleanup = () => {
         isDraggingLine = false;
@@ -2634,6 +2953,9 @@ function onLineDown(e) {
         map.off('touchmove', onMove);
         map.off('mouseup', onUp);
         map.off('touchend', onUp);
+        window.removeEventListener('touchmove', onMove);
+        window.removeEventListener('touchend', onUp);
+        window.removeEventListener('touchcancel', onUp);
 
         hideDragGuideSVG();
         hideHoverMarker();
@@ -2647,7 +2969,10 @@ function onLineDown(e) {
 }
 
 map.on('click', (e) => {
-    if (e.originalEvent.button !== 0) return; // Left click only
+    if (isLiveNavActive) return;
+    // On mobile touch devices, e.originalEvent can be a TouchEvent where button is undefined or not set.
+    // Only return if button is explicitly defined and is not the primary button (0).
+    if (e.originalEvent && typeof e.originalEvent.button === 'number' && e.originalEvent.button !== 0) return;
     if (wasDraggingLine || window._wasDraggingMarker || isDraggingMarker) return;
 
     // Check if the click is on or too close to an existing waypoint
@@ -2675,10 +3000,29 @@ map.on('click', (e) => {
         return;
     }
 
-    saveHistory();
-    createMarker(e.lngLat);
-    updateRoute();
-    checkLongSegmentWarning(waypoints.length - 1);
+    const newMarker = createMarker(e.lngLat);
+    const newIdx = waypoints.length - 1;
+    checkLongSegmentWarning(newIdx).then((approved) => {
+        if (!approved) {
+            const idx = markers.indexOf(newMarker);
+            if (idx > -1) {
+                markers.splice(idx, 1);
+                waypoints.splice(idx, 1);
+                if (idx > 0) {
+                    segmentModes.splice(idx - 1, 1);
+                    segmentGPXPaths.splice(idx - 1, 1);
+                } else {
+                    segmentModes.splice(0, 1);
+                    segmentGPXPaths.splice(0, 1);
+                }
+                newMarker.remove();
+                refreshMarkerIcons();
+            }
+            return;
+        }
+        saveHistory();
+        updateRoute();
+    });
 });
 
 function getWeatherIcon(code) {
@@ -2698,6 +3042,15 @@ function getWeatherIcon(code) {
     return sunny;
 }
 
+function openExternalMap(lat, lng, label) {
+    if (window.AndroidMaterialTheme && typeof window.AndroidMaterialTheme.openMapLocation === 'function') {
+        window.AndroidMaterialTheme.openMapLocation(lat, lng, label || '');
+        return;
+    }
+    window.open(`https://www.google.com/maps/search/?api=1&query=${lat},${lng}`, '_blank');
+}
+window.openExternalMap = openExternalMap;
+
 function showWeatherPopup(lngLat) {
     if (currentInfoPopup) currentInfoPopup.remove();
 
@@ -2712,7 +3065,7 @@ function showWeatherPopup(lngLat) {
         .setHTML(`
             <div style="font-family: 'Inter', sans-serif; padding: 0; white-space: nowrap;">
                 <div style="margin-top: 0; padding-right: 20px;">
-                    <a href="https://www.google.com/maps/search/?api=1&query=${lat},${lng}" target="_blank" 
+                    <a href="#" onclick="openExternalMap(${lat}, ${lng}); return false;" 
                        style="display: flex; align-items: center; color: #3b82f6; text-decoration: underline; text-underline-offset: 2px; font-size: 14px; font-weight: 600; margin-bottom: 8px;">
                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 6px; flex-shrink: 0;">
                            <circle cx="12" cy="12" r="8"></circle>
@@ -2855,6 +3208,7 @@ map.on('mouseup', (e) => {
     }
     lastRightClickTimestamp = now;
 
+    if (isLiveNavActive) return;
     if (pendingRightClickTimer) {
         clearTimeout(pendingRightClickTimer);
     }
@@ -2876,6 +3230,7 @@ let touchStartPos = null;
 let longPressTimer = null;
 
 function handleLongPress(lngLat, targetMarker = null) {
+    if (isLiveNavActive) return;
     if (targetMarker) {
         window._isMarkerTouch = false;
         // Delete pin logic
@@ -2896,7 +3251,7 @@ function handleLongPress(lngLat, targetMarker = null) {
 
 map.on('touchstart', (e) => {
     if (e.points && e.points.length > 1) return; // Ignore multi-touch
-    if (window._isMarkerTouch) return; // Ignore if marker was touched
+    if (window._isMarkerTouch || isDraggingLine || isDraggingMarker) return;
     touchStartPos = e.point;
     longPressTimer = setTimeout(() => {
         handleLongPress(e.lngLat);
@@ -3078,7 +3433,7 @@ async function fetchOneSegment(from, to, mode, avoidUnpaved, excludeParam, signa
 
     try {
         const bProfile = (mode === 'hike') ? 'trekking' : 'fastbike-lowtraffic';
-        let bRouterUrl = `https://brouter.de/brouter?lonlats=${from[0]},${from[1]}|${to[0]},${to[1]}&profile=${bProfile}&alternativeidx=0&format=geojson&profile:allow_ferries=${ferryVal}`;
+        let bRouterUrl = `https://brouter.de/brouter?lonlats=${from[0]},${from[1]}|${to[0]},${to[1]}&profile=${bProfile}&alternativeidx=0&format=geojson&profile:allow_ferries=${ferryVal}&turnInstructionMode=1`;
         if (avoidUnpaved) {
             bRouterUrl += `&profile:avoid_unpaved=1&profile:avoid_gravel=1`;
         }
@@ -3105,7 +3460,8 @@ async function fetchOneSegment(from, to, mode, avoidUnpaved, excludeParam, signa
                     result = {
                         coords: feature.geometry.coordinates,
                         dist: parseFloat(feature.properties['track-length']),
-                        messages: feature.properties.messages
+                        messages: feature.properties.messages,
+                        voicehints: feature.properties.voicehints
                     };
                 } else if (data.code === 'Ok' && data.routes.length > 0) {
                     result = { coords: data.routes[0].geometry.coordinates, dist: data.routes[0].distance };
@@ -3145,6 +3501,7 @@ async function updateRoute() {
         if (map.getSource('route-segments')) map.getSource('route-segments').setData({ type: 'FeatureCollection', features: [] });
         if (map.getSource('route-transit')) map.getSource('route-transit').setData({ type: 'FeatureCollection', features: [] });
         if (map.getSource('route-gradient')) map.getSource('route-gradient').setData({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [] } });
+        cleanupExtraGradientLayers();
         if (map.getSource('route-display')) map.getSource('route-display').setData({ type: 'LineString', coordinates: [] });
         if (map.getSource('turnarounds')) map.getSource('turnarounds').setData({ type: 'FeatureCollection', features: [] });
         hideHoverMarker();
@@ -3159,6 +3516,8 @@ async function updateRoute() {
         routeSurfaceTypes = [];
         updateRouteTypesUI([]);
         updateElevationProfile();
+        updateDistanceMarkers();
+        if (typeof stopLiveNavigation === 'function') stopLiveNavigation();
         syncUrl();
         clearStatus();
         return;
@@ -3217,23 +3576,65 @@ async function updateRoute() {
         throw e;
     }
 
-    // Stitch segments together, removing overlapping boundary points
+    // Ensure EVERY segment connects cleanly to its waypoint pins with zero gap.
+    // BRouter snaps endpoints to the nearest road network node; if that node is even slightly
+    // away from the clicked waypoint pin, connect it directly so the line reaches the pin.
+    for (let i = 0; i < segments.length; i++) {
+        const seg = segments[i];
+        if (!seg || !seg.coords || seg.coords.length === 0) continue;
+        const pStart = waypoints[i];
+        const pEnd = waypoints[i + 1];
+
+        if (seg.isTransit) {
+            seg.coords = [pStart, pEnd];
+        } else {
+            // Normal routed segment: ensure endpoints touch waypoints[i] and waypoints[i + 1] exactly
+            if (haversineDistance(seg.coords[0], pStart) > 0.5) {
+                seg.coords.unshift(pStart);
+            } else {
+                seg.coords[0] = pStart;
+            }
+            const lastIdx = seg.coords.length - 1;
+            if (haversineDistance(seg.coords[lastIdx], pEnd) > 0.5) {
+                seg.coords.push(pEnd);
+            } else {
+                seg.coords[lastIdx] = pEnd;
+            }
+        }
+    }
+
+    // Stitch segments together, resampling each routed segment individually.
+    // Transit gap segments only keep their start, collinear buffer, and end points without interpolating
+    // thousands of 5m points across the gap, preventing massive elevation queries and freezes.
     let allCoords = [];
     let totalDist = 0;
-    segments.forEach((seg, i) => {
-        const c = i > 0 ? seg.coords.slice(1) : seg.coords;
-        allCoords.push(...c);
-        totalDist += seg.dist;
+    segments.forEach((seg) => {
+        if (!seg.isTransit) {
+            totalDist += seg.dist;
+        }
     });
 
     setStatus('Resampling…');
     currentDistanceMeters = totalDist;
-    // Dynamic sampling: Target 1 point every 5 meters, min 2000, max 10000 points
-    // In High Performance mode: Target 1 point every 20 meters, min 500, max 2500 points
-    const targetPoints = isHighPerformance
-        ? Math.min(2500, Math.max(500, Math.ceil(totalDist / 20)))
-        : Math.min(10000, Math.max(2000, Math.ceil(totalDist / 5)));
-    const rawCoords = resampleLine(allCoords, targetPoints);
+
+    const exactWpIndices = [0];
+    segments.forEach((seg, segIdx) => {
+        if (seg.isTransit) {
+            const c = (allCoords.length > 0) ? seg.coords.slice(1) : seg.coords;
+            allCoords.push(...c);
+        } else {
+            const segDist = seg.dist;
+            const segPoints = isHighPerformance
+                ? Math.min(2500, Math.max(50, Math.ceil(segDist / 20)))
+                : Math.min(10000, Math.max(200, Math.ceil(segDist / 5)));
+            const resampled = resampleLine(seg.coords, segPoints);
+            const c = (allCoords.length > 0) ? resampled.slice(1) : resampled;
+            allCoords.push(...c);
+        }
+        exactWpIndices.push(allCoords.length - 1);
+    });
+
+    const rawCoords = allCoords;
     currentRouteGeoJSON = { type: 'LineString', coordinates: rawCoords };
     if (rawCoords.length > 0) {
         isRouteLeftHandDriving = isLeftHandDriving(rawCoords[0][0], rawCoords[0][1]);
@@ -3348,23 +3749,68 @@ async function updateRoute() {
         });
     }
 
+    // Exact waypoint indices corresponding to segment boundaries
+    waypointPathIndices = exactWpIndices;
 
-    // Track which indices in the final path correspond to our waypoints sequentially
-    let searchStart = 0;
-    waypointPathIndices = waypoints.map((wp, wpIdx) => {
-        if (wpIdx === 0) return 0;
-        if (wpIdx === waypoints.length - 1) return rawCoords.length - 1;
-        let bestIdx = searchStart;
-        let minDist = Infinity;
-        for (let i = searchStart; i < rawCoords.length; i++) {
-            const rc = rawCoords[i];
-            if (!rc || isNaN(rc[0]) || isNaN(rc[1])) continue;
-            const d = turf_distance(wp, rc);
-            if (d < minDist) { minDist = d; bestIdx = i; }
-        }
-        searchStart = bestIdx;
-        return bestIdx;
-    });
+    // Build routeTurnInstructions from segments with BRouter voicehints
+    routeTurnInstructions = [];
+    if (segments && segments.length > 0) {
+        segments.forEach((seg) => {
+            if (seg.voicehints && seg.coords && seg.coords.length > 0) {
+                seg.voicehints.forEach(vh => {
+                    const coordIdx = vh[0];
+                    const cmd = vh[1];
+                    const angle = vh[4] || 0;
+                    const c = seg.coords[coordIdx];
+                    if (!c) return;
+
+                    let type = 'straight';
+                    let icon = 'straight';
+                    let text = 'Continue';
+
+                    switch (cmd) {
+                        case 1: type = 'straight'; icon = 'straight'; text = 'Continue straight'; break;
+                        case 2: type = 'turn-left'; icon = 'left'; text = 'Turn left'; break;
+                        case 3: type = 'slight-left'; icon = 'slight-left'; text = 'Slight left'; break;
+                        case 4: type = 'sharp-left'; icon = 'sharp-left'; text = 'Turn sharp left'; break;
+                        case 5: type = 'turn-right'; icon = 'right'; text = 'Turn right'; break;
+                        case 6: type = 'slight-right'; icon = 'slight-right'; text = 'Slight right'; break;
+                        case 7: type = 'sharp-right'; icon = 'sharp-right'; text = 'Turn sharp right'; break;
+                        case 8: type = 'slight-left'; icon = 'slight-left'; text = 'Keep left'; break;
+                        case 9: type = 'slight-right'; icon = 'slight-right'; text = 'Keep right'; break;
+                        case 10: type = 'roundabout'; icon = 'roundabout'; text = 'Enter roundabout'; break;
+                        case 11:
+                            type = angle < 0 ? 'u-turn-left' : 'u-turn-right';
+                            icon = angle < 0 ? 'uturn-left' : 'uturn-right';
+                            text = angle < 0 ? 'Make a U-turn to the left' : 'Make a U-turn to the right';
+                            break;
+                        default:
+                            if (angle >= 45) { type = 'turn-right'; icon = 'right'; text = 'Turn right'; }
+                            else if (angle <= -45) { type = 'turn-left'; icon = 'left'; text = 'Turn left'; }
+                            break;
+                    }
+                    if (type === 'straight') return;
+
+                    // Match to closest coordinate index in resampled rawCoords
+                    let bestIdx = 0;
+                    let minDist = Infinity;
+                    for (let r = 0; r < rawCoords.length; r++) {
+                        const d = turf_distance(c, rawCoords[r]);
+                        if (d < minDist) { minDist = d; bestIdx = r; }
+                    }
+                    routeTurnInstructions.push({
+                        rawIdx: bestIdx,
+                        coord: c,
+                        type: type,
+                        text: text,
+                        icon: icon,
+                        isIntersection: true
+                    });
+                });
+            }
+        });
+        routeTurnInstructions.sort((a, b) => a.rawIdx - b.rawIdx);
+    }
 
     if (map.getSource('route')) map.getSource('route').setData(currentRouteGeoJSON);
     if (map.getSource('route-transit')) map.getSource('route-transit').setData({ type: 'FeatureCollection', features: [] });
@@ -3378,7 +3824,7 @@ async function updateRoute() {
     let dSum = 0;
     const dArray = [0];
     for (let i = 1; i < rawCoords.length; i++) {
-        if (!isTransitPoint(i)) {
+        if (!isTransitSegment(i - 1)) {
             dSum += haversineDistance(rawCoords[i - 1], rawCoords[i]);
         }
         dArray.push(dSum);
@@ -3463,8 +3909,8 @@ document.getElementById('undo-btn')?.addEventListener('click', undo);
 document.getElementById('redo-btn')?.addEventListener('click', redo);
 updateUndoRedoBtns();
 
-document.getElementById('clear-route').addEventListener('click', () => {
-    saveHistory();
+function clearRoute(withHistory = true) {
+    if (withHistory) saveHistory();
     waypoints = [];
     markers.forEach(m => m.remove());
     markers = [];
@@ -3473,7 +3919,13 @@ document.getElementById('clear-route').addEventListener('click', () => {
     const gainLossEl = document.getElementById('elev-gain-loss');
     if (gainLossEl) gainLossEl.textContent = '';
     updateRoute();
+    updateDistanceMarkers();
+    if (typeof stopLiveNavigation === 'function') stopLiveNavigation();
     updateUndoRedoBtns();
+}
+
+document.getElementById('clear-route').addEventListener('click', () => {
+    clearRoute(true);
 });
 
 function getFitBoundsPadding() {
@@ -3646,12 +4098,14 @@ let currentUserCoords = null;
     function closeMobileSearch() {
         if (mobileScreen) {
             mobileScreen.classList.remove('active');
+            mobileScreen.style.display = 'none';
             if (mobileInput) mobileInput.blur();
         }
     }
 
     function openMobileSearch() {
         if (mobileScreen) {
+            mobileScreen.style.display = 'flex';
             mobileScreen.classList.add('active');
             if (mobileInput) {
                 mobileInput.value = '';
@@ -3696,58 +4150,248 @@ let currentUserCoords = null;
         toggleSearch();
     });
 
+    function escapeSearchHtml(str) {
+        if (!str) return '';
+        return String(str).replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[m]);
+    }
+
     function selectResult(item) {
         const lng = parseFloat(item.lon);
         const lat = parseFloat(item.lat);
-        // Fly to location only — do NOT add a waypoint
-        map.flyTo({ center: [lng, lat], zoom: 12, speed: 2.8, curve: 1.4 });
+        if (isNaN(lng) || isNaN(lat)) return;
+        map.flyTo({ center: [lng, lat], zoom: 14, speed: 2.8, curve: 1.4 });
         showWeatherPopup({ lng, lat });
         collapseSearch();
+        closeMobileSearch();
+    }
+
+    function formatSearchResult(item) {
+        const rawName = item.name || (item.display_name ? item.display_name.split(',')[0].trim() : 'Location');
+        const addr = item.address || {};
+        const subParts = [];
+        const loc = addr.suburb || addr.neighbourhood || addr.quarter;
+        if (loc && loc !== rawName) subParts.push(loc);
+        const city = addr.city || addr.town || addr.village || addr.municipality;
+        if (city && city !== rawName && !subParts.includes(city)) subParts.push(city);
+        const region = addr.state || addr.country;
+        if (region && !subParts.includes(region)) subParts.push(region);
+
+        let subText = subParts.join(', ');
+        if (!subText && item.display_name) {
+            const parts = item.display_name.split(',').map(s => s.trim());
+            subText = parts.slice(1, 4).join(', ');
+        }
+
+        let distText = '';
+        if (item._distMeters != null && isFinite(item._distMeters) && item._distMeters < 500000) {
+            const isImperial = currentUnits !== 'metric';
+            if (isImperial) {
+                const mi = item._distMeters / 1609.344;
+                distText = mi < 10 ? `${mi.toFixed(1)} mi` : `${Math.round(mi)} mi`;
+            } else {
+                const km = item._distMeters / 1000;
+                distText = km < 10 ? `${km.toFixed(1)} km` : `${Math.round(km)} km`;
+            }
+        }
+
+        return { name: rawName, subText, distText };
+    }
+
+    function createResultRow(item, onSelect) {
+        const { name, subText, distText } = formatSearchResult(item);
+        const row = document.createElement('div');
+        row.className = 'search-result-row';
+        row.innerHTML = `
+            <div style="font-weight: 600; font-size: 0.92rem; color: var(--text-main); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeSearchHtml(name)}</div>
+            <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 2px; display: flex; justify-content: space-between; align-items: center; gap: 8px;">
+                <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeSearchHtml(subText)}</span>
+                ${distText ? `<span style="font-weight: 500; color: var(--primary); white-space: nowrap; flex-shrink: 0;">${distText}</span>` : ''}
+            </div>
+        `;
+        row.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            onSelect(item);
+        });
+        return row;
+    }
+
+    // Search cache and request cancellation for snappy search results
+    const searchCache = new Map();
+    let searchAbortController = null;
+
+    async function searchLocations(query) {
+        if (!query || query.trim().length < 2) return [];
+        const cleanQuery = query.trim();
+
+        // Check if query is GPS coordinate format: "lat, lng" or "lat lng"
+        const coordMatch = cleanQuery.match(/^([+-]?\d+(?:\.\d+)?)[,\s]+([+-]?\d+(?:\.\d+)?)$/);
+        if (coordMatch) {
+            const val1 = parseFloat(coordMatch[1]);
+            const val2 = parseFloat(coordMatch[2]);
+            let lat = null, lng = null;
+            if (val1 >= -90 && val1 <= 90 && val2 >= -180 && val2 <= 180) {
+                lat = val1; lng = val2;
+            } else if (val2 >= -90 && val2 <= 90 && val1 >= -180 && val1 <= 180) {
+                lat = val2; lng = val1;
+            }
+            if (lat !== null && lng !== null) {
+                return [{
+                    name: `Coordinates (${lat.toFixed(5)}, ${lng.toFixed(5)})`,
+                    display_name: `${lat.toFixed(5)}, ${lng.toFixed(5)}`,
+                    lat: lat.toString(),
+                    lon: lng.toString(),
+                    address: {}
+                }];
+            }
+        }
+
+        // Reference point for local proximity ranking & biasing
+        let refPoint = null;
+        if (currentUserCoords && Array.isArray(currentUserCoords) && currentUserCoords.length >= 2) {
+            refPoint = { lng: currentUserCoords[0], lat: currentUserCoords[1] };
+        } else if (typeof map !== 'undefined' && map.getCenter) {
+            const center = map.getCenter();
+            if (center) refPoint = { lng: center.lng, lat: center.lat };
+        }
+
+        const cacheKey = `${cleanQuery.toLowerCase()}_${refPoint ? `${refPoint.lng.toFixed(2)},${refPoint.lat.toFixed(2)}` : ''}`;
+        if (searchCache.has(cacheKey)) {
+            return searchCache.get(cacheKey);
+        }
+
+        // Cancel previous pending search request immediately so results don't lag or conflict
+        if (searchAbortController) {
+            searchAbortController.abort();
+        }
+        searchAbortController = new AbortController();
+        const signal = searchAbortController.signal;
+
+        // Fast endpoint: Photon (Komoot search index built for OSM autocomplete, <250ms)
+        const queryPhoton = async () => {
+            let url = `https://photon.komoot.io/api/?q=${encodeURIComponent(cleanQuery)}&limit=8`;
+            if (refPoint) {
+                url += `&lat=${refPoint.lat.toFixed(4)}&lon=${refPoint.lng.toFixed(4)}`;
+            }
+            const res = await fetch(url, { signal, headers: { 'Accept': 'application/json' } });
+            if (!res.ok) return [];
+            const data = await res.json();
+            if (!data || !data.features || !data.features.length) return [];
+
+            return data.features.map(f => {
+                const p = f.properties || {};
+                const c = f.geometry?.coordinates || [];
+                const subParts = [];
+                if (p.district && p.district !== p.name) subParts.push(p.district);
+                if (p.city && p.city !== p.name && !subParts.includes(p.city)) subParts.push(p.city);
+                if (p.state && !subParts.includes(p.state)) subParts.push(p.state);
+                if (p.country && !subParts.includes(p.country)) subParts.push(p.country);
+
+                return {
+                    name: p.name || p.street || 'Location',
+                    display_name: [p.name, ...subParts].filter(Boolean).join(', '),
+                    lon: c[0]?.toString(),
+                    lat: c[1]?.toString(),
+                    address: {
+                        suburb: p.district,
+                        city: p.city || p.town || p.village,
+                        state: p.state,
+                        country: p.country
+                    }
+                };
+            });
+        };
+
+        // Fallback endpoint: Nominatim with soft viewbox bias (non-restricted)
+        const queryNominatim = async () => {
+            let url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(cleanQuery)}&limit=8&addressdetails=1`;
+            if (typeof map !== 'undefined' && map.getBounds) {
+                const b = map.getBounds();
+                if (b) {
+                    const west = Math.max(-180, Math.min(180, b.getWest()));
+                    const east = Math.max(-180, Math.min(180, b.getEast()));
+                    const south = Math.max(-85, Math.min(85, b.getSouth()));
+                    const north = Math.max(-85, Math.min(85, b.getNorth()));
+                    if (isFinite(west) && isFinite(east) && isFinite(south) && isFinite(north) && west < east && south < north) {
+                        url += `&viewbox=${west.toFixed(4)},${north.toFixed(4)},${east.toFixed(4)},${south.toFixed(4)}`;
+                    }
+                }
+            }
+            const res = await fetch(url, { signal, headers: { 'Accept': 'application/json' } });
+            if (!res.ok) return [];
+            const data = await res.json();
+            return Array.isArray(data) ? data : [];
+        };
+
+        try {
+            // Attempt fast autocomplete index first; fallback to Nominatim if empty
+            let items = [];
+            try {
+                items = await queryPhoton();
+            } catch (photonErr) {
+                if (photonErr.name === 'AbortError') throw photonErr;
+                items = [];
+            }
+
+            if (!items || items.length === 0) {
+                items = await queryNominatim();
+            }
+            if (!items || !items.length) return [];
+
+            if (refPoint) {
+                items.forEach(item => {
+                    const itemLng = parseFloat(item.lon);
+                    const itemLat = parseFloat(item.lat);
+                    if (!isNaN(itemLng) && !isNaN(itemLat)) {
+                        item._distMeters = haversineDistance([refPoint.lng, refPoint.lat], [itemLng, itemLat]);
+                    } else {
+                        item._distMeters = Infinity;
+                    }
+                });
+                items.sort((a, b) => (a._distMeters || Infinity) - (b._distMeters || Infinity));
+            }
+
+            if (searchCache.size > 80) searchCache.clear();
+            searchCache.set(cacheKey, items);
+            return items;
+        } catch (err) {
+            if (err.name !== 'AbortError') {
+                console.warn('Search query failed:', err);
+            }
+            return [];
+        }
     }
 
     function renderDropdown(results) {
         dropdown.innerHTML = '';
-        currentResults = results;
-        if (!results.length) { closeDropdown(); return; }
-        results.forEach((item) => {
-            const row = document.createElement('div');
-            row.className = 'search-result-row';
-            row.textContent = item.display_name;
-            row.addEventListener('mousedown', (e) => {
-                e.preventDefault(); // prevent blur firing before click
-                selectResult(item);
-            });
+        currentResults = results || [];
+        if (!currentResults.length) { closeDropdown(); return; }
+        currentResults.forEach((item) => {
+            const row = createResultRow(item, selectResult);
+            row.addEventListener('mousedown', (e) => e.preventDefault()); // Prevent blur before click
             dropdown.appendChild(row);
         });
         dropdown.style.display = 'block';
     }
 
-    function getSearchUrl(query) {
-        let url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=5`;
-        if (typeof map !== 'undefined' && map.getBounds) {
-            const bounds = map.getBounds();
-            const left = bounds.getWest();
-            const right = bounds.getEast();
-            const top = bounds.getNorth();
-            const bottom = bounds.getSouth();
-            url += `&viewbox=${left},${top},${right},${bottom}`;
-        }
-        return url;
-    }
-
     async function fetchSuggestions(query) {
-        try {
-            const res = await fetch(getSearchUrl(query));
-            const data = await res.json();
+        const data = await searchLocations(query);
+        if (data && data.length) {
             renderDropdown(data);
-        } catch (_) { }
+        } else if (input.value.trim().length >= 2) {
+            closeDropdown();
+        }
     }
 
     input.addEventListener('input', () => {
         clearTimeout(debounceTimer);
         const q = input.value.trim();
-        if (q.length < 2) { closeDropdown(); return; }
-        debounceTimer = setTimeout(() => fetchSuggestions(q), 250);
+        if (q.length < 2) {
+            if (searchAbortController) searchAbortController.abort();
+            closeDropdown();
+            return;
+        }
+        debounceTimer = setTimeout(() => fetchSuggestions(q), 140);
     });
 
     input.addEventListener('keydown', (e) => {
@@ -3759,11 +4403,11 @@ let currentUserCoords = null;
     });
 
     input.addEventListener('blur', () => {
-        // Small delay so mousedown on result fires first
         setTimeout(closeDropdown, 150);
     });
 
     // Mobile Search Input & Event Handlers
+    let mobileResults = [];
     if (mobileInput) {
         mobileInput.addEventListener('input', () => {
             clearTimeout(debounceTimer);
@@ -3774,47 +4418,36 @@ let currentUserCoords = null;
                 if (mobileClearBtn) mobileClearBtn.style.display = 'block';
             }
             if (q.length < 2) {
+                if (searchAbortController) searchAbortController.abort();
                 if (mobileDropdown) {
                     mobileDropdown.innerHTML = '';
                     mobileDropdown.style.display = 'none';
                 }
+                mobileResults = [];
                 return;
             }
-            debounceTimer = setTimeout(() => {
-                fetch(getSearchUrl(q))
-                    .then(res => res.json())
-                    .then(data => {
-                        if (mobileDropdown) {
-                            mobileDropdown.innerHTML = '';
-                            if (!data.length) {
-                                mobileDropdown.style.display = 'none';
-                                return;
-                            }
-                            data.forEach((item) => {
-                                const row = document.createElement('div');
-                                row.className = 'search-result-row';
-                                row.textContent = item.display_name;
-                                row.addEventListener('click', () => {
-                                    const lng = parseFloat(item.lon);
-                                    const lat = parseFloat(item.lat);
-                                    map.flyTo({ center: [lng, lat], zoom: 12, speed: 2.8, curve: 1.4 });
-                                    showWeatherPopup({ lng, lat });
-                                    closeMobileSearch();
-                                });
-                                mobileDropdown.appendChild(row);
-                            });
-                            mobileDropdown.style.display = 'block';
-                        }
-                    })
-                    .catch(() => { });
-            }, 250);
+            debounceTimer = setTimeout(async () => {
+                const data = await searchLocations(q);
+                mobileResults = data;
+                if (mobileDropdown) {
+                    mobileDropdown.innerHTML = '';
+                    if (!data.length) {
+                        mobileDropdown.style.display = 'none';
+                        return;
+                    }
+                    data.forEach((item) => {
+                        const row = createResultRow(item, selectResult);
+                        mobileDropdown.appendChild(row);
+                    });
+                    mobileDropdown.style.display = 'flex';
+                }
+            }, 140);
         });
 
         mobileInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') {
-                if (mobileDropdown) {
-                    const firstRow = mobileDropdown.querySelector('.search-result-row');
-                    if (firstRow) firstRow.click();
+                if (mobileResults.length > 0) {
+                    selectResult(mobileResults[0]);
                 }
             } else if (e.key === 'Escape') {
                 closeMobileSearch();
@@ -3839,6 +4472,7 @@ let currentUserCoords = null;
                 mobileDropdown.innerHTML = '';
                 mobileDropdown.style.display = 'none';
             }
+            mobileResults = [];
         });
     }
 
@@ -3865,6 +4499,7 @@ function reverseRoute() {
 }
 
 function deleteLastWaypoint() {
+    if (isLiveNavActive) return;
     if (waypoints.length === 0) return;
     saveHistory();
     const idx = waypoints.length - 1;
@@ -4002,6 +4637,10 @@ document.getElementById('show-distance-markers-check')?.addEventListener('change
     updateDistanceMarkers();
 });
 
+document.getElementById('nav-vibration-check')?.addEventListener('change', (e) => {
+    localStorage.setItem('route_nav_vibration', e.target.checked ? 'true' : 'false');
+});
+
 document.getElementById('high-perf-check')?.addEventListener('change', (e) => {
     isHighPerformance = e.target.checked;
     localStorage.setItem('route_high_performance', isHighPerformance ? 'true' : 'false');
@@ -4010,17 +4649,23 @@ document.getElementById('high-perf-check')?.addEventListener('change', (e) => {
 
 // Settings Handlers
 document.getElementById('theme').addEventListener('change', (e) => {
-    localStorage.setItem('route_theme', e.target.value);
-    const isLight = e.target.value === 'light';
-    if (isLight) {
-        document.body.classList.add('light-mode');
-        document.documentElement.classList.add('light-mode');
+    const val = e.target.value;
+    localStorage.setItem('route_theme', val);
+    if (window.applyAppTheme) {
+        window.applyAppTheme(val);
     } else {
-        document.body.classList.remove('light-mode');
-        document.documentElement.classList.remove('light-mode');
+        const isLight = val === 'light';
+        if (isLight) {
+            document.body.classList.add('light-mode');
+            document.documentElement.classList.add('light-mode');
+        } else {
+            document.body.classList.remove('light-mode');
+            document.documentElement.classList.remove('light-mode');
+        }
     }
+    const isLightNow = document.body.classList.contains('light-mode');
     if (map && map.getLayer && map.getLayer('bg')) {
-        map.setPaintProperty('bg', 'background-color', isLight ? '#ffffff' : '#111111');
+        map.setPaintProperty('bg', 'background-color', isLightNow ? '#ffffff' : '#111111');
     }
     updateChartTheme();
 });
@@ -4310,7 +4955,7 @@ function getRouteElevationArray(coords) {
 
 // Unified parser for all route file formats
 async function parseRouteData(file) {
-    const name = file.name.toLowerCase();
+    const name = (file.name || '').toLowerCase();
     if (name.endsWith('.fit')) {
         const buffer = await file.arrayBuffer();
         const coords = parseFITRoute(buffer);
@@ -4319,32 +4964,43 @@ async function parseRouteData(file) {
     }
 
     const text = await file.text();
+    const trimmed = text.trim();
 
-    if (name.endsWith('.geojson') || name.endsWith('.json')) {
-        const json = JSON.parse(text);
-        const coords = [];
-        const extractCoords = obj => {
-            if (!obj) return;
-            if (obj.type === 'FeatureCollection' && Array.isArray(obj.features)) {
-                obj.features.forEach(extractCoords);
-            } else if (obj.type === 'Feature' && obj.geometry) {
-                extractCoords(obj.geometry);
-            } else if (obj.type === 'LineString' && Array.isArray(obj.coordinates)) {
-                coords.push(...obj.coordinates);
-            } else if (obj.type === 'MultiLineString' && Array.isArray(obj.coordinates)) {
-                obj.coordinates.forEach(ls => coords.push(...ls));
-            }
-        };
-        extractCoords(json);
-        const valid = coords.filter(c => Array.isArray(c) && !isNaN(c[0]) && !isNaN(c[1]));
-        if (valid.length < 2) throw new Error('GeoJSON does not contain a valid LineString with at least 2 points.');
-        return { type: 'track', coords: valid };
+    // GeoJSON detection by extension or content structure
+    if (name.endsWith('.geojson') || name.endsWith('.json') || trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try {
+            const json = JSON.parse(text);
+            const coords = [];
+            const extractCoords = obj => {
+                if (!obj) return;
+                if (obj.type === 'FeatureCollection' && Array.isArray(obj.features)) {
+                    obj.features.forEach(extractCoords);
+                } else if (obj.type === 'Feature' && obj.geometry) {
+                    extractCoords(obj.geometry);
+                } else if (obj.type === 'LineString' && Array.isArray(obj.coordinates)) {
+                    coords.push(...obj.coordinates);
+                } else if (obj.type === 'MultiLineString' && Array.isArray(obj.coordinates)) {
+                    obj.coordinates.forEach(ls => coords.push(...ls));
+                }
+            };
+            extractCoords(json);
+            const valid = coords.filter(c => Array.isArray(c) && !isNaN(c[0]) && !isNaN(c[1]));
+            if (valid.length >= 2) return { type: 'track', coords: valid };
+        } catch (_) {
+            // If JSON parsing fails, fall through to XML/FIT/etc
+        }
     }
 
     const xml = new DOMParser().parseFromString(text, 'application/xml');
     const parserError = xml.querySelector('parsererror');
-    if (parserError && !name.endsWith('.kml') && !name.endsWith('.tcx')) {
-        throw new Error('XML parsing failed: ' + parserError.textContent);
+    if (parserError && !name.endsWith('.kml') && !name.endsWith('.tcx') && !trimmed.includes('<gpx') && !trimmed.includes('<kml')) {
+        // Check if maybe it's binary FIT file with different extension
+        try {
+            const buffer = await file.arrayBuffer();
+            const coords = parseFITRoute(buffer);
+            if (coords && coords.length >= 2) return { type: 'track', coords };
+        } catch (_) {}
+        throw new Error('Could not parse route file. Supported formats: GPX, FIT, TCX, KML, GeoJSON.');
     }
 
     // TCX Format
@@ -4450,41 +5106,135 @@ async function importRouteFile(file) {
 }
 
 // Master Export Function
-function exportRoute(format = 'gpx') {
+function openDownloadModal() {
     if (!currentRouteGeoJSON || !currentRouteGeoJSON.coordinates?.length) {
-        alert('No route to download.');
+        showToast('No route to download.', 'warning');
+        return;
+    }
+
+    const format = localStorage.getItem('route_export_format') || 'gpx';
+    const modal = document.getElementById('download-modal');
+    const input = document.getElementById('download-filename-input');
+    const extLabel = document.getElementById('download-extension-label');
+
+    if (!modal) {
+        exportRoute(format, 'bike-route');
+        return;
+    }
+
+    if (extLabel) extLabel.textContent = `.${format}`;
+    if (input) {
+        input.value = 'bike-route';
+        setTimeout(() => {
+            input.focus();
+            input.select();
+        }, 100);
+    }
+
+    modal.style.display = 'flex';
+}
+
+function closeDownloadModal() {
+    const modal = document.getElementById('download-modal');
+    if (modal) modal.style.display = 'none';
+}
+
+function exportRoute(format = 'gpx', customTitle = 'bike-route') {
+    if (!currentRouteGeoJSON || !currentRouteGeoJSON.coordinates?.length) {
+        showToast('No route to download.', 'warning');
         return;
     }
 
     const coords = currentRouteGeoJSON.coordinates;
     const elevations = getRouteElevationArray(coords);
-    const title = 'bike-route';
+    let title = (customTitle || 'bike-route').trim().replace(/[/\\?%*:|"<>]/g, '_');
+    if (!title) title = 'bike-route';
+
+    let blob;
+    let mimeType;
 
     if (format === 'fit') {
-        const fitBytes = buildFITCourse(coords, elevations, 'Bike Route');
-        const blob = new Blob([fitBytes], { type: 'application/octet-stream' });
-        triggerDownload(blob, `${title}.fit`);
+        const fitBytes = buildFITCourse(coords, elevations, title);
+        mimeType = 'application/octet-stream';
+        blob = new Blob([fitBytes], { type: mimeType });
     } else if (format === 'tcx') {
-        const tcx = buildTCX(coords, elevations, 'Bike Route');
-        const blob = new Blob([tcx], { type: 'application/vnd.garmin.tcx+xml' });
-        triggerDownload(blob, `${title}.tcx`);
+        const tcx = buildTCX(coords, elevations, title);
+        mimeType = 'application/vnd.garmin.tcx+xml';
+        blob = new Blob([tcx], { type: mimeType });
     } else if (format === 'kml') {
-        const kml = buildKML(coords, elevations, 'Bike Route');
-        const blob = new Blob([kml], { type: 'application/vnd.google-earth.kml+xml' });
-        triggerDownload(blob, `${title}.kml`);
+        const kml = buildKML(coords, elevations, title);
+        mimeType = 'application/vnd.google-earth.kml+xml';
+        blob = new Blob([kml], { type: mimeType });
     } else if (format === 'geojson') {
         const geojson = buildGeoJSON(coords, elevations);
-        const blob = new Blob([geojson], { type: 'application/geo+json' });
-        triggerDownload(blob, `${title}.geojson`);
+        mimeType = 'application/geo+json';
+        blob = new Blob([geojson], { type: mimeType });
     } else {
         // GPX fallback
-        const gpx = buildGPX(coords, elevations, 'Bike Route');
-        const blob = new Blob([gpx], { type: 'application/gpx+xml' });
-        triggerDownload(blob, `${title}.gpx`);
+        const gpx = buildGPX(coords, elevations, title);
+        mimeType = 'application/gpx+xml';
+        blob = new Blob([gpx], { type: mimeType });
     }
+
+    triggerDownload(blob, `${title}.${format}`, mimeType);
 }
 
-function triggerDownload(blob, filename) {
+async function triggerDownload(blob, filename, mimeType = 'application/octet-stream') {
+    // 1. Android native DownloadManager / MediaStore Downloads folder with system notification
+    if (window.AndroidMaterialTheme && typeof window.AndroidMaterialTheme.saveToDownloads === 'function') {
+        try {
+            const reader = new FileReader();
+            const base64Promise = new Promise((resolve, reject) => {
+                reader.onloadend = () => {
+                    const res = reader.result;
+                    const b64 = res.split(',')[1] || res;
+                    resolve(b64);
+                };
+                reader.onerror = reject;
+            });
+            reader.readAsDataURL(blob);
+            const base64Data = await base64Promise;
+
+            const resStr = window.AndroidMaterialTheme.saveToDownloads(filename, base64Data, mimeType);
+            const parsed = JSON.parse(resStr || '{}');
+            if (parsed && parsed.success) {
+                showToast(`Downloaded ${filename} to Downloads folder`, 'success');
+                return;
+            }
+        } catch (err) {
+            console.warn('Native saveToDownloads failed, trying fallbacks:', err);
+        }
+    }
+
+    // 2. Capacitor Filesystem fallback
+    if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Filesystem) {
+        try {
+            const { Filesystem } = window.Capacitor.Plugins;
+            const reader = new FileReader();
+            const base64Promise = new Promise((resolve, reject) => {
+                reader.onloadend = () => {
+                    const result = reader.result;
+                    const base64 = result.split(',')[1] || result;
+                    resolve(base64);
+                };
+                reader.onerror = reject;
+            });
+            reader.readAsDataURL(blob);
+            const base64Data = await base64Promise;
+
+            await Filesystem.writeFile({
+                path: filename,
+                data: base64Data,
+                directory: 'DOCUMENTS'
+            });
+            showToast(`Saved ${filename} to Documents`, 'success');
+            return;
+        } catch (err) {
+            console.warn('Filesystem fallback failed, falling back to browser download:', err);
+        }
+    }
+
+    // 3. Standard browser fallback
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -4493,6 +5243,7 @@ function triggerDownload(blob, filename) {
     a.click();
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 2000);
+    showToast(`Downloading ${filename}...`, 'info');
 }
 
 function buildGPX(coords, elevations, name = 'Bike Route') {
@@ -4549,10 +5300,11 @@ function buildTCX(coords, elevations, name = 'Bike Route') {
     let cumulativeDist = 0;
 
     const trackpoints = coords.map((c, i) => {
-        if (i > 0) {
+        if (i > 0 && !isTransitSegment(i - 1)) {
             const prev = coords[i - 1];
             cumulativeDist += getSegmentDistanceMeters(prev[1], prev[0], c[1], c[0]);
         }
+        if (isTransitPoint(i)) return null;
         const ptTime = new Date(baseTime.getTime() + Math.round((cumulativeDist / 6.0) * 1000)).toISOString();
         const ele = elevations?.[i] != null ? elevations[i] : (c[2] != null ? c[2] : 0);
         return `          <Trackpoint>
@@ -4564,7 +5316,7 @@ function buildTCX(coords, elevations, name = 'Bike Route') {
             <AltitudeMeters>${Number(ele).toFixed(1)}</AltitudeMeters>
             <DistanceMeters>${cumulativeDist.toFixed(1)}</DistanceMeters>
           </Trackpoint>`;
-    }).join('\n');
+    }).filter(Boolean).join('\n');
 
     return `<?xml version="1.0" encoding="UTF-8"?>
 <TrainingCenterDatabase xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2">
@@ -4648,12 +5400,34 @@ function importGPX(file) {
     importRouteFile(file);
 }
 
+function refreshMarkerPositions() {
+    if (typeof markers !== 'undefined' && Array.isArray(markers)) {
+        markers.forEach(m => {
+            if (m && typeof m.setLngLat === 'function') {
+                const ll = m.getLngLat();
+                if (ll) m.setLngLat(ll);
+            }
+        });
+    }
+    if (typeof userLocationMarker !== 'undefined' && userLocationMarker && typeof userLocationMarker.setLngLat === 'function') {
+        const ull = userLocationMarker.getLngLat();
+        if (ull) userLocationMarker.setLngLat(ull);
+    }
+    if (window._dragPreviewMarker && window._dragPreviewMarker._added) {
+        const dll = window._dragPreviewMarker.getLngLat();
+        if (dll) window._dragPreviewMarker.setLngLat(dll);
+    }
+    if (map && typeof map.triggerRepaint === 'function') {
+        map.triggerRepaint();
+    }
+}
+
 function applyTerrain() {
     const val = document.getElementById('hillshade-select')?.value || 'off';
     const exInput = document.getElementById('terrain-exaggeration');
 
     localStorage.setItem('route_hillshade', val);
-    let exVal = parseFloat(exInput.value);
+    let exVal = parseFloat(exInput ? exInput.value : 2.0);
     if (isNaN(exVal)) exVal = 2.0;
     localStorage.setItem('route_exaggeration', exVal);
 
@@ -4677,6 +5451,11 @@ function applyTerrain() {
     rebuildMapGradient();
     needsElevationUpdate = true;
     if (typeof updateElevationProfile === 'function') updateElevationProfile();
+    refreshMarkerPositions();
+    requestAnimationFrame(refreshMarkerPositions);
+    setTimeout(refreshMarkerPositions, 60);
+    setTimeout(refreshMarkerPositions, 180);
+    setTimeout(refreshMarkerPositions, 350);
 }
 
 function setRoutingMode(mode) {
@@ -4716,7 +5495,12 @@ document.getElementById('mode-transit')?.addEventListener('click', () => {
 });
 
 document.getElementById('hillshade-select')?.addEventListener('change', applyTerrain);
-document.getElementById('terrain-exaggeration').addEventListener('change', applyTerrain);
+const terrainExEl = document.getElementById('terrain-exaggeration');
+if (terrainExEl) {
+    terrainExEl.addEventListener('input', applyTerrain);
+    terrainExEl.addEventListener('change', applyTerrain);
+}
+map.on('terrain', refreshMarkerPositions);
 
 function updateStatsToggleBtn() {
     const panel = document.getElementById('stats-panel');
@@ -4754,6 +5538,10 @@ function toggleStatsPanel(event) {
 }
 
 document.getElementById('total-distance').addEventListener('click', toggleStatsPanel);
+document.getElementById('brand-logo-btn')?.addEventListener('click', (e) => {
+    e.preventDefault();
+    window.location.reload();
+});
 document.getElementById('close-stats-btn')?.addEventListener('click', (e) => {
     e.stopPropagation();
     document.getElementById('stats-panel').classList.remove('show');
@@ -4767,158 +5555,6 @@ window.addEventListener('click', () => {
 
 document.getElementById('settings-menu').addEventListener('click', e => e.stopPropagation());
 document.getElementById('stats-panel').addEventListener('click', e => e.stopPropagation());
-
-let activeWeatherQueryToken = 0;
-const windForecastCache = new Map();
-
-async function fetchWindAtCoordinates(lat, lng) {
-    const latRounded = Math.round(lat * 100) / 100;
-    const lngRounded = Math.round(lng * 100) / 100;
-    const cacheKey = `${latRounded},${lngRounded}`;
-
-    if (windForecastCache.has(cacheKey)) {
-        return windForecastCache.get(cacheKey);
-    }
-
-    try {
-        const url = `https://api.open-meteo.com/v1/forecast?latitude=${latRounded}&longitude=${lngRounded}&current=wind_speed_10m,wind_direction_10m&wind_speed_unit=kmh`;
-        const resp = await fetch(url);
-        if (!resp.ok) throw new Error(`Weather fetch failed: ${resp.status}`);
-        const data = await resp.json();
-
-        const result = {
-            windSpeedKmh: data.current?.wind_speed_10m ?? 0,
-            windDir: data.current?.wind_direction_10m ?? 0
-        };
-        windForecastCache.set(cacheKey, result);
-        return result;
-    } catch (e) {
-        console.warn(`Could not fetch wind forecast at ${cacheKey}:`, e);
-        return { windSpeedKmh: 0, windDir: 0 };
-    }
-}
-
-function getRouteWeatherSamples() {
-    if (!currentRouteGeoJSON || !routePathDistances || routePathDistances.length < 2) return [];
-
-    const coords = currentRouteGeoJSON.coordinates;
-    const totalDist = routeTotalDist;
-    const interval = Math.max(totalDist / 10, 3218.68); // 1/10th or 2 miles in meters
-
-    const samples = [];
-    let nextTarget = 0;
-
-    for (let i = 0; i < coords.length; i++) {
-        const d = routePathDistances[i];
-        if (d >= nextTarget || i === coords.length - 1) {
-            samples.push({
-                coord: coords[i],
-                rawIdx: i,
-                dist: d
-            });
-            nextTarget += interval;
-        }
-    }
-    return samples;
-}
-
-async function fetchRouteWindData(samples) {
-    const promises = samples.map(s => fetchWindAtCoordinates(s.coord[1], s.coord[0]));
-    const results = await Promise.all(promises);
-    return samples.map((s, idx) => ({
-        ...s,
-        windSpeedKmh: results[idx].windSpeedKmh,
-        windDir: results[idx].windDir
-    }));
-}
-
-function getWindForDistance(routeDist, windSamples) {
-    if (!windSamples || windSamples.length === 0) return { windSpeedKmh: 0, windDir: 0 };
-
-    let closestSample = windSamples[0];
-    let minDiff = Infinity;
-
-    for (const s of windSamples) {
-        const diff = Math.abs(s.dist - routeDist);
-        if (diff < minDiff) {
-            minDiff = diff;
-            closestSample = s;
-        }
-    }
-    return closestSample;
-}
-
-function computeDetailedTimeEstimates(coords, elevations, mode, windSamples) {
-    if (!coords || coords.length < 2) return { baseMin: 0, windMin: 0 };
-
-    let totalBaseMin = 0;
-    let totalWindMin = 0;
-
-    const baseSpeed = currentBaseSpeedKmh;
-    const headwindFactor = (mode === 'hike') ? 0.05 : 0.25;
-    const minSpeed = (mode === 'hike') ? 1.5 : 5;
-    const maxSpeed = (mode === 'hike') ? 8 : 50;
-    const ascentPenalty = (mode === 'hike') ? 0.1 : 0.0833;
-
-    let lastBearing = undefined;
-
-    for (let i = 0; i < coords.length - 1; i++) {
-        const d = haversineDistance(coords[i], coords[i + 1]);
-        if (d <= 0) continue;
-
-        let bearing = 0;
-        if (d > 15) {
-            bearing = getBearing(coords[i], coords[i + 1]);
-            lastBearing = bearing;
-        } else if (lastBearing !== undefined) {
-            bearing = lastBearing;
-        } else {
-            // Find next point that is at least 15m away to get a stable initial bearing
-            let nextIdx = i + 1;
-            while (nextIdx < coords.length && haversineDistance(coords[i], coords[nextIdx]) < 15) {
-                nextIdx++;
-            }
-            if (nextIdx < coords.length) {
-                bearing = getBearing(coords[i], coords[nextIdx]);
-                lastBearing = bearing;
-            } else {
-                bearing = getBearing(coords[i], coords[i + 1]);
-            }
-        }
-
-        const midDist = (routePathDistances[i] + routePathDistances[i + 1]) / 2;
-        const wind = getWindForDistance(midDist, windSamples);
-
-        let segmentBaseSpeed = baseSpeed;
-        if (mode === 'hike') {
-            segmentBaseSpeed = 4.5;
-        }
-
-        // Base time (flat + climb)
-        const baseFlatMin = (d / 1000) / segmentBaseSpeed * 60;
-
-        // Wind-adjusted time (flat adjusted + climb)
-        const relAngle = wind.windDir - bearing;
-        const headwind = wind.windSpeedKmh * Math.cos(relAngle * Math.PI / 180);
-        let adjSpeed = segmentBaseSpeed - (headwind * headwindFactor);
-        adjSpeed = Math.max(minSpeed, Math.min(maxSpeed, adjSpeed));
-        const windFlatMin = (d / 1000) / adjSpeed * 60;
-
-        // Climbing penalty
-        let climbMin = 0;
-        if (elevations && elevations[i] != null && elevations[i + 1] != null) {
-            const elevDiff = elevations[i + 1] - elevations[i];
-            if (elevDiff > 0) {
-                climbMin = elevDiff * ascentPenalty;
-            }
-        }
-
-        totalBaseMin += baseFlatMin + climbMin;
-        totalWindMin += windFlatMin + climbMin;
-    }
-
-    return { baseMin: totalBaseMin, windMin: totalWindMin };
-}
 
 function getEstimatedTime(distanceMeters, elevationGainMeters, mode) {
     if (distanceMeters <= 0) return 0;
@@ -5001,29 +5637,6 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
     const baseMinutes = getEstimatedTime(currentDistanceMeters, totalGainM, currentRoutingMode);
     document.getElementById('stats-time').textContent = `${formatDuration(baseMinutes)} (${getAvgSpeedStr(baseMinutes)})`;
 
-    // Fetch route-level wind data asynchronously
-    const queryToken = ++activeWeatherQueryToken;
-    const samples = getRouteWeatherSamples();
-    if (samples.length > 0) {
-        fetchRouteWindData(samples).then(windSamples => {
-            if (queryToken !== activeWeatherQueryToken) return; // stale query
-
-            const coords = currentRouteGeoJSON.coordinates;
-            const elevations = currentStats ? currentStats.elevations : null;
-            const estimates = computeDetailedTimeEstimates(coords, elevations, currentRoutingMode, windSamples);
-
-            if (estimates.windMin > 0 && queryToken === activeWeatherQueryToken) {
-                const baseTimeStr = formatDuration(estimates.baseMin);
-                const windTimeStr = formatDuration(estimates.windMin);
-                const hasSignificantWind = windSamples.some(s => s.windSpeedKmh > 3);
-                if (hasSignificantWind) {
-                    document.getElementById('stats-time').textContent = `${windTimeStr} (${getAvgSpeedStr(estimates.windMin)})`;
-                } else {
-                    document.getElementById('stats-time').textContent = `${baseTimeStr} (${getAvgSpeedStr(estimates.baseMin)})`;
-                }
-            }
-        }).catch(err => console.warn('Wind stats calc error:', err));
-    }
 
     const unitLabel = currentUnits === 'metric' ? 'm' : 'ft';
     const gainVal = currentUnits === 'metric' ? totalGainM : totalGainM * 3.28084;
@@ -5054,7 +5667,7 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
         let maxDownGrade = Infinity;
 
         for (let i = 0; i < smoothedSegmentGrades.length; i++) {
-            if (isTransitPoint(i)) continue;
+            if (isTransitPoint(i) || isTransitSegment(i)) continue;
             const grade = smoothedSegmentGrades[i];
             if (grade == null || isNaN(grade)) continue;
             if (grade > 0.5) {
@@ -5347,6 +5960,12 @@ function loadStoredSettings() {
         distanceMarkersEl.checked = showDistanceMarkersVal !== null ? showDistanceMarkersVal === 'true' : false;
     }
 
+    const navVibrationVal = localStorage.getItem('route_nav_vibration');
+    const navVibrationEl = document.getElementById('nav-vibration-check');
+    if (navVibrationEl) {
+        navVibrationEl.checked = navVibrationVal !== null ? navVibrationVal === 'true' : true;
+    }
+
     const highPerfVal = localStorage.getItem('route_high_performance');
     const highPerfEl = document.getElementById('high-perf-check');
     if (highPerfEl) {
@@ -5386,12 +6005,85 @@ document.getElementById('gpx-file-input')?.addEventListener('change', (e) => {
 });
 
 downloadBtn?.addEventListener('click', () => {
-    if (!currentRouteGeoJSON || !currentRouteGeoJSON.coordinates?.length) {
-        alert('No route to download.');
+    openDownloadModal();
+});
+
+document.getElementById('download-modal-close')?.addEventListener('click', closeDownloadModal);
+document.getElementById('download-modal-cancel')?.addEventListener('click', closeDownloadModal);
+document.getElementById('download-modal-confirm')?.addEventListener('click', () => {
+    const input = document.getElementById('download-filename-input');
+    const customTitle = (input ? input.value : 'bike-route') || 'bike-route';
+    const format = localStorage.getItem('route_export_format') || 'gpx';
+    closeDownloadModal();
+    exportRoute(format, customTitle);
+});
+document.getElementById('download-filename-input')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        e.preventDefault();
+        document.getElementById('download-modal-confirm')?.click();
+    } else if (e.key === 'Escape') {
+        closeDownloadModal();
+    }
+});
+
+// Wire up Share button
+const shareBtn = document.getElementById('share-route-btn');
+shareBtn?.addEventListener('click', async () => {
+    if (waypoints.length < 2) {
+        showToast('Please add at least 2 points to share a route.', 'warning');
         return;
     }
-    const format = localStorage.getItem('route_export_format') || 'gpx';
-    exportRoute(format);
+
+    // Build the share URL pointing to ioncook.github.io/bike-route-planner
+    const params = new URLSearchParams();
+    const wpStr = waypoints.map(wp => `${wp[0].toFixed(5)},${wp[1].toFixed(5)}`).join(';');
+    params.set('route', wpStr);
+    if (segmentModes.length > 0) params.set('modes', segmentModes.join(','));
+    if (forceMode) params.set('force', '1');
+
+    const shareUrl = `https://ioncook.github.io/bike-route-planner/?${params.toString()}`;
+    const distText = document.getElementById('total-distance')?.textContent?.trim() || '';
+    const shareTitle = 'Bike Route Planner Route';
+    const shareText = distText ? `Bike route (${distText})` : 'Bike route';
+
+    // 1. Try Capacitor native Share plugin if available
+    if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Share) {
+        try {
+            await window.Capacitor.Plugins.Share.share({
+                title: shareTitle,
+                text: shareText,
+                url: shareUrl,
+                dialogTitle: 'Share Route'
+            });
+            return;
+        } catch (err) {
+            if (err.name !== 'AbortError') console.warn('Capacitor share cancelled or failed:', err);
+            return;
+        }
+    }
+
+    // 2. Try standard navigator.share
+    if (navigator.share) {
+        try {
+            await navigator.share({
+                title: shareTitle,
+                text: shareText,
+                url: shareUrl
+            });
+            return;
+        } catch (err) {
+            if (err.name !== 'AbortError') console.warn('Navigator share error:', err);
+            return;
+        }
+    }
+
+    // 3. Fallback: Copy to clipboard
+    try {
+        await navigator.clipboard.writeText(shareUrl);
+        showToast('Route link copied to clipboard!', 'info');
+    } catch (_) {
+        prompt('Copy this route link:', shareUrl);
+    }
 });
 
 Chart.Interaction.modes.routeHover = function (chart, e, options, useFinalPosition) {
@@ -5640,10 +6332,20 @@ function initChart() {
         plugins: [{
             id: 'hoverLine',
             beforeDatasetsDraw: (chart) => {
-                if (currentHoverDispDist !== null && chart.scales.x) {
-                    const x = chart.scales.x.getPixelForValue(currentHoverDispDist);
-                    const area = chart.chartArea;
-                    if (!area || x < area.left || x > area.right) return;
+                if (!chart.scales.x) return;
+                const area = chart.chartArea;
+                if (!area) return;
+
+                let targetDist = null;
+                if (currentHoverDispDist !== null) {
+                    targetDist = currentHoverDispDist;
+                } else if (isLiveNavActive && isNavOnRoute && currentNavDispDist !== null) {
+                    targetDist = currentNavDispDist;
+                }
+
+                if (targetDist !== null) {
+                    const x = chart.scales.x.getPixelForValue(targetDist);
+                    if (x < area.left || x > area.right) return;
                     const top = area.top;
                     const bottom = area.bottom;
                     const ctx = chart.ctx;
@@ -5674,7 +6376,7 @@ function initChart() {
 
                 const buildGrad = (alpha) => {
                     const grad = ctx.createLinearGradient(area.left, 0, area.right, 0);
-                    const STOPS = 300; // Increased from 50 for ultra-high-def color/height sync
+                    const STOPS = 300; // Ultra-high-def color/height sync
                     const data = ds.data;
                     const totalDist = data.length ? data[data.length - 1].x : 1;
                     for (let s = 0; s <= STOPS; s++) {
@@ -5685,7 +6387,19 @@ function initChart() {
                             const mid = (lo + hi) >> 1;
                             if (data[mid].x < distVal) lo = mid + 1; else hi = mid;
                         }
-                        const color = getColorForGrade(grades[lo] ?? 0);
+                        const pt = data[lo];
+                        let grade = pt ? pt.grade : 0;
+                        if (grade === undefined && pt && pt.rawIdx != null) {
+                            grade = grades[pt.rawIdx] ?? 0;
+                        }
+                        if (pt && pt.y === null) {
+                            if (lo + 1 < data.length && data[lo + 1].y !== null) {
+                                grade = data[lo + 1].grade ?? (data[lo + 1].rawIdx != null ? grades[data[lo + 1].rawIdx] : 0);
+                            } else if (lo > 0 && data[lo - 1].y !== null) {
+                                grade = data[lo - 1].grade ?? (data[lo - 1].rawIdx != null ? grades[data[lo - 1].rawIdx] : 0);
+                            }
+                        }
+                        const color = getColorForGrade(grade ?? 0);
                         grad.addColorStop(frac, color.replace('rgb(', 'rgba(').replace(')', `, ${alpha})`));
                     }
                     return grad;
@@ -5699,15 +6413,15 @@ function initChart() {
     });
 
     const clearHover = () => {
+        currentHoverDispDist = null;
         if (elevationChart) {
             elevationChart.setActiveElements([]);
             if (elevationChart.tooltip) elevationChart.tooltip.setActiveElements([]);
             elevationChart.update('none');
         }
-        currentHoverDispDist = null;
         hideHoverMarker();
         const statsDiv = document.getElementById('hover-stats');
-        if (statsDiv) statsDiv.style.opacity = '0';
+        if (statsDiv && !isLiveNavActive) statsDiv.style.opacity = '0';
     };
 
     const handleHoverMove = (clientX) => {
@@ -5718,15 +6432,13 @@ function initChart() {
         const rect = ctx.canvas.getBoundingClientRect();
         const canvasX = clientX - rect.left;
 
+        let targetCanvasX = canvasX;
         if (chart.chartArea) {
-            if (canvasX < chart.chartArea.left || canvasX > chart.chartArea.right) {
-                clearHover();
-                return;
-            }
+            targetCanvasX = Math.max(chart.chartArea.left, Math.min(chart.chartArea.right, canvasX));
         }
 
         // canvasX is in CSS pixels; Chart.js scales use the same coordinate space.
-        const xValue = chart.scales.x?.getValueForPixel(canvasX);
+        const xValue = chart.scales.x?.getValueForPixel(targetCanvasX);
         if (xValue == null) return;
 
         const data = chart.data.datasets[0]?.data;
@@ -5760,7 +6472,7 @@ function initChart() {
         } else {
             ci = Math.min(Math.floor((i / Math.max(1, data.length - 1)) * (coords.length - 1)), coords.length - 2);
         }
-        if (ci >= 0 && isTransitPoint(ci)) {
+        if (ci >= 0 && (isTransitPoint(ci) || isTransitSegment(ci))) {
             clearHover();
             return;
         }
@@ -5819,41 +6531,92 @@ function initChart() {
         }
     };
 
+    let isPointerDragging = false;
+
+    ctx.canvas.addEventListener('pointerdown', (e) => {
+        isPointerDragging = true;
+        try { ctx.canvas.setPointerCapture(e.pointerId); } catch (_) {}
+        handleHoverMove(e.clientX);
+    });
+    ctx.canvas.addEventListener('pointermove', (e) => {
+        if (isPointerDragging || e.buttons > 0) {
+            handleHoverMove(e.clientX);
+        }
+    });
+    const handlePointerEnd = (e) => {
+        if (isPointerDragging) {
+            isPointerDragging = false;
+            try { ctx.canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+            clearHover();
+        }
+    };
+    ctx.canvas.addEventListener('pointerup', handlePointerEnd);
+    ctx.canvas.addEventListener('pointercancel', handlePointerEnd);
+
     ctx.canvas.addEventListener('mouseout', clearHover);
-    ctx.canvas.addEventListener('touchend', clearHover, { passive: true });
-    ctx.canvas.addEventListener('touchcancel', clearHover, { passive: true });
+    ctx.canvas.addEventListener('touchend', (e) => {
+        clearHover();
+    });
+    ctx.canvas.addEventListener('touchcancel', (e) => {
+        clearHover();
+    });
 
     ctx.canvas.addEventListener('mousemove', (e) => {
         handleHoverMove(e.clientX);
     });
     ctx.canvas.addEventListener('touchstart', (e) => {
+        if (e.cancelable) e.preventDefault();
+        e.stopPropagation();
         if (e.touches.length > 0) {
             handleHoverMove(e.touches[0].clientX);
         }
-    }, { passive: true });
+    }, { passive: false });
     ctx.canvas.addEventListener('touchmove', (e) => {
+        if (e.cancelable) e.preventDefault();
+        e.stopPropagation();
         if (e.touches.length > 0) {
             handleHoverMove(e.touches[0].clientX);
         }
-    }, { passive: true });
+    }, { passive: false });
 
     updateChartTheme();
 }
 
 function updateChartTheme() {
     if (!elevationChart) return;
+    const computed = window.getComputedStyle(document.documentElement);
     const isLight = document.body.classList.contains('light-mode');
+
+    // Resolve border / grid line color from CSS variables (supports Material, Dark, Light)
+    let gridColor = computed.getPropertyValue('--border').trim();
+    if (!gridColor || gridColor === '') {
+        gridColor = isLight ? 'rgba(0, 0, 0, 0.12)' : '#333333';
+    } else {
+        // If border is hex/rgb, soften slightly for grid lines
+        if (gridColor.startsWith('#')) {
+            const r = parseInt(gridColor.slice(1, 3), 16) || 128;
+            const g = parseInt(gridColor.slice(3, 5), 16) || 128;
+            const b = parseInt(gridColor.slice(5, 7), 16) || 128;
+            gridColor = `rgba(${r}, ${g}, ${b}, ${isLight ? 0.35 : 0.6})`;
+        }
+    }
+
+    // Resolve tick text color from CSS variables
+    let tickColor = computed.getPropertyValue('--text-muted').trim();
+    if (!tickColor || tickColor === '') {
+        tickColor = isLight ? '#475569' : '#aaaaaa';
+    }
 
     // Update X-axis colors
     if (elevationChart.options.scales.x) {
-        elevationChart.options.scales.x.grid.color = isLight ? 'rgba(0, 0, 0, 0.08)' : '#333';
-        elevationChart.options.scales.x.ticks.color = isLight ? '#555' : '#aaa';
+        elevationChart.options.scales.x.grid.color = gridColor;
+        elevationChart.options.scales.x.ticks.color = tickColor;
     }
 
     // Update Y-axis colors
     if (elevationChart.options.scales.y) {
-        elevationChart.options.scales.y.grid.color = isLight ? 'rgba(0, 0, 0, 0.08)' : '#333';
-        elevationChart.options.scales.y.ticks.color = isLight ? '#555' : '#aaa';
+        elevationChart.options.scales.y.grid.color = gridColor;
+        elevationChart.options.scales.y.ticks.color = tickColor;
     }
 
     elevationChart.update();
@@ -5904,7 +6667,7 @@ async function updateElevationProfile() {
 
         // Build pathDistances and mercDistances for map gradient (excluding transit distance)
         for (let i = 1; i < coords.length; i++) {
-            const inTransit = isTransitPoint(i);
+            const inTransit = isTransitSegment(i - 1);
             if (!inTransit) {
                 distMeters += haversineDistance(coords[i - 1], coords[i]);
             }
@@ -6108,7 +6871,7 @@ async function updateElevationProfile() {
                     filteredChartData.push({ x: ptX, y: null });
                 }
 
-                filteredChartData.push({ x: ptX, y: displayElev ?? null });
+                filteredChartData.push({ x: ptX, y: displayElev ?? null, rawIdx: i });
                 if (displayElev != null) {
                     if (displayElev > filteredMax) {
                         filteredMax = displayElev;
@@ -6224,11 +6987,15 @@ async function updateElevationProfile() {
         // Clear icon cache to ensure new text centering is applied
         for (let key in wpIcons) delete wpIcons[key];
 
-        // Chart.js colors segment i (point i → i+1) using borderColor[i].
-        // smoothedGrades[i] = grade of segment arriving at point i.
-        // Using grades[i] for segment i means the color lags by one segment at
-        // transitions — acceptable since the hover tooltip uses the same index.
-        const borderColors = smoothedGrades.map(g => getColorForGrade(g));
+        // Attach smoothed grades directly to chartData points and sync borderColors
+        chartData.forEach(pt => {
+            if (pt.rawIdx != null) {
+                pt.grade = smoothedGrades[pt.rawIdx] ?? 0;
+            } else {
+                pt.grade = 0;
+            }
+        });
+        const borderColors = chartData.map(pt => pt.y === null ? 'transparent' : getColorForGrade(pt.grade ?? 0));
         // Waypoints on Chart (Excluding endpoints)
         const wpData = [];
         const wpStyles = [];
@@ -6333,6 +7100,7 @@ async function updateElevationProfile() {
             elevations: [...elevations]
         };
         updateStatsUI(currentStats.gain, currentStats.loss, currentStats.min, currentStats.max, currentStats.grades);
+        updateDistanceMarkers();
         needsElevationUpdate = false;
     } finally {
         isUpdatingElevation = false;
@@ -6352,16 +7120,49 @@ function syncUrl() {
         params.set('route', wpStr);
         if (segmentModes.length > 0) params.set('modes', segmentModes.join(','));
         else params.delete('modes');
+        try {
+            localStorage.setItem('cached_active_route', JSON.stringify({
+                route: wpStr,
+                modes: segmentModes.join(','),
+                force: forceMode ? '1' : '0'
+            }));
+        } catch (_) {}
     } else {
         params.delete('route');
         params.delete('modes');
+        try {
+            localStorage.removeItem('cached_active_route');
+        } catch (_) {}
     }
     if (forceMode) params.set('force', '1'); else params.delete('force');
     window.history.replaceState({}, '', `${window.location.pathname}?${params.toString()}`);
 }
 
-function loadUrlState() {
-    const params = new URLSearchParams(window.location.search);
+function loadUrlState(customUrl) {
+    let params;
+    if (customUrl) {
+        try {
+            const parsed = new URL(customUrl);
+            params = new URLSearchParams(parsed.search || parsed.hash.replace(/^#\/?/, ''));
+        } catch (_) {
+            params = new URLSearchParams(window.location.search);
+        }
+    } else {
+        params = new URLSearchParams(window.location.search);
+    }
+
+    // If no route in URL, check cached route in localStorage
+    if (!params.get('route')) {
+        try {
+            const cachedRoute = JSON.parse(localStorage.getItem('cached_active_route') || 'null');
+            if (cachedRoute && cachedRoute.route) {
+                params.set('route', cachedRoute.route);
+                if (cachedRoute.modes) params.set('modes', cachedRoute.modes);
+                if (cachedRoute.force === '1') params.set('force', '1');
+            }
+        } catch (_) {}
+    }
+
     // Restore force mode before building the route
     if (params.get('force') === '1') {
         forceMode = true;
@@ -6380,6 +7181,11 @@ function loadUrlState() {
     }
 
     if (routeStr) {
+        // Clear any existing markers if reloading from deep link or new route provided
+        if (customUrl || waypoints.length > 0) {
+            clearRoute(false);
+        }
+
         if (modes.length > 0) {
             const lastMode = modes[modes.length - 1];
             const fallbackMode = lastMode === 'gpx' ? 'bike' : lastMode;
@@ -6408,8 +7214,8 @@ function loadUrlState() {
             for (const wp of waypoints) {
                 bounds.extend(wp);
             }
-            fitBoundsSmart(bounds, { duration: 0 }); // Instant fit on load
-            // After camera settles and tiles load, force an elevation refresh
+            fitBoundsSmart(bounds, { duration: customUrl ? 500 : 0 });
+            removeInitialCover();
             map.once('idle', () => {
                 needsElevationUpdate = true;
                 updateElevationProfile();
@@ -6424,9 +7230,157 @@ function loadUrlState() {
     }
 }
 
+// Helper to handle base64 route files passed from Android "Open with" intent
+async function handleNativeIncomingRouteFile(fileDetail) {
+    if (!fileDetail || !fileDetail.base64) return;
+    try {
+        const raw = atob(fileDetail.base64);
+        const u8 = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) {
+            u8[i] = raw.charCodeAt(i);
+        }
+        const fileName = fileDetail.name || 'imported_route.gpx';
+        const file = new File([u8], fileName, { type: 'application/octet-stream' });
+        console.log('Importing route file opened from system:', fileName);
+        await importRouteFile(file);
+        removeInitialCover();
+    } catch (err) {
+        console.error('Failed to import native route file:', err);
+    }
+}
+
+// Listen for incoming route file event dispatched from native Android MainActivity
+window.addEventListener('incomingRouteFile', (e) => {
+    if (e.detail) {
+        handleNativeIncomingRouteFile(e.detail);
+    }
+});
+
+// Check if a route file was passed on app cold launch via AndroidMaterialTheme bridge
+function checkPendingNativeRouteFile() {
+    if (window.AndroidMaterialTheme && typeof window.AndroidMaterialTheme.getPendingRouteFile === 'function') {
+        try {
+            const raw = window.AndroidMaterialTheme.getPendingRouteFile();
+            if (raw) {
+                window.AndroidMaterialTheme.clearPendingRouteFile();
+                const fileDetail = JSON.parse(raw);
+                if (fileDetail && fileDetail.base64) {
+                    handleNativeIncomingRouteFile(fileDetail);
+                    return true;
+                }
+            }
+        } catch (e) {
+            console.error('Error checking pending native route file:', e);
+        }
+    }
+    return false;
+}
+
+// Helper to handle coordinates/query passed from Android "Open with" location / geo dialog
+async function handleIncomingLocation(detail) {
+    if (!detail) return;
+    try {
+        let lng = detail.lng;
+        let lat = detail.lat;
+
+        // If no coordinates provided directly but a search query exists, try geocoding it
+        if ((lng == null || lat == null) && detail.query) {
+            try {
+                const resp = await fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(detail.query)}&limit=1`);
+                if (resp.ok) {
+                    const geojson = await resp.json();
+                    if (geojson.features && geojson.features.length > 0) {
+                        const coords = geojson.features[0].geometry.coordinates;
+                        lng = coords[0];
+                        lat = coords[1];
+                    }
+                }
+            } catch (err) {
+                console.warn('Could not geocode incoming location query:', err);
+            }
+        }
+
+        if (lng != null && lat != null && !isNaN(lng) && !isNaN(lat)) {
+            removeInitialCover();
+            map.flyTo({ center: [lng, lat], zoom: 15, duration: 800 });
+            // Show right-click / weather popup at target location
+            showWeatherPopup({ lng, lat });
+        }
+    } catch (err) {
+        console.error('Failed to handle incoming location intent:', err);
+    }
+}
+
+// Listen for incoming location intent event dispatched from native Android MainActivity
+window.addEventListener('incomingLocationIntent', (e) => {
+    if (e.detail) {
+        handleIncomingLocation(e.detail);
+    }
+});
+
+// Check if a location was passed on app cold launch via AndroidMaterialTheme bridge
+function checkPendingNativeLocation() {
+    if (window.AndroidMaterialTheme && typeof window.AndroidMaterialTheme.getPendingLocation === 'function') {
+        try {
+            const raw = window.AndroidMaterialTheme.getPendingLocation();
+            if (raw) {
+                window.AndroidMaterialTheme.clearPendingLocation();
+                const detail = JSON.parse(raw);
+                if (detail) {
+                    handleIncomingLocation(detail);
+                    return true;
+                }
+            }
+        } catch (e) {
+            console.error('Error checking pending native location:', e);
+        }
+    }
+    return false;
+}
+
+// Deep linking support via Capacitor App plugin
+if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App) {
+    window.Capacitor.Plugins.App.addListener('appUrlOpen', (data) => {
+        if (data && data.url) {
+            console.log('App opened with URL:', data.url);
+            if (data.url.startsWith('file://') || data.url.startsWith('content://')) {
+                // If Capacitor passes content/file URI, let Android bridge or checkPending handle or inspect
+                checkPendingNativeRouteFile();
+            } else if (data.url.startsWith('geo:')) {
+                // Parse geo: scheme if received via Capacitor
+                try {
+                    const raw = data.url.replace(/^geo:/, '');
+                    const qIdx = raw.indexOf('?');
+                    let lat = null, lng = null, query = null;
+                    if (qIdx !== -1) {
+                        const qStr = raw.substring(qIdx + 1);
+                        const params = new URLSearchParams(qStr);
+                        query = params.get('q');
+                    }
+                    const coordsPart = qIdx !== -1 ? raw.substring(0, qIdx) : raw;
+                    const parts = coordsPart.split(',');
+                    if (parts.length >= 2) {
+                        lat = parseFloat(parts[0]);
+                        lng = parseFloat(parts[1]);
+                    }
+                    handleIncomingLocation({ lat, lng, query });
+                } catch (e) {
+                    console.error('Failed to parse Capacitor geo url:', e);
+                }
+            } else if (data.url.includes('maps.google') || data.url.includes('google.com/maps') || data.url.includes('goo.gl')) {
+                // Handled natively by MainActivity or parsed directly
+                checkPendingNativeLocation();
+            } else {
+                loadUrlState(data.url);
+            }
+        }
+    });
+}
+
 function removeInitialCover() {
     const cover = document.getElementById('initial-map-cover');
     if (cover) {
+        cover.style.pointerEvents = 'none';
         cover.style.opacity = '0';
         setTimeout(() => {
             if (cover.parentNode) cover.remove();
@@ -7029,12 +7983,64 @@ initCustomTooltips();
 let userLocationMarker = null;
 let userLocationWatchId = null;
 
+function createUserLocationMarkerElement() {
+    const root = document.createElement('div');
+    root.className = 'user-location-marker-root';
+
+    const coneWrapper = document.createElement('div');
+    coneWrapper.className = 'user-location-cone-wrapper';
+
+    const coneSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    coneSvg.setAttribute('viewBox', '0 0 80 80');
+    coneSvg.setAttribute('class', 'user-location-cone-svg');
+    coneSvg.innerHTML = `
+        <defs>
+            <radialGradient id="loc-cone-grad" cx="50%" cy="50%" r="50%">
+                <stop offset="0%" stop-color="currentColor" stop-opacity="0.65"/>
+                <stop offset="55%" stop-color="currentColor" stop-opacity="0.25"/>
+                <stop offset="100%" stop-color="currentColor" stop-opacity="0"/>
+            </radialGradient>
+        </defs>
+        <path d="M 40 40 L 19.9 7.8 A 38 38 0 0 1 60.1 7.8 Z" fill="url(#loc-cone-grad)"/>
+    `;
+    coneWrapper.appendChild(coneSvg);
+    root.appendChild(coneWrapper);
+
+    const pulse = document.createElement('div');
+    pulse.className = 'user-location-pulse';
+    root.appendChild(pulse);
+
+    const dot = document.createElement('div');
+    dot.className = 'user-location-dot';
+    root.appendChild(dot);
+
+    return root;
+}
+
+function ensureUserLocationMarker(lngLat) {
+    if (!userLocationMarker) {
+        userLocationMarker = new maplibregl.Marker({
+            element: createUserLocationMarkerElement(),
+            anchor: 'center',
+            rotationAlignment: 'map',
+            pitchAlignment: 'viewport'
+        }).setLngLat(lngLat).addTo(map);
+
+        const el = userLocationMarker.getElement();
+        if (el) {
+            el.style.pointerEvents = 'none';
+        }
+    }
+}
+
 function updateUserLocationPin() {
     const showCheck = document.getElementById('show-location-check');
     const isEnabled = showCheck ? showCheck.checked : false;
     localStorage.setItem('route_show_location_check', isEnabled);
 
-    if (!isEnabled) {
+    const isDebugActive = localStorage.getItem('debug_gps_joystick_enabled') === 'true';
+
+    if (!isEnabled && !isDebugActive && !isLiveNavActive) {
         if (userLocationWatchId !== null) {
             navigator.geolocation.clearWatch(userLocationWatchId);
             userLocationWatchId = null;
@@ -7051,22 +8057,13 @@ function updateUserLocationPin() {
     if (userLocationWatchId === null) {
         userLocationWatchId = navigator.geolocation.watchPosition(
             (pos) => {
+                if (localStorage.getItem('debug_gps_joystick_enabled') === 'true') return;
                 const lngLat = [pos.coords.longitude, pos.coords.latitude];
                 currentUserCoords = lngLat;
-                if (!userLocationMarker) {
-                    const el = document.createElement('div');
-                    el.style.width = '20px';
-                    el.style.height = '20px';
-                    el.style.backgroundColor = '#3b82f6';
-                    el.style.border = '3px solid #ffffff';
-                    el.style.borderRadius = '50%';
-                    el.style.boxShadow = '0 0 6px rgba(0,0,0,0.4), 0 0 0 4px rgba(59, 130, 246, 0.4)';
-                    el.style.cursor = 'default';
-                    userLocationMarker = new maplibregl.Marker({ element: el, anchor: 'center' })
-                        .setLngLat(lngLat)
-                        .addTo(map);
-                } else {
-                    userLocationMarker.setLngLat(lngLat);
+                ensureUserLocationMarker(lngLat);
+                userLocationMarker.setLngLat(lngLat);
+                if (pos.coords.heading != null && !isNaN(pos.coords.heading)) {
+                    userLocationMarker.setRotation(pos.coords.heading);
                 }
             },
             () => {
@@ -7181,3 +8178,1437 @@ function updateDistanceMarkers() {
         features
     });
 }
+
+// ==========================================
+// LIVE NAVIGATION & TELEMETRY ENGINE
+// ==========================================
+let navWatchId = null;
+let lastKnownGpsPos = null;
+
+function calculateBearing(c1, c2) {
+    const lat1 = c1[1] * Math.PI / 180;
+    const lat2 = c2[1] * Math.PI / 180;
+    const dLng = (c2[0] - c1[0]) * Math.PI / 180;
+    const y = Math.sin(dLng) * Math.cos(lat2);
+    const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+
+function getBearingName(deg) {
+    const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+    const idx = Math.round(deg / 45) % 8;
+    return directions[idx];
+}
+
+// Distance in meters from point P to line segment AB
+function distToSegment(p, a, b) {
+    const l2 = (b[0] - a[0]) * (b[0] - a[0]) + (b[1] - a[1]) * (b[1] - a[1]);
+    if (l2 === 0) return haversineDistance(p, a);
+    let t = ((p[0] - a[0]) * (b[0] - a[0]) + (p[1] - a[1]) * (b[1] - a[1])) / l2;
+    t = Math.max(0, Math.min(1, t));
+    const proj = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
+    return {
+        distMeters: haversineDistance(p, proj),
+        projectedPoint: proj,
+        t: t
+    };
+}
+
+function findClosestPointOnRoute(gpsLngLat, ignoreTransit = false) {
+    if (!currentRouteGeoJSON || !currentRouteGeoJSON.coordinates || currentRouteGeoJSON.coordinates.length < 2) {
+        return null;
+    }
+    const coords = currentRouteGeoJSON.coordinates;
+    let minDistance = Infinity;
+    let closestIndex = 0;
+    let bestProj = coords[0];
+    let bestT = 0;
+
+    for (let i = 0; i < coords.length - 1; i++) {
+        if (ignoreTransit && isTransitSegment(i)) continue;
+        const seg = distToSegment(gpsLngLat, coords[i], coords[i + 1]);
+        if (seg.distMeters < minDistance) {
+            minDistance = seg.distMeters;
+            closestIndex = i;
+            bestProj = seg.projectedPoint;
+            bestT = seg.t;
+        }
+    }
+
+    // Calculate approximate distance along route from start to this projected point
+    let distAlongRoute = 0;
+    if (routePathDistances && routePathDistances.length > closestIndex) {
+        const d0 = routePathDistances[closestIndex] || 0;
+        const d1 = routePathDistances[closestIndex + 1] || d0;
+        distAlongRoute = d0 + bestT * (d1 - d0);
+    }
+
+    return {
+        distMeters: minDistance,
+        index: closestIndex,
+        point: bestProj,
+        distAlongRoute: distAlongRoute,
+        isTransit: isTransitSegment(closestIndex)
+    };
+}
+
+// Calculate forward geodetic point given origin, bearing in degrees, and distance in meters
+function offsetLngLat(lngLat, bearingDeg, distMeters) {
+    const R = 6371000;
+    const d = distMeters / R;
+    const brng = bearingDeg * Math.PI / 180;
+    const lat1 = lngLat[1] * Math.PI / 180;
+    const lon1 = lngLat[0] * Math.PI / 180;
+
+    const lat2 = Math.asin(Math.sin(lat1) * Math.cos(d) + Math.cos(lat1) * Math.sin(d) * Math.cos(brng));
+    const lon2 = lon1 + Math.atan2(Math.sin(brng) * Math.sin(d) * Math.cos(lat1), Math.cos(d) - Math.sin(lat1) * Math.sin(lat2));
+
+    return [lon2 * 180 / Math.PI, lat2 * 180 / Math.PI];
+}
+
+// Determine upcoming turn instruction ahead along route (alerting only at real intersection turns)
+function getUpcomingTurn(coords, fromIndex, maxLookaheadMeters = 500) {
+    if (!coords || fromIndex >= coords.length - 2) {
+        return {
+            type: 'arrive',
+            text: 'Arriving at destination',
+            distMeters: 0,
+            icon: 'flag'
+        };
+    }
+
+    // Check if within 30m of destination
+    let totalDistToEnd = 0;
+    for (let j = fromIndex; j < coords.length - 1; j++) {
+        totalDistToEnd += haversineDistance(coords[j], coords[j + 1]);
+    }
+    if (totalDistToEnd < 30) {
+        return {
+            type: 'arrive',
+            text: 'Arriving at destination',
+            distMeters: totalDistToEnd,
+            icon: 'flag'
+        };
+    }
+
+    // Check if approaching a transit / gap segment
+    let nextTransitStartIdx = null;
+    let nextTransitSegIdx = null;
+    if (waypointPathIndices && waypointPathIndices.length >= 2) {
+        for (let segI = 0; segI < waypointPathIndices.length - 1; segI++) {
+            if (segmentModes[segI] === 'transit') {
+                const sStart = waypointPathIndices[segI];
+                if (sStart > fromIndex) {
+                    if (nextTransitStartIdx === null || sStart < nextTransitStartIdx) {
+                        nextTransitStartIdx = sStart;
+                        nextTransitSegIdx = segI;
+                    }
+                }
+            }
+        }
+    }
+
+    let distToTransitStart = Infinity;
+    if (nextTransitStartIdx !== null) {
+        distToTransitStart = 0;
+        for (let j = fromIndex; j < nextTransitStartIdx; j++) {
+            distToTransitStart += haversineDistance(coords[j], coords[j + 1]);
+        }
+        if (distToTransitStart < 30) {
+            return {
+                type: 'arrive-segment',
+                text: 'Reached end of segment',
+                distMeters: distToTransitStart,
+                icon: 'transit',
+                transitSegIdx: nextTransitSegIdx
+            };
+        }
+    }
+
+    // Prioritize verified turn instructions from routing engine (BRouter voicehints / intersections)
+    if (routeTurnInstructions && routeTurnInstructions.length > 0) {
+        for (const inst of routeTurnInstructions) {
+            if (inst.rawIdx > fromIndex) {
+                // Check if approaching a transit segment before this turn
+                if (nextTransitStartIdx !== null && inst.rawIdx >= nextTransitStartIdx && distToTransitStart <= maxLookaheadMeters) {
+                    return {
+                        type: 'arrive-segment',
+                        text: 'End of segment ahead',
+                        distMeters: distToTransitStart,
+                        icon: 'transit',
+                        transitSegIdx: nextTransitSegIdx
+                    };
+                }
+
+                let distToTurn = 0;
+                for (let j = fromIndex; j < inst.rawIdx; j++) {
+                    distToTurn += haversineDistance(coords[j], coords[j + 1]);
+                }
+                if (distToTurn <= maxLookaheadMeters) {
+                    return {
+                        type: inst.type,
+                        text: inst.text,
+                        distMeters: distToTurn,
+                        icon: inst.icon,
+                        turnIndex: inst.rawIdx,
+                        isIntersection: true
+                    };
+                }
+                break;
+            }
+        }
+        return {
+            type: 'straight',
+            text: 'Continue on current route',
+            distMeters: 0,
+            icon: 'straight',
+            turnIndex: -1,
+            isIntersection: false
+        };
+    }
+
+    let accumDist = 0;
+    // Fallback geometric detection for imported GPX without routing metadata:
+    // Only detect sharp, localized corner deflections (>= 55 degrees) to completely ignore winding curved roads.
+    for (let i = fromIndex + 1; i < coords.length - 1; i++) {
+        const segDist = haversineDistance(coords[i - 1], coords[i]);
+        accumDist += segDist;
+        if (accumDist > maxLookaheadMeters) break;
+
+        if (nextTransitStartIdx !== null && i >= nextTransitStartIdx) {
+            return {
+                type: 'arrive-segment',
+                text: 'End of segment ahead',
+                distMeters: distToTransitStart,
+                icon: 'transit',
+                transitSegIdx: nextTransitSegIdx
+            };
+        }
+
+        let preIdx = i;
+        let preDist = 0;
+        while (preIdx > fromIndex && preDist < 18) {
+            preDist += haversineDistance(coords[preIdx - 1], coords[preIdx]);
+            preIdx--;
+        }
+
+        let postIdx = i;
+        let postDist = 0;
+        while (postIdx < coords.length - 1 && postDist < 18) {
+            postDist += haversineDistance(coords[postIdx], coords[postIdx + 1]);
+            postIdx++;
+        }
+
+        if (preDist < 10 || postDist < 10) continue;
+
+        const inBearing = calculateBearing(coords[preIdx], coords[i]);
+        const outBearing = calculateBearing(coords[i], coords[postIdx]);
+        const diff = (outBearing - inBearing + 540) % 360 - 180;
+
+        // Ignore all bends < 55 degrees (winding roads, gentle curves)
+        if (Math.abs(diff) >= 55) {
+            let apexIdx = i;
+            let maxDiff = Math.abs(diff);
+            let checkDist = 0;
+            for (let k = i + 1; k < coords.length - 1; k++) {
+                checkDist += haversineDistance(coords[k - 1], coords[k]);
+                if (checkDist > 20) break;
+
+                let pPre = k, dPre = 0;
+                while (pPre > fromIndex && dPre < 18) {
+                    dPre += haversineDistance(coords[pPre - 1], coords[pPre]);
+                    pPre--;
+                }
+                let pPost = k, dPost = 0;
+                while (pPost < coords.length - 1 && dPost < 18) {
+                    dPost += haversineDistance(coords[pPost], coords[pPost + 1]);
+                    pPost++;
+                }
+                if (dPre >= 10 && dPost >= 10) {
+                    const bIn = calculateBearing(coords[pPre], coords[k]);
+                    const bOut = calculateBearing(coords[k], coords[pPost]);
+                    const d = (bOut - bIn + 540) % 360 - 180;
+                    if (Math.abs(d) > maxDiff) {
+                        maxDiff = Math.abs(d);
+                        apexIdx = k;
+                    }
+                }
+            }
+
+            let apexPre = apexIdx, aPreD = 0;
+            while (apexPre > fromIndex && aPreD < 18) {
+                aPreD += haversineDistance(coords[apexPre - 1], coords[apexPre]);
+                apexPre--;
+            }
+            let apexPost = apexIdx, aPostD = 0;
+            while (apexPost < coords.length - 1 && aPostD < 18) {
+                aPostD += haversineDistance(coords[apexPost], coords[apexPost + 1]);
+                apexPost++;
+            }
+            const finalDiff = (calculateBearing(coords[apexIdx], coords[apexPost]) - calculateBearing(coords[apexPre], coords[apexIdx]) + 540) % 360 - 180;
+
+            if (Math.abs(finalDiff) < 55) continue;
+
+            let type = 'turn-right';
+            let icon = 'right';
+            let text = 'Turn right';
+
+            if (finalDiff >= 140) {
+                type = 'u-turn-right';
+                icon = 'uturn-right';
+                text = 'Make a U-turn to the right';
+            } else if (finalDiff <= -140) {
+                type = 'u-turn-left';
+                icon = 'uturn-left';
+                text = 'Make a U-turn to the left';
+            } else if (finalDiff >= 105) {
+                type = 'sharp-right';
+                icon = 'sharp-right';
+                text = 'Turn sharp right';
+            } else if (finalDiff <= -105) {
+                type = 'sharp-left';
+                icon = 'sharp-left';
+                text = 'Turn sharp left';
+            } else if (finalDiff > 0) {
+                type = 'turn-right';
+                icon = 'right';
+                text = 'Turn right';
+            } else {
+                type = 'turn-left';
+                icon = 'left';
+                text = 'Turn left';
+            }
+
+            let distToApex = 0;
+            for (let m = fromIndex; m < apexIdx; m++) {
+                distToApex += haversineDistance(coords[m], coords[m + 1]);
+            }
+
+            return {
+                type: type,
+                text: text,
+                distMeters: distToApex,
+                icon: icon,
+                turnIndex: apexIdx,
+                isIntersection: false // Unverified intersection, so do not vibrate
+            };
+        }
+    }
+
+    return {
+        type: 'straight',
+        text: 'Continue on current route',
+        distMeters: accumDist,
+        icon: 'straight',
+        turnIndex: -1,
+        isIntersection: false
+    };
+}
+
+function getTurnSvg(icon) {
+    switch (icon) {
+        case 'transit':
+        case 'gap':
+            return `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="3" width="18" height="15" rx="2"></rect>
+                <line x1="3" y1="9" x2="21" y2="9"></line>
+                <circle cx="7" cy="14" r="1.5"></circle>
+                <circle cx="17" cy="14" r="1.5"></circle>
+                <line x1="8" y1="18" x2="6" y2="21"></line>
+                <line x1="16" y1="18" x2="18" y2="21"></line>
+            </svg>`;
+        case 'left':
+            return `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="18" y1="20" x2="18" y2="12"></line>
+                <path d="M18 12a4 4 0 0 0-4-4H5"></path>
+                <polyline points="9 4 5 8 9 12"></polyline>
+            </svg>`;
+        case 'right':
+            return `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="6" y1="20" x2="6" y2="12"></line>
+                <path d="M6 12a4 4 0 0 1 4-4h9"></path>
+                <polyline points="15 4 19 8 15 12"></polyline>
+            </svg>`;
+        case 'slight-left':
+            return `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="15" y1="20" x2="15" y2="13"></line>
+                <path d="M15 13L8 6"></path>
+                <polyline points="14 6 8 6 8 12"></polyline>
+            </svg>`;
+        case 'slight-right':
+            return `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="9" y1="20" x2="9" y2="13"></line>
+                <path d="M9 13L16 6"></path>
+                <polyline points="10 6 16 6 16 12"></polyline>
+            </svg>`;
+        case 'sharp-left':
+            return `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M17 21V9a3 3 0 0 0-5.2-2.1L6 14"></path>
+                <polyline points="11 14 6 14 6 9"></polyline>
+            </svg>`;
+        case 'sharp-right':
+            return `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M7 21V9a3 3 0 0 1 5.2-2.1L18 14"></path>
+                <polyline points="13 14 18 14 18 9"></polyline>
+            </svg>`;
+        case 'uturn':
+        case 'uturn-left':
+            return `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="17" y1="20" x2="17" y2="10"></line>
+                <path d="M17 10a5 5 0 0 0-10 0v9"></path>
+                <polyline points="3 15 7 19 11 15"></polyline>
+            </svg>`;
+        case 'uturn-right':
+            return `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="7" y1="20" x2="7" y2="10"></line>
+                <path d="M7 10a5 5 0 0 1 10 0v9"></path>
+                <polyline points="21 15 17 19 13 15"></polyline>
+            </svg>`;
+        case 'flag':
+            return `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"></path>
+                <line x1="4" y1="22" x2="4" y2="15"></line>
+            </svg>`;
+        case 'alert':
+            return `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="12 2 2 22 22 22 12 2"></polygon>
+                <line x1="12" y1="9" x2="12" y2="13"></line>
+                <line x1="12" y1="17" x2="12.01" y2="17"></line>
+            </svg>`;
+        case 'straight':
+        default:
+            return `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="12" y1="19" x2="12" y2="5"></line>
+                <polyline points="5 12 12 5 19 12"></polyline>
+            </svg>`;
+    }
+}
+
+let liveNavStartDistAlongRoute = null;
+let liveNavLastDistAlongRoute = null;
+let liveNavTotalTraveledMeters = 0;
+let liveNavLastElevationMeters = null;
+let liveNavLastRouteIndex = null;
+let liveNavAccumGainMeters = 0;
+let liveNavAccumLossMeters = 0;
+let wasNavOffRoute = false;
+let cumulativeRouteGain = null;
+let liveNavTransitSegIndex = null;
+
+function getCumulativeRouteGain() {
+    if (!currentStats?.elevations || currentStats.elevations.length === 0) return null;
+    if (cumulativeRouteGain && cumulativeRouteGain.length === currentStats.elevations.length) {
+        return cumulativeRouteGain;
+    }
+    const elevs = currentStats.elevations;
+    const cum = new Float32Array(elevs.length);
+    let g = 0;
+    for (let i = 1; i < elevs.length; i++) {
+        const d = elevs[i] - elevs[i - 1];
+        if (d > 0) g += d;
+        cum[i] = g;
+    }
+    cumulativeRouteGain = cum;
+    return cumulativeRouteGain;
+}
+
+function formatNavRemain(meters) {
+    if (meters == null || isNaN(meters)) return '--';
+    const isImperial = currentUnits === 'imperial';
+    if (isImperial) {
+        const miles = meters / 1609.344;
+        return `${miles.toFixed(2)} mi`;
+    } else {
+        const km = meters / 1000;
+        return `${km.toFixed(2)} km`;
+    }
+}
+
+function formatNavRemainTime(minutes) {
+    if (minutes == null || isNaN(minutes) || minutes <= 0) return '';
+    if (minutes < 1) return '• <1 min';
+    if (minutes < 60) return `• ${Math.round(minutes)} min`;
+    const hrs = Math.floor(minutes / 60);
+    const mins = Math.round(minutes % 60);
+    return `• ${hrs}h ${mins}m`;
+}
+
+function formatNavEta(minutes) {
+    if (minutes == null || isNaN(minutes) || minutes < 0) return '';
+    const etaDate = new Date(Date.now() + Math.round(minutes * 60000));
+    try {
+        const timeStr = etaDate.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+        return `Arrive at ${timeStr}`;
+    } catch (e) {
+        let h = etaDate.getHours();
+        const m = String(etaDate.getMinutes()).padStart(2, '0');
+        const ampm = h >= 12 ? 'PM' : 'AM';
+        h = h % 12 || 12;
+        return `Arrive at ${h}:${m} ${ampm}`;
+    }
+}
+
+function formatNavDistance(meters) {
+    if (meters == null || isNaN(meters)) return '--';
+    const isImperial = currentUnits === 'imperial';
+    if (isImperial) {
+        const feet = meters * 3.28084;
+        if (feet < 900) {
+            return `${Math.round(feet / 10) * 10} ft`;
+        }
+        const miles = meters / 1609.344;
+        return `${miles.toFixed(1)} mi`;
+    } else {
+        if (meters < 900) {
+            return `${Math.round(meters / 10) * 10} m`;
+        }
+        const km = meters / 1000;
+        return `${km.toFixed(1)} km`;
+    }
+}
+
+function updateNavigationHUD(pos) {
+    if (!isLiveNavActive) return;
+    lastKnownGpsPos = pos;
+    const hud = document.getElementById('live-nav-hud');
+    if (!hud) return;
+
+    const coords = currentRouteGeoJSON?.coordinates;
+    if (!coords || coords.length < 2) {
+        document.getElementById('live-nav-instruction').textContent = 'Please plot a route first';
+        document.getElementById('live-nav-distance').textContent = 'No route active';
+        return;
+    }
+
+    const gpsLngLat = [pos.coords.longitude, pos.coords.latitude];
+    ensureUserLocationMarker(gpsLngLat);
+    userLocationMarker.setLngLat(gpsLngLat);
+
+    const closest = findClosestPointOnRoute(gpsLngLat);
+    if (!closest) return;
+
+    // Track cumulative distance and elevation gain/loss during this navigation session
+    if (liveNavLastDistAlongRoute === null) {
+        liveNavStartDistAlongRoute = closest.distAlongRoute;
+        liveNavLastDistAlongRoute = closest.distAlongRoute;
+    } else {
+        const deltaDist = closest.distAlongRoute - liveNavLastDistAlongRoute;
+        // Rider progressing forward along route
+        if (deltaDist > 0 && deltaDist < 200) {
+            liveNavTotalTraveledMeters += deltaDist;
+            liveNavLastDistAlongRoute = closest.distAlongRoute;
+        } else if (deltaDist < -10) {
+            // Rider moved or recalculated
+            liveNavLastDistAlongRoute = closest.distAlongRoute;
+        }
+    }
+
+    // Calculate heading (direction of travel)
+    let heading = pos.coords.heading;
+    if (heading == null || isNaN(heading) || heading === 0) {
+        if (lastGpsLngLat && (Math.abs(gpsLngLat[0] - lastGpsLngLat[0]) > 0.000015 || Math.abs(gpsLngLat[1] - lastGpsLngLat[1]) > 0.000015)) {
+            heading = calculateBearing(lastGpsLngLat, gpsLngLat);
+        } else if (closest && coords && coords.length > closest.index + 1) {
+            heading = calculateBearing(coords[closest.index], coords[closest.index + 1]);
+        } else {
+            heading = currentHeading || 0;
+        }
+    }
+    currentHeading = heading;
+    lastGpsLngLat = [gpsLngLat[0], gpsLngLat[1]];
+
+    userLocationMarker.setRotation(heading);
+
+    // Third-person perspective camera behind the dot:
+    // Initialize from saved localStorage zoom/tilt (default 17.5 zoom, 58 pitch)
+    let targetZoom = Math.max(10, map.getZoom());
+    let targetPitch = map.getPitch();
+
+    if (!isInitialNavCameraSet) {
+        const savedZoom = parseFloat(localStorage.getItem('nav_user_zoom'));
+        const savedPitch = parseFloat(localStorage.getItem('nav_user_pitch'));
+        targetZoom = (!isNaN(savedZoom) && savedZoom >= 10 && savedZoom <= 22) ? savedZoom : 17.5;
+        targetPitch = (!isNaN(savedPitch) && savedPitch >= 0 && savedPitch <= 85) ? savedPitch : 58;
+        isInitialNavCameraSet = true;
+    }
+
+    // Check if user is actively touching, dragging, pitching, or zooming the map
+    const isUserInteracting = (
+        isUserTouchingMap ||
+        (map.touchPitch && typeof map.touchPitch.isActive === 'function' && map.touchPitch.isActive()) ||
+        (map.touchZoomRotate && typeof map.touchZoomRotate.isActive === 'function' && map.touchZoomRotate.isActive()) ||
+        (map.scrollZoom && typeof map.scrollZoom.isActive === 'function' && map.scrollZoom.isActive()) ||
+        (typeof map.isZooming === 'function' && map.isZooming()) ||
+        (typeof map.isRotating === 'function' && map.isRotating())
+    );
+
+    // Only ease camera if user is not actively touching or adjusting zoom/pitch
+    if (!isUserInteracting) {
+        const latRad = gpsLngLat[1] * Math.PI / 180;
+        const metersPerPixel = (156543.03392 * Math.cos(latRad)) / Math.pow(2, targetZoom);
+        // Lookahead forward along heading so rider sits ~1/3 of the way up from screen bottom
+        const lookaheadMeters = metersPerPixel * 105;
+        const cameraTarget = offsetLngLat(gpsLngLat, heading, lookaheadMeters);
+
+        map.easeTo({
+            center: cameraTarget,
+            zoom: targetZoom,
+            pitch: targetPitch,
+            bearing: heading,
+            padding: { top: 0, bottom: 0, left: 0, right: 0 },
+            duration: 350,
+            easing: (t) => t
+        });
+    }
+
+    const isImperial = currentUnits === 'imperial';
+
+    // Handle transit / gap segments during navigation
+    const hasTransit = waypointPathIndices && waypointPathIndices.length >= 2 && segmentModes.some(m => m === 'transit');
+
+    if (hasTransit) {
+        if (liveNavTransitSegIndex !== null) {
+            const endIdx = waypointPathIndices[liveNavTransitSegIndex + 1];
+            const endCoord = coords[endIdx];
+            const distToResume = haversineDistance(gpsLngLat, endCoord);
+            const nonTransit = findClosestPointOnRoute(gpsLngLat, true);
+            const hasResumedOnRoute = distToResume <= 40 || (nonTransit && nonTransit.index >= endIdx && nonTransit.distMeters <= 40);
+            if (hasResumedOnRoute) {
+                liveNavTransitSegIndex = null;
+                if (nonTransit) liveNavLastRouteIndex = nonTransit.index;
+            }
+        } else {
+            for (let segI = 0; segI < waypointPathIndices.length - 1; segI++) {
+                if (segmentModes[segI] === 'transit') {
+                    const sStart = waypointPathIndices[segI];
+                    const sEnd = waypointPathIndices[segI + 1];
+                    const distToStart = haversineDistance(gpsLngLat, coords[sStart]);
+                    const distToEnd = haversineDistance(gpsLngLat, coords[sEnd]);
+                    if ((distToStart <= 40 && liveNavLastRouteIndex != null && liveNavLastRouteIndex >= sStart - 2) ||
+                        (closest.index >= sStart && closest.index < sEnd && distToEnd > 40)) {
+                        liveNavTransitSegIndex = segI;
+                        break;
+                    }
+                }
+            }
+        }
+    } else {
+        liveNavTransitSegIndex = null;
+    }
+
+    if (liveNavTransitSegIndex !== null) {
+        const sEnd = waypointPathIndices[liveNavTransitSegIndex + 1];
+        const endCoord = coords[sEnd];
+        const distToResume = haversineDistance(gpsLngLat, endCoord);
+
+        isNavOnRoute = true;
+        wasNavOffRoute = false;
+        currentNavDispDist = null;
+
+        hud.classList.remove('off-route-banner');
+        hud.classList.remove('arrive-banner');
+
+        const arrowSource = map.getSource('nav-offroute-arrow-source');
+        if (arrowSource) {
+            arrowSource.setData({ type: 'FeatureCollection', features: [] });
+        }
+
+        const instructionEl = document.getElementById('live-nav-instruction');
+        const distEl = document.getElementById('live-nav-distance');
+        const iconContainer = document.getElementById('live-nav-turn-icon');
+
+        if (iconContainer) iconContainer.innerHTML = getTurnSvg('transit');
+        if (instructionEl) instructionEl.textContent = "Reached end of segment";
+        if (distEl) distEl.textContent = `${formatNavDistance(distToResume)} to next segment`;
+
+        // Keep grade telemetry neutral
+        const gradeEl = document.getElementById('nav-stat-grade');
+        if (gradeEl) {
+            gradeEl.textContent = "0.00%";
+            gradeEl.style.color = '';
+        }
+        const gradeCard = document.getElementById('nav-stat-grade-card') || (gradeEl ? gradeEl.closest('.live-nav-stat-card') : null);
+        if (gradeCard) {
+            gradeCard.style.removeProperty('background-color');
+            gradeCard.style.removeProperty('border-color');
+        }
+
+        // Trip stats
+        const tripDistEl = document.getElementById('nav-stat-trip-dist');
+        const tripDistUnitEl = document.getElementById('nav-stat-trip-dist-unit');
+        if (tripDistEl) {
+            const distDisp = isImperial ? (liveNavTotalTraveledMeters / 1609.344) : (liveNavTotalTraveledMeters / 1000);
+            tripDistEl.textContent = distDisp.toFixed(2);
+        }
+        if (tripDistUnitEl) tripDistUnitEl.textContent = isImperial ? 'MI DIST' : 'KM DIST';
+
+        const tripElevEl = document.getElementById('nav-stat-trip-elev');
+        const tripElevUnitEl = document.getElementById('nav-stat-trip-elev-unit');
+        if (tripElevEl) {
+            const gainDisp = isImperial ? Math.round(liveNavAccumGainMeters * 3.28084) : Math.round(liveNavAccumGainMeters);
+            tripElevEl.textContent = `+${gainDisp.toLocaleString()}`;
+        }
+        if (tripElevUnitEl) tripElevUnitEl.textContent = isImperial ? 'FT GAIN' : 'M GAIN';
+
+        // Remaining distance & ETA to destination from next segment
+        const totalDist = routeTotalDist || 0;
+        const resumeDistAlong = (routePathDistances && routePathDistances[sEnd]) ? routePathDistances[sEnd] : 0;
+        const remainingMeters = Math.max(0, totalDist - resumeDistAlong);
+        const topRemainValEl = document.getElementById('nav-top-remain-val');
+        const topRemainTimeEl = document.getElementById('nav-top-remain-time');
+        const topEtaEl = document.getElementById('nav-top-eta');
+        if (topRemainValEl) topRemainValEl.textContent = formatNavRemain(remainingMeters);
+        if (topRemainTimeEl || topEtaEl) {
+            const cumGainArr = getCumulativeRouteGain();
+            const remainGainMeters = (cumGainArr && sEnd < cumGainArr.length)
+                ? Math.max(0, cumGainArr[cumGainArr.length - 1] - cumGainArr[sEnd])
+                : 0;
+            const remainMin = getEstimatedTime(remainingMeters, remainGainMeters, currentRoutingMode);
+            if (topRemainTimeEl) topRemainTimeEl.textContent = formatNavRemainTime(remainMin);
+            if (topEtaEl) topEtaEl.textContent = formatNavEta(remainMin);
+        }
+
+        window.AndroidMaterialTheme?.updateNavNotification?.("Reached end of segment", `${formatNavDistance(distToResume)} to next segment`);
+        return;
+    }
+
+    // 1. SPEED TELEMETRY
+    const speedRaw = pos.coords.speed; // meters per second
+    let displaySpeed = 0;
+    if (speedRaw != null && !isNaN(speedRaw) && speedRaw > 0.3) {
+        displaySpeed = isImperial ? (speedRaw * 2.23694) : (speedRaw * 3.6);
+    }
+    const speedEl = document.getElementById('nav-stat-speed');
+    const speedUnitEl = document.getElementById('nav-stat-speed-unit');
+    if (speedEl) speedEl.textContent = displaySpeed.toFixed(1);
+    if (speedUnitEl) speedUnitEl.textContent = isImperial ? 'MPH' : 'KM/H';
+
+    // 2. ELEVATION & GAIN/LOSS TELEMETRY
+    let elevationMeters = pos.coords.altitude;
+    if (elevationMeters == null && currentStats?.elevations?.length > closest.index) {
+        elevationMeters = currentStats.elevations[closest.index];
+    }
+
+    // Accumulate elevation gain using high-resolution DEM route profile
+    const cumGainArr = getCumulativeRouteGain();
+    if (cumGainArr && closest.index != null && closest.index < cumGainArr.length) {
+        if (liveNavLastRouteIndex === null) {
+            liveNavLastRouteIndex = closest.index;
+        } else if (closest.index > liveNavLastRouteIndex) {
+            const gainDelta = cumGainArr[closest.index] - cumGainArr[liveNavLastRouteIndex];
+            if (gainDelta > 0 && gainDelta < 500) {
+                liveNavAccumGainMeters += gainDelta;
+            }
+            liveNavLastRouteIndex = closest.index;
+        } else if (closest.index < liveNavLastRouteIndex - 10) {
+            liveNavLastRouteIndex = closest.index;
+        }
+    } else if (elevationMeters != null) {
+        if (liveNavLastElevationMeters !== null) {
+            const diffElev = elevationMeters - liveNavLastElevationMeters;
+            if (Math.abs(diffElev) < 50) {
+                if (diffElev > 0.1) liveNavAccumGainMeters += diffElev;
+                else if (diffElev < -0.1) liveNavAccumLossMeters += Math.abs(diffElev);
+            }
+        }
+        liveNavLastElevationMeters = elevationMeters;
+    }
+
+    // 3. GRADE TELEMETRY (Hundredths precision)
+    let gradeVal = 0;
+    if (currentStats?.grades?.length > closest.index) {
+        gradeVal = Number(currentStats.grades[closest.index] || 0);
+    }
+    const gradeStr = (gradeVal >= 0 ? '+' : '') + gradeVal.toFixed(2) + '%';
+    const gradeEl = document.getElementById('nav-stat-grade');
+    if (gradeEl) {
+        gradeEl.textContent = gradeStr;
+        if (gradeVal >= 5) {
+            gradeEl.style.color = '#ef4444';
+        } else if (gradeVal <= -5) {
+            gradeEl.style.color = '#3b82f6';
+        } else {
+            gradeEl.style.color = '';
+        }
+        // Color the background of the grade swatch card with the grade color (desaturated/translucent 0.25 alpha)
+        const gradeCard = document.getElementById('nav-stat-grade-card') || gradeEl.closest('.live-nav-stat-card');
+        if (gradeCard) {
+            const gradeColor = getColorForGrade(gradeVal);
+            const desaturatedBg = gradeColor.replace('rgb(', 'rgba(').replace(')', ', 0.25)');
+            const desaturatedBorder = gradeColor.replace('rgb(', 'rgba(').replace(')', ', 0.5)');
+            gradeCard.style.setProperty('background-color', desaturatedBg, 'important');
+            gradeCard.style.setProperty('border-color', desaturatedBorder, 'important');
+        }
+    }
+
+    // 4. FIRST LINE STATS: TOTAL DISTANCE TRAVELED & ELEVATION GAIN
+    const tripDistEl = document.getElementById('nav-stat-trip-dist');
+    const tripDistUnitEl = document.getElementById('nav-stat-trip-dist-unit');
+    if (tripDistEl) {
+        const distDisp = isImperial ? (liveNavTotalTraveledMeters / 1609.344) : (liveNavTotalTraveledMeters / 1000);
+        tripDistEl.textContent = distDisp.toFixed(2);
+    }
+    if (tripDistUnitEl) tripDistUnitEl.textContent = isImperial ? 'MI DIST' : 'KM DIST';
+
+    const tripElevEl = document.getElementById('nav-stat-trip-elev');
+    const tripElevUnitEl = document.getElementById('nav-stat-trip-elev-unit');
+    if (tripElevEl) {
+        const gainDisp = isImperial ? Math.round(liveNavAccumGainMeters * 3.28084) : Math.round(liveNavAccumGainMeters);
+        tripElevEl.textContent = `+${gainDisp.toLocaleString()}`;
+    }
+    if (tripElevUnitEl) tripElevUnitEl.textContent = isImperial ? 'FT GAIN' : 'M GAIN';
+
+    // 5. TOP REMAINING DISTANCE WITH MONOCHROME FLAG, TIME & ETA
+    const totalDist = routeTotalDist || 0;
+    const remainingMeters = Math.max(0, totalDist - closest.distAlongRoute);
+    const topRemainValEl = document.getElementById('nav-top-remain-val');
+    const topRemainTimeEl = document.getElementById('nav-top-remain-time');
+    const topEtaEl = document.getElementById('nav-top-eta');
+
+    if (topRemainValEl) {
+        topRemainValEl.textContent = formatNavRemain(remainingMeters);
+    }
+
+    if (topRemainTimeEl || topEtaEl) {
+        const remainGainMeters = (cumGainArr && closest.index != null && closest.index < cumGainArr.length)
+            ? Math.max(0, cumGainArr[cumGainArr.length - 1] - cumGainArr[closest.index])
+            : 0;
+        const remainMin = getEstimatedTime(remainingMeters, remainGainMeters, currentRoutingMode);
+
+        if (topRemainTimeEl) {
+            topRemainTimeEl.textContent = formatNavRemainTime(remainMin);
+        }
+        if (topEtaEl) {
+            topEtaEl.textContent = formatNavEta(remainMin);
+        }
+    }
+
+    // 6. OFF ROUTE vs ON ROUTE & ELEVATION GRAPH TRACKING
+    const OFF_ROUTE_THRESHOLD_METERS = 60; // 60 meters off track
+    const instructionEl = document.getElementById('live-nav-instruction');
+    const distEl = document.getElementById('live-nav-distance');
+    const iconContainer = document.getElementById('live-nav-turn-icon');
+
+    if (closest.distMeters > OFF_ROUTE_THRESHOLD_METERS) {
+        // Off route: Hide elevation line marker
+        isNavOnRoute = false;
+        currentNavDispDist = null;
+
+        const distBackStr = formatNavDistance(closest.distMeters);
+
+        hud.classList.remove('arrive-banner');
+        hud.classList.add('off-route-banner');
+        if (iconContainer) iconContainer.innerHTML = getTurnSvg('alert');
+        if (instructionEl) instructionEl.textContent = "Off route";
+        if (distEl) distEl.textContent = `${distBackStr} to route`;
+
+        // Long buzz vibration once upon transitioning to off-route
+        if (!wasNavOffRoute) {
+            wasNavOffRoute = true;
+            const vibrationCheck = document.getElementById('nav-vibration-check');
+            const isVibrationEnabled = vibrationCheck ? vibrationCheck.checked : true;
+            if (isVibrationEnabled) {
+                if (window.AndroidMaterialTheme?.vibratePhone) {
+                    window.AndroidMaterialTheme.vibratePhone(1000); // 1000ms distinct long buzz
+                } else if (navigator.vibrate) {
+                    navigator.vibrate(1000);
+                }
+            }
+        }
+
+        // Draw solid trajectory line from dot to closest route point
+        const arrowSource = map.getSource('nav-offroute-arrow-source');
+        if (arrowSource) {
+            arrowSource.setData({
+                type: 'Feature',
+                geometry: {
+                    type: 'LineString',
+                    coordinates: [gpsLngLat, closest.point]
+                }
+            });
+        }
+
+        // Background ongoing notification
+        window.AndroidMaterialTheme?.updateNavNotification?.("Off route", `${distBackStr} to route`);
+    } else {
+        // On route: Show position on elevation graph
+        isNavOnRoute = true;
+        wasNavOffRoute = false;
+        currentNavDispDist = isImperial ? (closest.distAlongRoute / 1609.344) : (closest.distAlongRoute / 1000);
+
+        hud.classList.remove('off-route-banner');
+
+        // Clear off-route trajectory line
+        const arrowSource = map.getSource('nav-offroute-arrow-source');
+        if (arrowSource) {
+            arrowSource.setData({ type: 'FeatureCollection', features: [] });
+        }
+
+        const turn = getUpcomingTurn(coords, closest.index);
+        if (turn.type === 'arrive' || turn.type === 'arrive-segment') {
+            hud.classList.add('arrive-banner');
+        } else {
+            hud.classList.remove('arrive-banner');
+        }
+
+        if (iconContainer) iconContainer.innerHTML = getTurnSvg(turn.icon);
+        if (instructionEl) instructionEl.textContent = turn.text;
+        let notifDistText = "";
+        if (distEl) {
+            if (turn.type === 'arrive') {
+                distEl.textContent = `${formatNavDistance(remainingMeters)} remaining`;
+                notifDistText = `${formatNavDistance(remainingMeters)} remaining`;
+            } else {
+                distEl.textContent = `In ${formatNavDistance(turn.distMeters)}`;
+                notifDistText = `In ${formatNavDistance(turn.distMeters)}`;
+            }
+        }
+
+        // Turn Vibration: Vibrate ONLY when approaching an actual intersection turn (< 40m) if toggle is on
+        const vibrationCheck = document.getElementById('nav-vibration-check');
+        const isVibrationEnabled = vibrationCheck ? vibrationCheck.checked : true;
+        const isRealIntersectionTurn = turn.isIntersection && ['turn-right', 'turn-left', 'sharp-right', 'sharp-left', 'u-turn-right', 'u-turn-left', 'roundabout'].includes(turn.type);
+        if (isVibrationEnabled && turn.distMeters <= 40 && lastVibratedTurnIndex !== turn.turnIndex && isRealIntersectionTurn) {
+            lastVibratedTurnIndex = turn.turnIndex;
+            if (window.AndroidMaterialTheme?.vibratePhone) {
+                window.AndroidMaterialTheme.vibratePhone(400);
+            } else if (navigator.vibrate) {
+                navigator.vibrate([200, 100, 200]);
+            }
+        }
+
+        // Persistent background notification
+        window.AndroidMaterialTheme?.updateNavNotification?.(turn.text, notifDistText);
+    }
+
+    // While routing, display live rider telemetry in top-right of elevation profile header (dist, elev, grade)
+    if (currentHoverDispDist === null) {
+        const statsDiv = document.getElementById('hover-stats');
+        const hoverDistEl = document.getElementById('hover-dist');
+        const hoverElevEl = document.getElementById('hover-elev');
+        const hoverGradeEl = document.getElementById('hover-grade');
+        if (statsDiv && hoverDistEl && hoverElevEl && hoverGradeEl) {
+            const curDistDisp = isImperial ? (closest.distAlongRoute / 1609.344) : (closest.distAlongRoute / 1000);
+            const distLabel = curDistDisp.toFixed(2) + (isImperial ? ' mi' : ' km');
+            let elevLabel = '--';
+            if (elevationMeters != null) {
+                const dispE = isImperial ? Math.round(elevationMeters * 3.28084) : Math.round(elevationMeters);
+                elevLabel = `${dispE.toLocaleString()} ${isImperial ? 'ft' : 'm'}`;
+            }
+            const gradeLabel = (gradeVal >= 0 ? '+' : '') + gradeVal.toFixed(2) + '%';
+
+            hoverDistEl.textContent = distLabel;
+            hoverElevEl.textContent = elevLabel;
+            hoverGradeEl.textContent = gradeLabel;
+            statsDiv.style.opacity = '1';
+        }
+
+        if (elevationChart) {
+            elevationChart.update('none');
+        }
+    }
+}
+
+function startLiveNavigation() {
+    if (!currentRouteGeoJSON || !currentRouteGeoJSON.coordinates || currentRouteGeoJSON.coordinates.length < 2) {
+        showToast("Please plot a route before starting navigation.", "warning");
+        stopLiveNavigation();
+        return;
+    }
+
+    isLiveNavActive = true;
+    isInitialNavCameraSet = false;
+    liveNavStartDistAlongRoute = null;
+    liveNavLastDistAlongRoute = null;
+    liveNavTotalTraveledMeters = 0;
+    liveNavLastElevationMeters = null;
+    liveNavLastRouteIndex = null;
+    liveNavAccumGainMeters = 0;
+    liveNavAccumLossMeters = 0;
+    wasNavOffRoute = false;
+    document.body.classList.add('routing-active');
+
+    // Enable zooming and tilting up/down, but prevent moving around (pan) or manual rotation
+    // Zooming and tilting are centered directly on the user dot (screen center)
+    map.scrollZoom.enable({ around: 'center' });
+    map.doubleClickZoom.enable({ around: 'center' });
+    map.boxZoom.enable();
+    map.touchPitch.enable(); // Two-finger vertical drag tilts up and down
+    map.touchZoomRotate.enable({ around: 'center' }); // Pinch to zoom centered on rider
+    map.touchZoomRotate.disableRotation(); // Crucial: disables rotating the map manually
+    map.dragPan.disable(); // Keeps camera centered on rider
+    map.dragRotate.disable(); // Disables manual desktop rotate/pan
+    map.keyboard.disable();
+
+    // Prevent dragging or clicking waypoints during live routing
+    markers.forEach(m => {
+        m.setDraggable(false);
+        if (m.getElement()) m.getElement().style.pointerEvents = 'none';
+    });
+
+    // Disable action buttons
+    const clearBtn = document.getElementById('clear-route');
+    if (clearBtn) clearBtn.disabled = true;
+    const searchToggle = document.getElementById('search-toggle');
+    if (searchToggle) searchToggle.disabled = true;
+    const mobileSearchToggle = document.getElementById('mobile-search-toggle');
+    if (mobileSearchToggle) mobileSearchToggle.setAttribute('disabled', 'true');
+    const mapSearch = document.getElementById('map-search');
+    if (mapSearch) mapSearch.disabled = true;
+    document.querySelectorAll('.mode-btn').forEach(b => b.disabled = true);
+
+    // Hide and block stats panel
+    const statsPanel = document.getElementById('stats-panel');
+    if (statsPanel) statsPanel.classList.remove('show');
+
+    const navBtn = document.getElementById('start-nav-btn');
+    if (navBtn) {
+        const parentGroup = navBtn.closest('.icon-btn-group');
+        if (parentGroup) parentGroup.classList.add('nav-active');
+        navBtn.title = "Stop live navigation";
+        navBtn.blur();
+    }
+
+    const hud = document.getElementById('live-nav-hud');
+    if (hud) hud.style.display = 'flex';
+
+    const isDebugSpoof = localStorage.getItem('debug_gps_joystick_enabled') === 'true';
+    if (isDebugSpoof && virtualGpsCoords) {
+        updateNavigationHUD({
+            coords: {
+                longitude: virtualGpsCoords[0],
+                latitude: virtualGpsCoords[1],
+                speed: 0,
+                heading: currentHeading || 0,
+                altitude: 50
+            }
+        });
+    }
+
+    if ("geolocation" in navigator) {
+        navWatchId = navigator.geolocation.watchPosition(
+            (pos) => {
+                if (localStorage.getItem('debug_gps_joystick_enabled') === 'true') return;
+                updateNavigationHUD(pos);
+            },
+            (err) => {
+                if (localStorage.getItem('debug_gps_joystick_enabled') === 'true') return;
+                console.warn("Navigation geolocation error:", err);
+                const instructionEl = document.getElementById('live-nav-instruction');
+                if (instructionEl) instructionEl.textContent = "Waiting for GPS signal...";
+            },
+            { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+        );
+    } else if (!isDebugSpoof) {
+        showToast("Geolocation is not supported by your device.", "error");
+        stopLiveNavigation();
+    }
+}
+
+function stopLiveNavigation() {
+    isLiveNavActive = false;
+    isInitialNavCameraSet = false;
+    liveNavTransitSegIndex = null;
+    document.body.classList.remove('routing-active');
+
+    if (navWatchId !== null) {
+        navigator.geolocation.clearWatch(navWatchId);
+        navWatchId = null;
+    }
+
+    // Re-enable all map interactions and rotation
+    map.scrollZoom.enable();
+    map.boxZoom.enable();
+    map.dragRotate.enable();
+    map.dragPan.enable();
+    map.keyboard.enable();
+    map.doubleClickZoom.enable();
+    map.touchZoomRotate.enable();
+    if (typeof map.touchZoomRotate.enableRotation === 'function') {
+        map.touchZoomRotate.enableRotation();
+    }
+    map.touchPitch.enable();
+
+    // Re-enable dragging waypoint markers and pointer events
+    markers.forEach(m => {
+        m.setDraggable(true);
+        if (m.getElement()) m.getElement().style.pointerEvents = '';
+    });
+
+    // Reset camera pitch and bearing smoothly back to top-down flat view
+    map.easeTo({ pitch: 0, bearing: 0, padding: { top: 0, bottom: 0, left: 0, right: 0 }, duration: 800 });
+
+    // Re-enable action buttons
+    const clearBtn = document.getElementById('clear-route');
+    if (clearBtn) clearBtn.disabled = false;
+    const searchToggle = document.getElementById('search-toggle');
+    if (searchToggle) searchToggle.disabled = false;
+    const mobileSearchToggle = document.getElementById('mobile-search-toggle');
+    if (mobileSearchToggle) mobileSearchToggle.removeAttribute('disabled');
+    const mapSearch = document.getElementById('map-search');
+    if (mapSearch) mapSearch.disabled = false;
+    document.querySelectorAll('.mode-btn').forEach(b => b.disabled = false);
+
+    // Clear elevation graph nav marker
+    isNavOnRoute = false;
+    currentNavDispDist = null;
+    if (elevationChart) elevationChart.update('none');
+
+    const navBtn = document.getElementById('start-nav-btn');
+    if (navBtn) {
+        const parentGroup = navBtn.closest('.icon-btn-group');
+        if (parentGroup) parentGroup.classList.remove('nav-active');
+        navBtn.title = "Start live turn-by-turn navigation";
+        navBtn.blur();
+    }
+
+    const hud = document.getElementById('live-nav-hud');
+    if (hud) {
+        hud.style.display = 'none';
+        hud.classList.remove('off-route-banner');
+        hud.classList.remove('arrive-banner');
+    }
+
+    const topRemainValEl = document.getElementById('nav-top-remain-val');
+    if (topRemainValEl) topRemainValEl.textContent = '--';
+    const topRemainTimeEl = document.getElementById('nav-top-remain-time');
+    if (topRemainTimeEl) topRemainTimeEl.textContent = '';
+    const topEtaEl = document.getElementById('nav-top-eta');
+    if (topEtaEl) topEtaEl.textContent = '';
+
+    // Reset grade stat card styles
+    const gradeCard = document.getElementById('nav-stat-grade-card') || document.getElementById('nav-stat-grade')?.closest('.live-nav-stat-card');
+    if (gradeCard) {
+        gradeCard.style.removeProperty('background-color');
+        gradeCard.style.removeProperty('border-color');
+    }
+
+    // Reset off-route trajectory line
+    const arrowSource = map.getSource('nav-offroute-arrow-source');
+    if (arrowSource) {
+        arrowSource.setData({ type: 'FeatureCollection', features: [] });
+    }
+
+    // Hide elevation header hover stats if not actively hovering
+    if (currentHoverDispDist === null) {
+        const statsDiv = document.getElementById('hover-stats');
+        if (statsDiv) statsDiv.style.opacity = '0';
+    }
+
+    // Cancel persistent background navigation notification
+    window.AndroidMaterialTheme?.stopNavNotification?.();
+    lastVibratedTurnIndex = -1;
+    liveNavStartDistAlongRoute = null;
+    liveNavLastDistAlongRoute = null;
+    liveNavTotalTraveledMeters = 0;
+    liveNavLastElevationMeters = null;
+    liveNavLastRouteIndex = null;
+    liveNavAccumGainMeters = 0;
+    liveNavAccumLossMeters = 0;
+    wasNavOffRoute = false;
+}
+
+function toggleLiveNavigation() {
+    const navBtn = document.getElementById('start-nav-btn');
+    if (navBtn) navBtn.blur();
+
+    if (isLiveNavActive) {
+        stopLiveNavigation();
+    } else {
+        startLiveNavigation();
+    }
+}
+
+// Wire up live navigation event listeners
+const startNavBtn = document.getElementById('start-nav-btn');
+if (startNavBtn) {
+    startNavBtn.addEventListener('click', (e) => {
+        e.currentTarget.blur();
+        toggleLiveNavigation();
+    });
+}
+const stopNavBtn = document.getElementById('live-nav-stop-btn');
+if (stopNavBtn) {
+    stopNavBtn.addEventListener('click', stopLiveNavigation);
+}
+
+// User camera interaction tracker to prevent programmatic camera updates from fighting user gestures
+let isUserTouchingMap = false;
+let userTouchTimeout = null;
+
+const mapCanvas = map.getCanvas();
+if (mapCanvas) {
+    const onTouchStart = () => {
+        isUserTouchingMap = true;
+        if (userTouchTimeout) clearTimeout(userTouchTimeout);
+    };
+    const onTouchEnd = () => {
+        if (userTouchTimeout) clearTimeout(userTouchTimeout);
+        userTouchTimeout = setTimeout(() => {
+            isUserTouchingMap = false;
+        }, 300);
+    };
+    mapCanvas.addEventListener('touchstart', onTouchStart, { passive: true });
+    mapCanvas.addEventListener('touchmove', onTouchStart, { passive: true });
+    mapCanvas.addEventListener('touchend', onTouchEnd, { passive: true });
+    mapCanvas.addEventListener('touchcancel', onTouchEnd, { passive: true });
+    mapCanvas.addEventListener('mousedown', onTouchStart, { passive: true });
+    window.addEventListener('mouseup', onTouchEnd, { passive: true });
+}
+
+// Synchronize map pitch with CSS for user location direction cone tilting
+function updateMapPitchCss() {
+    const pitch = map.getPitch() || 0;
+    document.documentElement.style.setProperty('--map-pitch', `${pitch}deg`);
+}
+map.on('pitch', updateMapPitchCss);
+updateMapPitchCss();
+
+// Save user zoom & pitch preferences during live navigation
+map.on('zoomend', () => {
+    if (isLiveNavActive) {
+        try {
+            localStorage.setItem('nav_user_zoom', map.getZoom().toString());
+        } catch (_) {}
+    }
+});
+map.on('pitchend', () => {
+    updateMapPitchCss();
+    if (isLiveNavActive) {
+        try {
+            localStorage.setItem('nav_user_pitch', map.getPitch().toString());
+        } catch (_) {}
+    }
+});
+
+// --- Debug GPS Location Throttle / Brake / Steer Spoofing ---
+let virtualGpsCoords = null;
+let isThrottlePressed = false;
+let isBrakePressed = false;
+let isSteerLeftPressed = false;
+let isSteerRightPressed = false;
+let debugSimSpeed = 0; // Current simulated speed in m/s (0 to ~8.94 m/s = 20.0 mph)
+let debugLoopId = null;
+let lastDebugTimestamp = null;
+
+function initDebugJoystick() {
+    const debugToggle = document.getElementById('debug-joystick-check');
+    const debugContainer = document.getElementById('debug-joystick-container');
+    const resetBtn = document.getElementById('debug-joystick-reset-btn');
+    const throttleBtn = document.getElementById('debug-ctrl-throttle');
+    const brakeBtn = document.getElementById('debug-ctrl-brake');
+    const steerLeftBtn = document.getElementById('debug-ctrl-steer-left');
+    const steerRightBtn = document.getElementById('debug-ctrl-steer-right');
+
+    if (!debugToggle || !debugContainer) return;
+
+    const savedState = localStorage.getItem('debug_gps_joystick_enabled') === 'true';
+    debugToggle.checked = savedState;
+    debugContainer.style.display = savedState ? 'flex' : 'none';
+
+    if (resetBtn) {
+        resetBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            debugSimSpeed = 0;
+            if ("geolocation" in navigator) {
+                navigator.geolocation.getCurrentPosition(
+                    (pos) => {
+                        virtualGpsCoords = [pos.coords.longitude, pos.coords.latitude];
+                        currentHeading = pos.coords.heading || 0;
+                        ensureUserLocationMarker(virtualGpsCoords);
+                        if (userLocationMarker) {
+                            userLocationMarker.setLngLat(virtualGpsCoords);
+                            userLocationMarker.setRotation(currentHeading);
+                        }
+                        if (isLiveNavActive) {
+                            updateNavigationHUD({
+                                coords: {
+                                    longitude: virtualGpsCoords[0],
+                                    latitude: virtualGpsCoords[1],
+                                    speed: 0,
+                                    heading: currentHeading,
+                                    altitude: pos.coords.altitude || 50
+                                }
+                            });
+                        } else {
+                            map.easeTo({ center: virtualGpsCoords, duration: 400 });
+                        }
+                        showToast("GPS reset to current location", "info");
+                    },
+                    () => {
+                        if (currentRouteGeoJSON?.coordinates?.length) {
+                            virtualGpsCoords = [currentRouteGeoJSON.coordinates[0][0], currentRouteGeoJSON.coordinates[0][1]];
+                            ensureUserLocationMarker(virtualGpsCoords);
+                            if (userLocationMarker) userLocationMarker.setLngLat(virtualGpsCoords);
+                            if (isLiveNavActive) {
+                                updateNavigationHUD({
+                                    coords: {
+                                        longitude: virtualGpsCoords[0],
+                                        latitude: virtualGpsCoords[1],
+                                        speed: 0,
+                                        heading: 0,
+                                        altitude: 50
+                                    }
+                                });
+                            } else {
+                                map.easeTo({ center: virtualGpsCoords, duration: 400 });
+                            }
+                            showToast("Reset to start of route", "info");
+                        } else {
+                            showToast("Could not determine current location", "warning");
+                        }
+                    },
+                    { enableHighAccuracy: true, timeout: 6000, maximumAge: 0 }
+                );
+            } else if (currentRouteGeoJSON?.coordinates?.length) {
+                virtualGpsCoords = [currentRouteGeoJSON.coordinates[0][0], currentRouteGeoJSON.coordinates[0][1]];
+                ensureUserLocationMarker(virtualGpsCoords);
+                if (userLocationMarker) userLocationMarker.setLngLat(virtualGpsCoords);
+                map.easeTo({ center: virtualGpsCoords, duration: 400 });
+                showToast("Reset to start of route", "info");
+            }
+        });
+    }
+
+    // Helper to wire up press/hold events for touch and pointer
+    function bindButtonPress(btn, onDown, onUp) {
+        if (!btn) return;
+        const downHandler = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            try { btn.setPointerCapture(e.pointerId); } catch (_) {}
+            btn.classList.add('active');
+            onDown();
+        };
+        const upHandler = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            try { btn.releasePointerCapture(e.pointerId); } catch (_) {}
+            btn.classList.remove('active');
+            onUp();
+        };
+        btn.addEventListener('pointerdown', downHandler);
+        btn.addEventListener('pointerup', upHandler);
+        btn.addEventListener('pointercancel', upHandler);
+    }
+
+    bindButtonPress(throttleBtn, () => { isThrottlePressed = true; }, () => { isThrottlePressed = false; });
+    bindButtonPress(brakeBtn, () => { isBrakePressed = true; }, () => { isBrakePressed = false; });
+    bindButtonPress(steerLeftBtn, () => { isSteerLeftPressed = true; }, () => { isSteerLeftPressed = false; });
+    bindButtonPress(steerRightBtn, () => { isSteerRightPressed = true; }, () => { isSteerRightPressed = false; });
+
+    debugToggle.addEventListener('change', (e) => {
+        const enabled = e.target.checked;
+        localStorage.setItem('debug_gps_joystick_enabled', enabled);
+        debugContainer.style.display = enabled ? 'flex' : 'none';
+        if (enabled) {
+            setupInitialVirtualGps();
+            startDebugLoop();
+        } else {
+            stopDebugLoop();
+        }
+    });
+
+    if (savedState) {
+        setupInitialVirtualGps();
+        startDebugLoop();
+    }
+
+    function setupInitialVirtualGps() {
+        if (!virtualGpsCoords) {
+            if (currentRouteGeoJSON?.coordinates?.length) {
+                virtualGpsCoords = [currentRouteGeoJSON.coordinates[0][0], currentRouteGeoJSON.coordinates[0][1]];
+                if (currentRouteGeoJSON.coordinates.length > 1) {
+                    currentHeading = calculateBearing(currentRouteGeoJSON.coordinates[0], currentRouteGeoJSON.coordinates[1]);
+                }
+            } else if (userLocationMarker) {
+                const ll = userLocationMarker.getLngLat();
+                virtualGpsCoords = [ll.lng, ll.lat];
+            } else {
+                const c = map.getCenter();
+                virtualGpsCoords = [c.lng, c.lat];
+            }
+        }
+        ensureUserLocationMarker(virtualGpsCoords);
+        if (userLocationMarker) {
+            userLocationMarker.setLngLat(virtualGpsCoords);
+            userLocationMarker.setRotation(currentHeading || 0);
+        }
+    }
+}
+
+function startDebugLoop() {
+    if (debugLoopId) return;
+    lastDebugTimestamp = performance.now();
+
+    function step(timestamp) {
+        const dt = Math.min(0.1, (timestamp - lastDebugTimestamp) / 1000);
+        lastDebugTimestamp = timestamp;
+
+        if (isBrakePressed) {
+            // Braking deceleration
+            debugSimSpeed = Math.max(0, debugSimSpeed - 6.0 * dt);
+        } else if (isThrottlePressed) {
+            // Uncapped acceleration
+            debugSimSpeed += 2.8 * dt;
+        } else {
+            // Zero friction - keeps constant velocity when neither throttle nor brake is held
+        }
+
+        // Steering: rotate heading left or right
+        if (isSteerLeftPressed) {
+            currentHeading = ((currentHeading || 0) - 80 * dt + 360) % 360;
+        }
+        if (isSteerRightPressed) {
+            currentHeading = ((currentHeading || 0) + 80 * dt) % 360;
+        }
+
+        if (virtualGpsCoords) {
+            const heading = currentHeading || 0;
+            const headingRad = heading * Math.PI / 180;
+            const dMeters = debugSimSpeed * dt;
+
+            if (dMeters > 0) {
+                const dLat = (dMeters * Math.cos(headingRad)) / 111139;
+                const dLng = (dMeters * Math.sin(headingRad)) / (111139 * Math.cos(virtualGpsCoords[1] * Math.PI / 180));
+                virtualGpsCoords[0] += dLng;
+                virtualGpsCoords[1] += dLat;
+            }
+
+            const spoofedPos = {
+                coords: {
+                    longitude: virtualGpsCoords[0],
+                    latitude: virtualGpsCoords[1],
+                    speed: debugSimSpeed,
+                    heading: heading,
+                    altitude: 50
+                }
+            };
+
+            if (isLiveNavActive) {
+                updateNavigationHUD(spoofedPos);
+            } else {
+                ensureUserLocationMarker(virtualGpsCoords);
+                if (userLocationMarker) {
+                    userLocationMarker.setLngLat(virtualGpsCoords);
+                    userLocationMarker.setRotation(heading);
+                }
+                // In normal mode, do NOT center or move the camera as location changes
+            }
+        }
+        debugLoopId = requestAnimationFrame(step);
+    }
+    debugLoopId = requestAnimationFrame(step);
+}
+
+function stopDebugLoop() {
+    if (debugLoopId) {
+        cancelAnimationFrame(debugLoopId);
+        debugLoopId = null;
+    }
+}
+
+// Initialize debug controls
+initDebugJoystick();
+
