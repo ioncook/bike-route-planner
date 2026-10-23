@@ -1882,6 +1882,7 @@ function setupRouteLayers() {
         }
         rebuildMapGradient();
         updateDistanceMarkers();
+        updateTurnaroundJoins();
     }
 }
 let isFirstLoad = true;
@@ -4676,12 +4677,13 @@ document.getElementById('basemap').addEventListener('change', (e) => {
         ? VECTOR_STYLES[val]
         : buildRasterStyle(RASTER_BASEMAPS[val] || RASTER_BASEMAPS.osm);
 
-    map.setStyle(newStyle);
+    _activeExtraGradientLayers = 0;
+    map.setStyle(newStyle, { diff: false });
 
     // After a setStyle() call all custom sources/layers are wiped.
     // Re-add them once the new style is ready.
-    // We use both 'style.load' AND a 200ms fallback because inline raster styles
-    // can finish loading synchronously before the once() listener is registered.
+    // We use both 'style.load' AND a fallback timer because inline raster styles
+    // or loaded styles can finish synchronously before once() is triggered.
     let _setupDone = false;
     const _doSetup = () => {
         if (_setupDone) return;
@@ -9606,4 +9608,23 @@ function stopDebugLoop() {
 
 // Initialize debug controls
 initDebugJoystick();
+
+// Only enable live navigation and navigation HUD UI on the native app version (e.g. Capacitor Android)
+(function enforceNativeOnlyLiveNavigation() {
+    const isNative = Boolean(window.Capacitor && typeof window.Capacitor.isNativePlatform === 'function' && window.Capacitor.isNativePlatform());
+    if (!isNative) {
+        const navBtnGroup = document.querySelector('.icon-btn-group-success:has(#start-nav-btn)') || document.getElementById('start-nav-btn')?.closest('.icon-btn-group');
+        if (navBtnGroup) navBtnGroup.style.display = 'none';
+        const startBtn = document.getElementById('start-nav-btn');
+        if (startBtn) startBtn.style.display = 'none';
+        const hud = document.getElementById('live-nav-hud');
+        if (hud) hud.style.display = 'none';
+        const debugJoystick = document.getElementById('debug-joystick-container');
+        if (debugJoystick) debugJoystick.style.display = 'none';
+        const debugCheckRow = document.getElementById('debug-joystick-check')?.closest('.setting-row');
+        if (debugCheckRow) debugCheckRow.style.display = 'none';
+        const hapticsRow = document.getElementById('nav-vibration-check')?.closest('.setting-row');
+        if (hapticsRow) hapticsRow.style.display = 'none';
+    }
+})();
 
