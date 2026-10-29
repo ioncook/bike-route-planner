@@ -70,6 +70,7 @@ document.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
         try {
+            localStorage.removeItem('cached_active_route');
             localStorage.removeItem('route_waypoints');
             localStorage.removeItem('route_segment_modes');
             localStorage.removeItem('route_gpx_paths');
@@ -1800,7 +1801,10 @@ function setupRouteLayers() {
     if (!map.getSource('distance-markers-source')) {
         map.addSource('distance-markers-source', {
             type: 'geojson',
-            data: { type: 'FeatureCollection', features: [] }
+            data: { type: 'FeatureCollection', features: [] },
+            maxzoom: 24,
+            buffer: 128,
+            tolerance: 0
         });
     }
     if (!map.getLayer('distance-markers-layer')) {
@@ -1901,6 +1905,7 @@ map.on('style.load', () => {
     }
 
     let lastRebuildZoom = map.getZoom();
+    let _lastDistMarkerUpdate = 0;
     const updateView = () => {
         routeScreenPtsDirty = true;
         const currentZoom = map.getZoom();
@@ -1909,6 +1914,7 @@ map.on('style.load', () => {
             updateTurnaroundJoins();
             rebuildMapGradient(); // Miter point depends on zoom — refresh display coords
         }
+        updateDistanceMarkers();
 
         try {
             const center = map.getCenter();
@@ -1921,6 +1927,11 @@ map.on('style.load', () => {
     map.on('rotateend', () => { routeScreenPtsDirty = true; });
     map.on('zoom', () => {
         routeScreenPtsDirty = true;
+        const now = performance.now();
+        if (now - _lastDistMarkerUpdate > 32) {
+            _lastDistMarkerUpdate = now;
+            updateDistanceMarkers();
+        }
     });
     map.on('zoomend', () => {
         isZooming = false;
@@ -5536,10 +5547,21 @@ function toggleStatsPanel(event) {
 }
 
 document.getElementById('total-distance').addEventListener('click', toggleStatsPanel);
-document.getElementById('brand-logo-btn')?.addEventListener('click', (e) => {
-    e.preventDefault();
-    window.location.reload();
-});
+const brandLogoBtn = document.getElementById('brand-logo-btn');
+if (brandLogoBtn) {
+    const isNativeApp = Boolean(window.Capacitor && typeof window.Capacitor.isNativePlatform === 'function' && window.Capacitor.isNativePlatform());
+    if (isNativeApp) {
+        brandLogoBtn.setAttribute('href', 'javascript:void(0)');
+        brandLogoBtn.setAttribute('title', 'Reload app');
+        brandLogoBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            window.location.reload();
+        });
+    } else {
+        brandLogoBtn.setAttribute('href', 'https://ioncook.github.io');
+        brandLogoBtn.setAttribute('title', 'Go to Homepage');
+    }
+}
 document.getElementById('close-stats-btn')?.addEventListener('click', (e) => {
     e.stopPropagation();
     document.getElementById('stats-panel').classList.remove('show');
@@ -8088,8 +8110,9 @@ setTimeout(syncTopBarHeight, 500);
 
 function getCoordinateAtDistance(meters) {
     if (!currentRouteGeoJSON || !routePathDistances || routePathDistances.length === 0) return null;
-    if (meters <= 0) return currentRouteGeoJSON.coordinates[0];
-    if (meters >= routeTotalDist) return currentRouteGeoJSON.coordinates[currentRouteGeoJSON.coordinates.length - 1];
+    const coords = currentRouteGeoJSON.coordinates;
+    if (meters <= 0) return coords[0];
+    if (meters >= routeTotalDist) return coords[coords.length - 1];
 
     // Binary search to find segment
     let lo = 0, hi = routePathDistances.length - 1;
@@ -8102,17 +8125,35 @@ function getCoordinateAtDistance(meters) {
         }
     }
     const idx = lo;
-    if (idx === 0) return currentRouteGeoJSON.coordinates[0];
+    if (idx === 0) return coords[0];
 
     const d0 = routePathDistances[idx - 1];
     const d1 = routePathDistances[idx];
-    const p0 = currentRouteGeoJSON.coordinates[idx - 1];
-    const p1 = currentRouteGeoJSON.coordinates[idx];
+    const p0 = coords[idx - 1];
+    const p1 = coords[idx];
 
-    const ratio = (meters - d0) / (d1 - d0);
+    const ratio = (d1 > d0) ? (meters - d0) / (d1 - d0) : 0;
     const lng = p0[0] + ratio * (p1[0] - p0[0]);
     const lat = p0[1] + ratio * (p1[1] - p0[1]);
-    return [lng, lat];
+    const baseCoord = [lng, lat];
+
+    // Offset perpendicular to segment bearing to match the rendered route line's lane offset
+    const zoom = map ? map.getZoom() : 0;
+    const mult = isRouteLeftHandDriving ? -1 : 1;
+    const pxOffset = getPixelOffset(zoom) * mult;
+    if (Math.abs(pxOffset) > 0.1) {
+        let prevIdx = idx - 1;
+        while (prevIdx > 0 && haversineDistance(coords[prevIdx], p1) < 0.5) {
+            prevIdx--;
+        }
+        const bearing = getBearing(coords[prevIdx], p1);
+        const latRad = lat * Math.PI / 180;
+        const metersPerPixel = 78271.51696 * Math.cos(latRad) / Math.pow(2, zoom);
+        const offsetDist = Math.abs(pxOffset) * metersPerPixel;
+        return offsetLatLng(baseCoord, offsetDist, bearing + 90 * mult);
+    }
+
+    return baseCoord;
 }
 
 function updateDistanceMarkers() {
@@ -8147,17 +8188,35 @@ function updateDistanceMarkers() {
     }
 
     const unitInMeters = isImperial ? 1609.344 : 1000;
-    const intervalMeters = interval * unitInMeters;
+    const totalDistUnits = routeTotalDist / unitInMeters;
+    const maxK = Math.floor(totalDistUnits / interval);
+
+    // Compute visible viewport bounds with a small buffer so we don't generate
+    // thousands of off-screen markers at high zoom levels during live zoom gestures
+    let minLng = -180, maxLng = 180, minLat = -90, maxLat = 90;
+    if (maxK > 150 && map.getBounds) {
+        try {
+            const bounds = map.getBounds();
+            const sw = bounds.getSouthWest();
+            const ne = bounds.getNorthEast();
+            const padLng = Math.max(0.01, (ne.lng - sw.lng) * 0.35);
+            const padLat = Math.max(0.01, (ne.lat - sw.lat) * 0.35);
+            minLng = sw.lng - padLng;
+            maxLng = ne.lng + padLng;
+            minLat = sw.lat - padLat;
+            maxLat = ne.lat + padLat;
+        } catch (_) {}
+    }
 
     const features = [];
-    const totalDistUnits = routeTotalDist / unitInMeters;
-
-    const maxK = Math.floor(totalDistUnits / interval);
     for (let k = 1; k <= maxK; k++) {
         const distUnits = k * interval;
         const distMeters = distUnits * unitInMeters;
         const coord = getCoordinateAtDistance(distMeters);
         if (coord) {
+            if (coord[0] < minLng || coord[0] > maxLng || coord[1] < minLat || coord[1] > maxLat) {
+                continue;
+            }
             let text = distUnits.toString();
             if (distUnits % 1 !== 0) {
                 text = parseFloat(distUnits.toFixed(2)).toString();
