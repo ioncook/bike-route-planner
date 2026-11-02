@@ -82,23 +82,26 @@ document.addEventListener('click', (e) => {
 // Wait for DOM content to be ready
 document.addEventListener('DOMContentLoaded', () => {
     let params = new URLSearchParams(window.location.search);
-    let routeStr = params.get('route');
-    let modeStr = params.get('modes');
+    let routeStr = params.get('r') || params.get('route');
+    let modeStr = params.get('m') || params.get('modes');
 
     // On mobile app, check cached route in localStorage if no route in URL query
     if (!routeStr) {
         try {
             const cachedRoute = JSON.parse(localStorage.getItem('cached_active_route') || 'null');
-            if (cachedRoute && cachedRoute.route) {
-                routeStr = cachedRoute.route;
-                if (!modeStr && cachedRoute.modes) modeStr = cachedRoute.modes;
+            if (cachedRoute && (cachedRoute.r || cachedRoute.route)) {
+                routeStr = cachedRoute.r || cachedRoute.route;
+                if (!modeStr && (cachedRoute.m || cachedRoute.modes)) modeStr = cachedRoute.m || cachedRoute.modes;
             }
         } catch (_) {}
     }
 
-    const modes = modeStr ? modeStr.split(',') : [];
+    const isCompact = !routeStr?.includes(';');
+    const isGPX = modeStr?.includes('gpx') || modeStr?.includes('g');
+    const hasMultiplePoints = routeStr && (isCompact ? (decodePolyline5(routeStr).length >= 2) : routeStr.includes(';'));
+
     // Only show the loading cover when there are 2+ waypoints (a real route to fetch) and not a GPX import.
-    if (routeStr && routeStr.includes(';') && !modes.includes('gpx')) {
+    if (hasMultiplePoints && !isGPX) {
         document.body.appendChild(initialCover);
         document.getElementById('loading-indicator').style.display = 'flex';
         document.getElementById('loading-phase').textContent = 'Initializing...';
@@ -497,6 +500,69 @@ function decodePolyline6(str) {
         coordinates.push([lng / 1e6, lat / 1e6]);
     }
     return coordinates;
+}
+
+// Compact 5-decimal Polyline encoding for waypoints (Google/OSRM format, ~1m precision)
+function encodePolyline5(coords) {
+    if (!coords || coords.length === 0) return '';
+    let output = '';
+    let prevLat = 0;
+    let prevLng = 0;
+    for (const [lng, lat] of coords) {
+        const latInt = Math.round(lat * 1e5);
+        const lngInt = Math.round(lng * 1e5);
+        const dLat = latInt - prevLat;
+        const dLng = lngInt - prevLng;
+        prevLat = latInt;
+        prevLng = lngInt;
+        for (let val of [dLat, dLng]) {
+            let num = val < 0 ? ~(val << 1) : (val << 1);
+            while (num >= 0x20) {
+                output += String.fromCharCode((0x20 | (num & 0x1f)) + 63);
+                num >>= 5;
+            }
+            output += String.fromCharCode(num + 63);
+        }
+    }
+    return output;
+}
+
+function decodePolyline5(str) {
+    if (!str) return [];
+    let index = 0, lat = 0, lng = 0, coordinates = [];
+    while (index < str.length) {
+        let b, shift = 0, result = 0;
+        do { b = str.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+        lat += ((result & 1) ? ~(result >> 1) : (result >> 1));
+        shift = 0; result = 0;
+        do { b = str.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+        lng += ((result & 1) ? ~(result >> 1) : (result >> 1));
+        coordinates.push([Number((lng / 1e5).toFixed(5)), Number((lat / 1e5).toFixed(5))]);
+    }
+    return coordinates;
+}
+
+function encodeCompactModes(modes) {
+    if (!modes || modes.length === 0) return '';
+    const map = { bike: 'b', direct: 'd', hike: 'h', transit: 't', gpx: 'g' };
+    const str = modes.map(m => map[m] || 'b').join('');
+    if (/^b+$/.test(str)) return ''; // Omit when all segments are bike mode
+    return str;
+}
+
+function decodeCompactModes(str, segCount) {
+    if (!str) return Array(segCount).fill('bike');
+    if (str.includes(',')) {
+        const parts = str.split(',');
+        return parts.length >= segCount ? parts.slice(0, segCount) : [...parts, ...Array(segCount - parts.length).fill('bike')];
+    }
+    const map = { b: 'bike', d: 'direct', h: 'hike', t: 'transit', g: 'gpx' };
+    const res = [];
+    for (let i = 0; i < segCount; i++) {
+        const ch = str[i] || str[str.length - 1] || 'b';
+        res.push(map[ch] || 'bike');
+    }
+    return res;
 }
 
 // Haversine distance between two [lng, lat] points — used in force/direct mode
@@ -3669,30 +3735,18 @@ async function updateRoute() {
         throw e;
     }
 
-    // Ensure EVERY segment connects cleanly to its waypoint pins with zero gap.
-    // BRouter snaps endpoints to the nearest road network node; if that node is even slightly
-    // away from the clicked waypoint pin, connect it directly so the line reaches the pin.
+    // Process segments for line rendering.
+    // In direct/transit modes, use direct straight lines between the waypoints.
+    // For routed segments (bike, hike), the router's geometry already follows the road network;
+    // we do NOT inject off-road waypoint coordinates into routed segments.
     for (let i = 0; i < segments.length; i++) {
         const seg = segments[i];
         if (!seg || !seg.coords || seg.coords.length === 0) continue;
         const pStart = waypoints[i];
         const pEnd = waypoints[i + 1];
 
-        if (seg.isTransit) {
+        if (seg.isTransit || segmentModes[i] === 'transit' || segmentModes[i] === 'direct') {
             seg.coords = [pStart, pEnd];
-        } else {
-            // Normal routed segment: ensure endpoints touch waypoints[i] and waypoints[i + 1] exactly
-            if (haversineDistance(seg.coords[0], pStart) > 0.5) {
-                seg.coords.unshift(pStart);
-            } else {
-                seg.coords[0] = pStart;
-            }
-            const lastIdx = seg.coords.length - 1;
-            if (haversineDistance(seg.coords[lastIdx], pEnd) > 0.5) {
-                seg.coords.push(pEnd);
-            } else {
-                seg.coords[lastIdx] = pEnd;
-            }
         }
     }
 
@@ -6139,11 +6193,12 @@ shareBtn?.addEventListener('click', async () => {
         return;
     }
 
-    // Build the share URL pointing to ioncook.github.io/bike-route-planner
+    // Build compact share URL pointing to ioncook.github.io/bike-route-planner
     const params = new URLSearchParams();
-    const wpStr = waypoints.map(wp => `${wp[0].toFixed(5)},${wp[1].toFixed(5)}`).join(';');
-    params.set('route', wpStr);
-    if (segmentModes.length > 0) params.set('modes', segmentModes.join(','));
+    const compactRoute = encodePolyline5(waypoints);
+    params.set('r', compactRoute);
+    const compactModes = encodeCompactModes(segmentModes);
+    if (compactModes) params.set('m', compactModes);
     if (forceMode) params.set('force', '1');
 
     const shareUrl = `https://ioncook.github.io/bike-route-planner/?${params.toString()}`;
@@ -7274,18 +7329,26 @@ function syncUrl() {
     const params = new URLSearchParams(window.location.search);
     const hasGPX = segmentModes.some(m => m === 'gpx');
     if (waypoints.length > 0 && !hasGPX) {
-        const wpStr = waypoints.map(wp => `${wp[0].toFixed(5)},${wp[1].toFixed(5)}`).join(';');
-        params.set('route', wpStr);
-        if (segmentModes.length > 0) params.set('modes', segmentModes.join(','));
-        else params.delete('modes');
+        const compactRoute = encodePolyline5(waypoints);
+        params.set('r', compactRoute);
+        params.delete('route'); // Clean up verbose legacy param if present
+        const compactModes = encodeCompactModes(segmentModes);
+        if (compactModes) params.set('m', compactModes);
+        else params.delete('m');
+        params.delete('modes'); // Clean up verbose legacy param if present
         try {
+            const wpStr = waypoints.map(wp => `${wp[0].toFixed(5)},${wp[1].toFixed(5)}`).join(';');
             localStorage.setItem('cached_active_route', JSON.stringify({
+                r: compactRoute,
+                m: compactModes,
                 route: wpStr,
                 modes: segmentModes.join(','),
                 force: forceMode ? '1' : '0'
             }));
         } catch (_) {}
     } else {
+        params.delete('r');
+        params.delete('m');
         params.delete('route');
         params.delete('modes');
         try {
@@ -7310,12 +7373,17 @@ function loadUrlState(customUrl) {
     }
 
     // If no route in URL, check cached route in localStorage
-    if (!params.get('route')) {
+    if (!params.get('r') && !params.get('route')) {
         try {
             const cachedRoute = JSON.parse(localStorage.getItem('cached_active_route') || 'null');
-            if (cachedRoute && cachedRoute.route) {
-                params.set('route', cachedRoute.route);
-                if (cachedRoute.modes) params.set('modes', cachedRoute.modes);
+            if (cachedRoute) {
+                if (cachedRoute.r) {
+                    params.set('r', cachedRoute.r);
+                    if (cachedRoute.m) params.set('m', cachedRoute.m);
+                } else if (cachedRoute.route) {
+                    params.set('route', cachedRoute.route);
+                    if (cachedRoute.modes) params.set('modes', cachedRoute.modes);
+                }
                 if (cachedRoute.force === '1') params.set('force', '1');
             }
         } catch (_) {}
@@ -7326,11 +7394,36 @@ function loadUrlState(customUrl) {
         forceMode = true;
         updateForceModeBtn();
     }
-    const routeStr = params.get('route');
-    const modeStr = params.get('modes');
-    const modes = modeStr ? modeStr.split(',') : [];
+    const compactRouteStr = params.get('r');
+    const legacyRouteStr = params.get('route');
+    const compactModeStr = params.get('m');
+    const legacyModeStr = params.get('modes');
+
+    // Parse waypoints from either compact polyline or legacy string
+    let parsedWaypoints = [];
+    if (compactRouteStr) {
+        parsedWaypoints = decodePolyline5(compactRouteStr);
+    } else if (legacyRouteStr) {
+        const points = legacyRouteStr.split(';');
+        points.forEach(pt => {
+            const [lng, lat] = pt.split(',').map(Number);
+            if (!isNaN(lng) && !isNaN(lat)) parsedWaypoints.push([lng, lat]);
+        });
+    }
+
+    const segCount = Math.max(0, parsedWaypoints.length - 1);
+    let modes = [];
+    if (compactModeStr) {
+        modes = decodeCompactModes(compactModeStr, segCount);
+    } else if (legacyModeStr) {
+        modes = legacyModeStr.split(',');
+    } else {
+        modes = Array(segCount).fill('bike');
+    }
 
     if (modes.includes('gpx')) {
+        params.delete('r');
+        params.delete('m');
         params.delete('route');
         params.delete('modes');
         window.history.replaceState({}, '', `${window.location.pathname}?${params.toString()}`);
@@ -7338,7 +7431,7 @@ function loadUrlState(customUrl) {
         return;
     }
 
-    if (routeStr) {
+    if (parsedWaypoints.length > 0) {
         // Clear any existing markers if reloading from deep link or new route provided
         if (customUrl || waypoints.length > 0) {
             clearRoute(false);
@@ -7356,9 +7449,9 @@ function loadUrlState(customUrl) {
                 document.getElementById('mode-transit')?.classList.toggle('active', fallbackMode === 'transit');
             }
         }
-        const points = routeStr.split(';');
-        points.forEach((pt, i) => {
-            const [lng, lat] = pt.split(',').map(Number);
+
+        parsedWaypoints.forEach((coords, i) => {
+            const [lng, lat] = coords;
             if (!isNaN(lng) && !isNaN(lat)) {
                 const mode = i > 0 ? modes[i - 1] : undefined;
                 createMarker({ lng, lat }, undefined, mode === 'gpx' ? 'bike' : mode);
