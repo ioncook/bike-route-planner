@@ -113,6 +113,81 @@ const initialCenter = cachedCenter ? JSON.parse(cachedCenter) : [0, 0];
 const initialZoom = cachedZoom ? parseFloat(cachedZoom) : 1;
 
 
+function isNativeCapacitorApp() {
+    return Boolean(window.Capacitor && typeof window.Capacitor.isNativePlatform === 'function' && window.Capacitor.isNativePlatform());
+}
+
+function isLngLatBehindCamera(mapInstance, lngLat) {
+    if (!mapInstance || !lngLat) return false;
+    try {
+        const tr = mapInstance.transform;
+        if (!tr) return false;
+        const ct = tr.currentTransform || tr;
+        const mat = (mapInstance.terrain && ct._pixelMatrix3D) ? ct._pixelMatrix3D : ct._pixelMatrix;
+        if (mat && ct.worldSize) {
+            const lng = typeof lngLat.lng === 'number' ? lngLat.lng : lngLat[0];
+            const lat = typeof lngLat.lat === 'number' ? lngLat.lat : lngLat[1];
+            const mc = maplibregl.MercatorCoordinate.fromLngLat({ lng, lat });
+            const elev = mapInstance.terrain
+                ? (mapInstance.terrain.getElevationForLngLatZoom({ lng, lat }, ct._helper?._tileZoom ?? Math.floor(mapInstance.getZoom())) || 0)
+                : 0;
+            const x = mc.x * ct.worldSize;
+            const y = mc.y * ct.worldSize;
+            const z = elev;
+            // In gl-matrix column-major 4x4, the 4th component w after mat * [x, y, z, 1] is:
+            const w = mat[3] * x + mat[7] * y + mat[11] * z + mat[15];
+            return w <= 0;
+        }
+    } catch (_) {}
+    return false;
+}
+
+if (typeof maplibregl !== 'undefined' && maplibregl.Marker && !maplibregl.Marker.prototype._patchedBehindCamera) {
+    maplibregl.Marker.prototype._patchedBehindCamera = true;
+    const origSetLngLat = maplibregl.Marker.prototype.setLngLat;
+    maplibregl.Marker.prototype.setLngLat = function (lngLat) {
+        if (!this._patchedInstanceUpdate && typeof this._update === 'function') {
+            this._patchedInstanceUpdate = true;
+            const origUpdate = this._update;
+            this._update = (e) => {
+                origUpdate(e);
+                if (this._map && this._element && this._lngLat) {
+                    const behind = isLngLatBehindCamera(this._map, this._lngLat);
+                    if (behind) {
+                        this._element.style.visibility = 'hidden';
+                    } else if (this._element.style.visibility === 'hidden') {
+                        this._element.style.visibility = '';
+                    }
+                }
+            };
+        }
+        return origSetLngLat.call(this, lngLat);
+    };
+}
+
+if (typeof maplibregl !== 'undefined' && maplibregl.Popup && !maplibregl.Popup.prototype._patchedBehindCamera) {
+    maplibregl.Popup.prototype._patchedBehindCamera = true;
+    const origPopupSetLngLat = maplibregl.Popup.prototype.setLngLat;
+    maplibregl.Popup.prototype.setLngLat = function (lngLat) {
+        if (!this._patchedInstanceUpdate && typeof this._update === 'function') {
+            this._patchedInstanceUpdate = true;
+            const origUpdate = this._update;
+            this._update = (e) => {
+                origUpdate(e);
+                if (this._map && this._container && this._lngLat) {
+                    const behind = isLngLatBehindCamera(this._map, this._lngLat);
+                    if (behind) {
+                        this._container.style.visibility = 'hidden';
+                    } else if (this._container.style.visibility === 'hidden') {
+                        this._container.style.visibility = '';
+                    }
+                }
+            };
+        }
+        return origPopupSetLngLat.call(this, lngLat);
+    };
+}
+
 const map = new maplibregl.Map({
     container: 'map',
     style: VECTOR_STYLES[currentBasemap] || buildRasterStyle(RASTER_BASEMAPS[currentBasemap]),
@@ -123,7 +198,7 @@ const map = new maplibregl.Map({
     centerClampedToGround: false,
     projection: { type: localStorage.getItem('route_projection') || 'mercator' },
     antialias: false,
-    fadeDuration: 0,
+    fadeDuration: isNativeCapacitorApp() ? 50 : 0,
     trackResize: true,
     clickTolerance: 8,
     aroundCenter: false,
@@ -161,6 +236,7 @@ let middleClickStartX = null, middleClickStartY = null;
 function buildRasterStyle(tileUrl) {
     const tiles = Array.isArray(tileUrl) ? tileUrl : [tileUrl];
     const isLight = document.body.classList.contains('light-mode') || localStorage.getItem('route_theme') === 'light';
+    const isNative = isNativeCapacitorApp();
     return {
         version: 8,
         glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',
@@ -174,7 +250,7 @@ function buildRasterStyle(tileUrl) {
         },
         layers: [
             { id: 'bg', type: 'background', paint: { 'background-color': isLight ? '#ffffff' : '#111111' } },
-            { id: 'basemap-layer', type: 'raster', source: 'basemap' }
+            { id: 'basemap-layer', type: 'raster', source: 'basemap', paint: { 'raster-fade-duration': isNative ? 50 : 0 } }
         ]
     };
 }
@@ -782,7 +858,8 @@ function rebuildMapGradient() {
 
             let color = 'rgb(34,197,94)';
             if (currentMapColorMode === 'grade' && grades) {
-                color = getColorForGrade(grades[Math.min(rawIdx + 1, grades.length - 1)] ?? 0);
+                const gradeIdx = Math.min(rawIdx + 1, sec.endRaw, grades.length - 1);
+                color = getColorForGrade(grades[gradeIdx] ?? grades[rawIdx] ?? 0);
             } else if (currentMapColorMode === 'road') {
                 const rt = routeRoadTypes[Math.min(rawIdx, routeRoadTypes.length - 1)] || 'other';
                 color = roadColors[rt] || '#6b7280';
@@ -913,11 +990,13 @@ function showHoverSegment(ci) {
             if (frac <= lastFrac) continue;
             lastFrac = frac;
             const rawIdx = displayIndexToRawIndex[displayIdx];
-            stops.push(frac, getColorForGrade(routeGrades[Math.min(rawIdx + 1, routeGrades.length - 1)] ?? 0));
+            const gradeIdx = Math.min(rawIdx + 1, endIndex, routeGrades.length - 1);
+            stops.push(frac, getColorForGrade(routeGrades[gradeIdx] ?? routeGrades[rawIdx] ?? 0));
         }
         if (lastFrac < 1) {
             const rawIdx = displayIndexToRawIndex[displayEnd];
-            stops.push(1, getColorForGrade(routeGrades[Math.min(rawIdx + 1, routeGrades.length - 1)] ?? 0));
+            const gradeIdx = Math.min(rawIdx + 1, endIndex, routeGrades.length - 1);
+            stops.push(1, getColorForGrade(routeGrades[gradeIdx] ?? routeGrades[rawIdx] ?? 0));
         }
     } else {
         stops.push(0, 'rgb(34,197,94)', 1, 'rgb(34,197,94)');
@@ -1367,6 +1446,10 @@ function showHoverMarker(lngLat, info) {
         pt = lngLat;
     } else if (map && typeof map.project === 'function') {
         const coords = Array.isArray(lngLat) ? lngLat : [lngLat.lng, lngLat.lat];
+        if (isLngLatBehindCamera(map, coords)) {
+            hideHoverMarker();
+            return;
+        }
         pt = map.project(coords);
     } else {
         return;
@@ -2271,6 +2354,8 @@ function getOffsetScreenPt(ci) {
         pIdx = rawIndexToDisplayRange[ci][0] ?? ci;
     }
     pIdx = Math.min(pIdx, displayCoords.length - 1);
+
+    if (isLngLatBehindCamera(map, displayCoords[pIdx])) return null;
 
     const p2 = map.project(displayCoords[pIdx]);
     if (!p2) return null;
@@ -6473,14 +6558,17 @@ function initChart() {
             else high = mid - 1;
         }
 
-        // Sub-index interpolation factor between data[i] and data[i+1]
-        const t = (data[i + 1] && data[i + 1].x !== data[i].x)
+        // Sub-index interpolation factor between data[i] and data[i+1] (only if neither point is a null transit break)
+        const isNullGap = (data[i] && data[i].y === null) || (data[i + 1] && data[i + 1].y === null);
+        const t = (!isNullGap && data[i + 1] && data[i + 1].x !== data[i].x)
             ? Math.max(0, Math.min(1, (xValue - data[i].x) / (data[i + 1].x - data[i].x)))
             : 0;
 
         // Map xValue → route coordinate index via cumulative distances (continuous)
         let ci = 0;
-        if (routePathDistances && routePathDistances.length === coords.length) {
+        if (data[i] && data[i].rawIdx != null) {
+            ci = data[i].rawIdx;
+        } else if (routePathDistances && routePathDistances.length === coords.length) {
             const xMeters = currentUnits === 'imperial' ? xValue * 1609.344 : xValue * 1000;
             let lo = 0, hi = routePathDistances.length - 2;
             while (lo <= hi) {
@@ -6492,11 +6580,11 @@ function initChart() {
         } else {
             ci = Math.min(Math.floor((i / Math.max(1, data.length - 1)) * (coords.length - 1)), coords.length - 2);
         }
-        if (ci >= 0 && (isTransitPoint(ci) || isTransitSegment(ci))) {
+        if (ci >= 0 && isTransitPoint(ci)) {
             clearHover();
             return;
         }
-        const ciNext = ci + 1;
+        const ciNext = isTransitSegment(ci) ? ci : Math.min(ci + 1, coords.length - 1);
 
         // Interpolated geographic position
         const displayCoords = currentDisplayCoords || coords;
@@ -6505,30 +6593,50 @@ function initChart() {
         const lngC = displayCoords[displayIdx][0] + t * (displayCoords[displayIdxNext][0] - displayCoords[displayIdx][0]);
         const latC = displayCoords[displayIdx][1] + t * (displayCoords[displayIdxNext][1] - displayCoords[displayIdx][1]);
 
-        // Offset marker to sit on the route line (same logic as map hover)
-        const pCenter = map.project([lngC, latC]);
-        const p0 = map.project(displayCoords[displayIdx]);
-        const p1 = map.project(displayCoords[displayIdxNext]);
-        const vX = p1.x - p0.x, vY = p1.y - p0.y;
-        const segLen = Math.sqrt(vX * vX + vY * vY);
-        let markerLngLat;
-        let markerScreenPt = null;
-        if (segLen > 0.1) {
-            const nx = -vY / segLen, ny = vX / segLen;
-            const off = getPixelOffset(map.getZoom()) * (isRouteLeftHandDriving ? -1 : 1);
-            markerScreenPt = { x: pCenter.x + nx * off, y: pCenter.y + ny * off };
-            markerLngLat = map.unproject([pCenter.x + nx * off, pCenter.y + ny * off]);
+        if (isLngLatBehindCamera(map, [lngC, latC])) {
+            hoverCircleEl.style.display = 'none';
+            hoverInfoEl.style.display = 'none';
         } else {
-            markerLngLat = { lng: lngC, lat: latC };
+            // Offset marker to sit on the route line (same logic as map hover)
+            const pCenter = map.project([lngC, latC]);
+            const p0 = map.project(displayCoords[displayIdx]);
+            const p1 = map.project(displayCoords[displayIdxNext]);
+            const vX = p1.x - p0.x, vY = p1.y - p0.y;
+            const segLen = Math.sqrt(vX * vX + vY * vY);
+            let markerLngLat;
+            let markerScreenPt = null;
+            if (segLen > 0.1) {
+                const nx = -vY / segLen, ny = vX / segLen;
+                const off = getPixelOffset(map.getZoom()) * (isRouteLeftHandDriving ? -1 : 1);
+                markerScreenPt = { x: pCenter.x + nx * off, y: pCenter.y + ny * off };
+                markerLngLat = map.unproject([pCenter.x + nx * off, pCenter.y + ny * off]);
+            } else {
+                markerLngLat = { lng: lngC, lat: latC };
+            }
+
+            // Interpolate elevation and grade continuously
+            const ds = chart.data.datasets[0];
+            const elevA = data[i]?.y, elevB = data[i + 1]?.y;
+            const elevVal = (elevA != null && elevB != null) ? elevA + t * (elevB - elevA) : (elevA ?? elevB ?? null);
+            const gradeA = ds.grades?.[ci];
+            const gradeB = ds.grades?.[Math.min(ciNext, (ds.grades?.length ?? 1) - 1)];
+            const grade = (gradeA != null && gradeB != null) ? gradeA + t * (gradeB - gradeA) : (gradeA ?? gradeB);
+
+            const distLabel = xValue.toFixed(2) + (currentUnits === 'metric' ? ' km' : ' mi');
+            const elevLabel = elevVal != null ? elevVal.toFixed(1) + (currentUnits === 'metric' ? ' m' : ' ft') : '';
+            const gradeLabel = grade !== undefined ? (grade >= 0 ? '+' : '') + grade.toFixed(2) + '%' : '';
+            const info = `${distLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${elevLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${gradeLabel}`;
+
+            showHoverMarker(markerScreenPt || [markerLngLat.lng, markerLngLat.lat], info);
         }
 
         // Interpolate elevation and grade continuously
         const ds = chart.data.datasets[0];
         const elevA = data[i]?.y, elevB = data[i + 1]?.y;
-        const elevVal = (elevA != null && elevB != null) ? elevA + t * (elevB - elevA) : (elevA ?? null);
+        const elevVal = (elevA != null && elevB != null) ? elevA + t * (elevB - elevA) : (elevA ?? elevB ?? null);
         const gradeA = ds.grades?.[ci];
-        const gradeB = ds.grades?.[Math.min(ci + 1, (ds.grades?.length ?? 1) - 1)];
-        const grade = (gradeA !== undefined && gradeB !== undefined) ? gradeA + t * (gradeB - gradeA) : gradeA;
+        const gradeB = ds.grades?.[Math.min(ciNext, (ds.grades?.length ?? 1) - 1)];
+        const grade = (gradeA != null && gradeB != null) ? gradeA + t * (gradeB - gradeA) : (gradeA ?? gradeB);
 
         // Update hover line on chart
         currentHoverDispDist = xValue;
@@ -6537,9 +6645,7 @@ function initChart() {
         const distLabel = xValue.toFixed(2) + (currentUnits === 'metric' ? ' km' : ' mi');
         const elevLabel = elevVal != null ? elevVal.toFixed(1) + (currentUnits === 'metric' ? ' m' : ' ft') : '';
         const gradeLabel = grade !== undefined ? (grade >= 0 ? '+' : '') + grade.toFixed(2) + '%' : '';
-        const info = `${distLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${elevLabel} <span style="color:#888">&nbsp;|&nbsp;</span> ${gradeLabel}`;
 
-        showHoverMarker(markerScreenPt || [markerLngLat.lng, markerLngLat.lat], info);
         showHoverSegment(ci);
 
         const statsDiv = document.getElementById('hover-stats');
@@ -6696,11 +6802,34 @@ async function updateElevationProfile() {
             mercDistances.push(mercDist);
         }
 
+        // Helper to find the continuous non-transit section [secStart, secEnd] containing index idx
+        const getContinuousBounds = (idx) => {
+            if (isTransitPoint(idx)) return null;
+            let secStart = 0;
+            let secEnd = elevations.length - 1;
+            if (waypointPathIndices && waypointPathIndices.length >= 2) {
+                for (let segI = 0; segI < waypointPathIndices.length - 1; segI++) {
+                    if (segmentModes[segI] === 'transit') {
+                        const tStart = waypointPathIndices[segI];
+                        const tEnd = waypointPathIndices[segI + 1];
+                        if (tEnd <= idx && tEnd > secStart) {
+                            secStart = tEnd;
+                        }
+                        if (tStart >= idx && tStart < secEnd) {
+                            secEnd = tStart;
+                        }
+                    }
+                }
+            }
+            return { secStart, secEnd };
+        };
+
         // Pass 1: Isolation despiker — eliminates single-point glitches.
         // 6 passes ensure multi-point clusters are progressively collapsed.
         for (let pass = 0; pass < 6; pass++) {
             const readElevs = [...elevations];
             for (let i = 1; i < elevations.length - 1; i++) {
+                if (isTransitPoint(i) || isTransitSegment(i - 1) || isTransitSegment(i)) continue;
                 const v = readElevs[i];
                 const prev = readElevs[i - 1];
                 const next = readElevs[i + 1];
@@ -6736,6 +6865,7 @@ async function updateElevationProfile() {
         for (let pass = 0; pass < 5; pass++) {
             const readElevs = [...elevations];
             for (let i = 1; i < elevations.length - 1; i++) {
+                if (isTransitPoint(i) || isTransitSegment(i - 1) || isTransitSegment(i)) continue;
                 const v = readElevs[i], prev = readElevs[i - 1], next = readElevs[i + 1];
                 if (v == null || prev == null || next == null) continue;
                 const d1 = haversineDistance(coords[i - 1], coords[i]);
@@ -6762,6 +6892,7 @@ async function updateElevationProfile() {
         // common in free Terrarium data. Using a 31-point symmetric kernel (sigma ~ 8).
         // This is applied directly to the source elevations so that gain/loss 
         // calculations are performed on the cleaned data, preventing noise-induced inflation.
+        // Bounded strictly within each continuous section so transit gaps never bleed elevation.
         const GAUSS = [
             0.005, 0.007, 0.010, 0.014, 0.018, 0.024, 0.030, 0.037,
             0.044, 0.052, 0.059, 0.066, 0.073, 0.078, 0.082, 0.084,
@@ -6771,23 +6902,30 @@ async function updateElevationProfile() {
         const WIN_HALF = 15;
         const smoothedElevs = elevations.map((v, i) => {
             if (v == null) return null;
+            const bounds = getContinuousBounds(i);
+            if (!bounds) return v;
+            const { secStart, secEnd } = bounds;
             let sum = 0, weight = 0;
             for (let k = -WIN_HALF; k <= WIN_HALF; k++) {
                 let idx = i + k;
                 let e = null;
-                if (idx >= 0 && idx < elevations.length) {
+                if (idx >= secStart && idx <= secEnd) {
                     e = elevations[idx];
-                } else if (idx < 0) {
-                    // Start boundary reflection
-                    const reflectedIdx = -idx;
-                    if (reflectedIdx < elevations.length && elevations[0] != null && elevations[reflectedIdx] != null) {
-                        e = 2 * elevations[0] - elevations[reflectedIdx];
+                } else if (idx < secStart) {
+                    // Start of continuous section boundary reflection
+                    const reflectedIdx = 2 * secStart - idx;
+                    if (reflectedIdx <= secEnd && elevations[secStart] != null && elevations[reflectedIdx] != null) {
+                        e = 2 * elevations[secStart] - elevations[reflectedIdx];
+                    } else if (elevations[secStart] != null) {
+                        e = elevations[secStart];
                     }
                 } else {
-                    // End boundary reflection
-                    const reflectedIdx = 2 * elevations.length - 2 - idx;
-                    if (reflectedIdx >= 0 && elevations[elevations.length - 1] != null && elevations[reflectedIdx] != null) {
-                        e = 2 * elevations[elevations.length - 1] - elevations[reflectedIdx];
+                    // End of continuous section boundary reflection
+                    const reflectedIdx = 2 * secEnd - idx;
+                    if (reflectedIdx >= secStart && elevations[secEnd] != null && elevations[reflectedIdx] != null) {
+                        e = 2 * elevations[secEnd] - elevations[reflectedIdx];
+                    } else if (elevations[secEnd] != null) {
+                        e = elevations[secEnd];
                     }
                 }
 
@@ -7090,7 +7228,7 @@ async function updateElevationProfile() {
         let maxDownIdx = 0;
 
         for (let i = 0; i < smoothedSegmentGrades.length; i++) {
-            if (isTransitPoint(i)) continue;
+            if (isTransitPoint(i) || isTransitSegment(i)) continue;
             const grade = smoothedSegmentGrades[i];
             if (grade == null || isNaN(grade)) continue;
             if (grade > maxUpGrade) {
