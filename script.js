@@ -465,9 +465,43 @@ async function snapToNearestRoad(lngLat) {
     const lng = Array.isArray(lngLat) ? lngLat[0] : (lngLat ? lngLat.lng : NaN);
     const lat = Array.isArray(lngLat) ? lngLat[1] : (lngLat ? lngLat.lat : NaN);
     if (isNaN(lng) || isNaN(lat)) return lngLat;
+
+    // Check rendered map features near the point: only snap if the user clicked on a sidewalk/footway
+    // and NOT on a bike path or drivable road.
+    if (typeof map !== 'undefined' && map && typeof map.project === 'function' && typeof map.queryRenderedFeatures === 'function') {
+        try {
+            const pt = map.project([lng, lat]);
+            const pad = 10;
+            const features = map.queryRenderedFeatures([
+                [pt.x - pad, pt.y - pad],
+                [pt.x + pad, pt.y + pad]
+            ]);
+            let hasSidewalkOrFootway = false;
+            let hasCycleway = false;
+
+            for (const f of features) {
+                const p = f.properties || {};
+                const sub = p.subclass || '';
+                const hwy = p.highway || '';
+                if (sub === 'cycleway' || hwy === 'cycleway' || p.bicycle === 'designated') {
+                    hasCycleway = true;
+                }
+                if (sub === 'footway' || sub === 'pedestrian' || hwy === 'footway' || hwy === 'pedestrian' || p.footway === 'sidewalk') {
+                    hasSidewalkOrFootway = true;
+                }
+            }
+
+            if (hasCycleway) {
+                return [lng, lat];
+            }
+        } catch (_) {
+            // Fall through to OSRM snap if queryRenderedFeatures fails
+        }
+    }
+
     const endpoints = [
-        `https://router.project-osrm.org/nearest/v1/cycling/${lng},${lat}`,
-        `https://routing.openstreetmap.de/routed-bike/nearest/v1/bicycle/${lng},${lat}`
+        `https://router.project-osrm.org/nearest/v1/driving/${lng},${lat}`,
+        `https://routing.openstreetmap.de/routed-car/nearest/v1/driving/${lng},${lat}`
     ];
     for (const url of endpoints) {
         try {
@@ -476,8 +510,8 @@ async function snapToNearestRoad(lngLat) {
             const data = await resp.json();
             if (data.code === 'Ok' && data.waypoints && data.waypoints[0]?.location) {
                 const loc = data.waypoints[0].location;
-                // Only snap if within 250 meters of a road to avoid jumps
-                if ((data.waypoints[0].distance || 0) <= 250) {
+                // Only snap if within 35 meters of a road/bikeway to avoid pulling off dedicated bike paths
+                if ((data.waypoints[0].distance || 0) <= 35) {
                     return [loc[0], loc[1]];
                 }
             }
@@ -2785,7 +2819,7 @@ function createMarker(lngLat, index, initialMode) {
         const idx = markers.indexOf(marker);
         if (idx > -1) {
             const ll = marker.getLngLat();
-            const prevWp = waypoints[idx];
+            const prevWp = waypoints[idx] ? [...waypoints[idx]] : (origLngLat ? [origLngLat.lng, origLngLat.lat] : null);
             waypoints[idx] = [ll.lng, ll.lat];
 
             checkLongSegmentWarning(idx).then((approved) => {
@@ -2799,7 +2833,10 @@ function createMarker(lngLat, index, initialMode) {
                     }
                     return;
                 }
+                // Temporarily restore pre-drag coordinate so saveHistory() records the state BEFORE the move
+                if (prevWp) waypoints[idx] = prevWp;
                 saveHistory();
+                waypoints[idx] = [ll.lng, ll.lat];
                 invalidateGPXSegment(idx);
                 updateRoute();
             });
@@ -3086,9 +3123,10 @@ function onLineDown(e) {
                         newMarker.remove();
                         refreshMarkerIcons();
                     }
+                    undoStack.pop();
+                    updateUndoRedoBtns();
                     return;
                 }
-                saveHistory();
                 updateRoute();
             });
         }
@@ -3159,6 +3197,7 @@ map.on('click', (e) => {
         return;
     }
 
+    saveHistory();
     const newMarker = createMarker(e.lngLat);
     const newIdx = waypoints.length - 1;
     checkLongSegmentWarning(newIdx).then((approved) => {
@@ -3177,9 +3216,10 @@ map.on('click', (e) => {
                 newMarker.remove();
                 refreshMarkerIcons();
             }
+            undoStack.pop();
+            updateUndoRedoBtns();
             return;
         }
-        saveHistory();
         updateRoute();
     });
 });
@@ -3591,15 +3631,27 @@ async function fetchOneSegment(from, to, mode, avoidUnpaved, excludeParam, signa
     const ferryVal = allowFerries ? '1' : '0';
 
     try {
+        // In bike mode, snap endpoints to the nearest cyclable road so waypoints placed on
+        // adjacent sidewalks/footpaths route along the road rather than onto the sidewalk.
+        let routeFrom = from;
+        let routeTo = to;
+        if (mode === 'bike') {
+            [routeFrom, routeTo] = await Promise.all([
+                snapToNearestRoad(from),
+                snapToNearestRoad(to)
+            ]);
+            if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        }
+
         const bProfile = (mode === 'hike') ? 'trekking' : 'fastbike-lowtraffic';
-        let bRouterUrl = `https://brouter.de/brouter?lonlats=${from[0]},${from[1]}|${to[0]},${to[1]}&profile=${bProfile}&alternativeidx=0&format=geojson&profile:allow_ferries=${ferryVal}&turnInstructionMode=1`;
+        let bRouterUrl = `https://brouter.de/brouter?lonlats=${routeFrom[0]},${routeFrom[1]}|${routeTo[0]},${routeTo[1]}&profile=${bProfile}&alternativeidx=0&format=geojson&profile:allow_ferries=${ferryVal}&turnInstructionMode=1`;
         if (avoidUnpaved) {
             bRouterUrl += `&profile:avoid_unpaved=1&profile:avoid_gravel=1`;
         }
         const endpoints = [
             bRouterUrl,
-            `https://routing.openstreetmap.de/routed-bike/route/v1/bicycle/${from[0]},${from[1]};${to[0]},${to[1]}?overview=full&geometries=geojson`,
-            `https://router.project-osrm.org/route/v1/cycling/${from[0]},${from[1]};${to[0]},${to[1]}?overview=full&geometries=geojson`
+            `https://routing.openstreetmap.de/routed-bike/route/v1/bicycle/${routeFrom[0]},${routeFrom[1]};${routeTo[0]},${routeTo[1]}?overview=full&geometries=geojson`,
+            `https://router.project-osrm.org/route/v1/cycling/${routeFrom[0]},${routeFrom[1]};${routeTo[0]},${routeTo[1]}?overview=full&geometries=geojson`
         ];
         for (const url of endpoints) {
             if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -5222,6 +5274,8 @@ async function importRouteFile(file) {
     try {
         const result = await parseRouteData(file);
 
+        saveHistory();
+
         // Clear current route
         waypoints = [];
         markers.forEach(m => m.remove());
@@ -5570,8 +5624,26 @@ function refreshMarkerPositions() {
     }
 }
 
+function sync3DTerrainFromPitch() {
+    if (!map.getSource('terrain-source')) return;
+    const exInput = document.getElementById('terrain-exaggeration');
+    let exVal = parseFloat(exInput ? exInput.value : 2.0);
+    if (isNaN(exVal)) exVal = 2.0;
+
+    const shouldEnable = map.getPitch() > 5;
+    const hasTerrain = Boolean(map.getTerrain());
+    if (shouldEnable && !hasTerrain) {
+        map.setTerrain({ source: 'terrain-source', exaggeration: exVal });
+        refreshMarkerPositions();
+    } else if (!shouldEnable && hasTerrain) {
+        map.setTerrain(null);
+        refreshMarkerPositions();
+    }
+}
+
 function applyTerrain() {
-    const val = document.getElementById('hillshade-select')?.value || 'off';
+    const isChecked = document.getElementById('hillshade-check')?.checked ?? false;
+    const val = isChecked ? 'hillshade' : 'off';
     const exInput = document.getElementById('terrain-exaggeration');
 
     localStorage.setItem('route_hillshade', val);
@@ -5584,16 +5656,15 @@ function applyTerrain() {
 
     if (val === 'off') {
         map.setLayoutProperty('hillshade-layer', 'visibility', 'none');
-        if (map.getTerrain()) map.setTerrain(null);
-    } else if (val === 'hillshade') {
+    } else {
         map.setLayoutProperty('hillshade-layer', 'visibility', 'visible');
         map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', 0.5);
-        if (map.getTerrain()) map.setTerrain(null);
-    } else if (val === 'terrain') {
-        // Keep hillshade visible along with 3D terrain using separate sources to prevent warnings
-        map.setLayoutProperty('hillshade-layer', 'visibility', 'visible');
-        map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', 0.5);
+    }
+
+    if (map.getPitch() > 5) {
         map.setTerrain({ source: 'terrain-source', exaggeration: exVal });
+    } else if (map.getTerrain()) {
+        map.setTerrain(null);
     }
 
     rebuildMapGradient();
@@ -5642,13 +5713,15 @@ document.getElementById('mode-transit')?.addEventListener('click', () => {
     else setRoutingMode('transit');
 });
 
-document.getElementById('hillshade-select')?.addEventListener('change', applyTerrain);
+document.getElementById('hillshade-check')?.addEventListener('change', applyTerrain);
 const terrainExEl = document.getElementById('terrain-exaggeration');
 if (terrainExEl) {
     terrainExEl.addEventListener('input', applyTerrain);
     terrainExEl.addEventListener('change', applyTerrain);
 }
 map.on('terrain', refreshMarkerPositions);
+map.on('pitch', sync3DTerrainFromPitch);
+map.on('pitchend', sync3DTerrainFromPitch);
 
 function updateStatsToggleBtn() {
     const panel = document.getElementById('stats-panel');
@@ -6080,11 +6153,8 @@ function loadStoredSettings() {
     // Terrain/hillshade UI values (applyTerrain reads them)
     const hillshade = localStorage.getItem('route_hillshade');
     if (hillshade !== null) {
-        let val = hillshade;
-        if (val === 'true') val = 'hillshade';
-        else if (val === 'false') val = 'off';
-        const el = document.getElementById('hillshade-select');
-        if (el) el.value = val;
+        const el = document.getElementById('hillshade-check');
+        if (el) el.checked = (hillshade === 'true' || hillshade === 'hillshade' || hillshade === 'terrain');
     }
     const exaggeration = localStorage.getItem('route_exaggeration');
     if (exaggeration !== null) {
@@ -7657,6 +7727,7 @@ function requestLocation(fly = false) {
 
     if (!("geolocation" in navigator)) {
         console.warn("Geolocation not supported by this browser.");
+        fallbackToApproximateLocation(fly);
         return;
     }
 
@@ -7688,9 +7759,68 @@ function requestLocation(fly = false) {
         },
         (err) => {
             console.warn("Geolocation failed or denied:", err);
+            fallbackToApproximateLocation(fly);
         },
         { timeout: 5000, enableHighAccuracy: true, maximumAge: 10000 }
     );
+}
+
+async function fallbackToApproximateLocation(fly = false) {
+    // Don't override if user already has a route or zoomed in manually
+    if (waypoints.length > 0 || map.getZoom() > 4) return;
+
+    const applyApproxCenter = (lng, lat, zoom) => {
+        if (!Number.isFinite(lng) || !Number.isFinite(lat)) return;
+        if (waypoints.length > 0 || map.getZoom() > 4) return;
+        if (fly) {
+            map.flyTo({ center: [lng, lat], zoom, speed: 2.2, curve: 1.4 });
+        } else {
+            map.jumpTo({ center: [lng, lat], zoom });
+        }
+    };
+
+    const fetchWithTimeout = async (url, ms = 3000) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), ms);
+        try {
+            const res = await fetch(url, { signal: controller.signal });
+            if (!res.ok) return null;
+            return await res.json();
+        } catch (e) {
+            return null;
+        } finally {
+            clearTimeout(timer);
+        }
+    };
+
+    // 1. Try IP geolocation (geojs.io, ipapi.co, then ipwho.is)
+    const geoJsData = await fetchWithTimeout('https://get.geojs.io/v1/ip/geo.json');
+    if (geoJsData && Number.isFinite(Number(geoJsData.latitude)) && Number.isFinite(Number(geoJsData.longitude))) {
+        applyApproxCenter(Number(geoJsData.longitude), Number(geoJsData.latitude), 10);
+        return;
+    }
+
+    const ipData = await fetchWithTimeout('https://ipapi.co/json/');
+    if (ipData && Number.isFinite(Number(ipData.latitude)) && Number.isFinite(Number(ipData.longitude))) {
+        applyApproxCenter(Number(ipData.longitude), Number(ipData.latitude), 10);
+        return;
+    }
+
+    const ipWhoData = await fetchWithTimeout('https://ipwho.is/');
+    if (ipWhoData && ipWhoData.success !== false && Number.isFinite(Number(ipWhoData.latitude)) && Number.isFinite(Number(ipWhoData.longitude))) {
+        applyApproxCenter(Number(ipWhoData.longitude), Number(ipWhoData.latitude), 10);
+        return;
+    }
+
+    // 2. Offline fallback: estimate longitude from timezone offset
+    const offsetHours = -new Date().getTimezoneOffset() / 60;
+    const approxLng = Math.max(-180, Math.min(180, offsetHours * 15));
+    const approxLat = 38;
+    applyApproxCenter(approxLng, approxLat, 5);
+}
+
+if (!localStorage.getItem('cachedMapZoom')) {
+    fallbackToApproximateLocation(false);
 }
 
 
@@ -8342,6 +8472,7 @@ setTimeout(syncTopBarHeight, 500);
 function getCoordinateAtDistance(meters) {
     if (!currentRouteGeoJSON || !routePathDistances || routePathDistances.length === 0) return null;
     const coords = currentRouteGeoJSON.coordinates;
+    if (!coords || coords.length === 0) return null;
     if (meters <= 0) return coords[0];
     if (meters >= routeTotalDist) return coords[coords.length - 1];
 
@@ -8362,6 +8493,7 @@ function getCoordinateAtDistance(meters) {
     const d1 = routePathDistances[idx];
     const p0 = coords[idx - 1];
     const p1 = coords[idx];
+    if (!p0 || !p1) return coords[0];
 
     const ratio = (d1 > d0) ? (meters - d0) / (d1 - d0) : 0;
     const lng = p0[0] + ratio * (p1[0] - p0[0]);
