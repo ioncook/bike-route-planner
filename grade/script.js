@@ -57,7 +57,10 @@ const map = new maplibregl.Map({
     fadeDuration: 0,
     trackResize: true,
     clickTolerance: 8,
-    aroundCenter: false
+    aroundCenter: false,
+    transformRequest: (url, resourceType) => {
+        // No custom headers to avoid CORS preflight failures on tile servers
+    }
 });
 
 map.dragRotate.enable();
@@ -113,12 +116,18 @@ elevationWorker.onmessage = (e) => {
     const cb = _workerCallbacks.get(e.data.id);
     if (cb) {
         _workerCallbacks.delete(e.data.id);
-        if (e.data.type === 'process-grade-ways') {
+        if (e.data.type === 'build-grade-tile') {
+            cb({ buffer: e.data.buffer, error: e.data.error });
+        } else if (e.data.type === 'process-grade-ways') {
             cb(e.data.processedWays);
         } else {
             cb(e.data.elevations);
         }
     }
+};
+
+elevationWorker.onerror = (err) => {
+    console.error('Elevation Worker Error in Grade Map:', err);
 };
 
 function getHighResElevation(coords) {
@@ -137,15 +146,91 @@ function getProcessedSegmentsFromWorker(ways) {
     });
 }
 
+function buildGradeTileInWorker(z, x, y) {
+    return new Promise(resolve => {
+        const id = _nextWorkerId++;
+        _workerCallbacks.set(id, resolve);
+        elevationWorker.postMessage({ type: 'build-grade-tile', id, z, x, y });
+    });
+}
 
-
-// Cache for processed ways: wayId -> Array of Segment objects
-const wayCache = new Map();
-const deduplicatedFeatures = [];
-const seenSegmentKeys = new Set();
-let isFetching = false;
-let needsRefetch = false;
 let isMapMoving = false;
+let _activeGradeTiles = 0;
+
+function setGradeLoadingState(delta) {
+    _activeGradeTiles = Math.max(0, _activeGradeTiles + delta);
+    const loadingEl = document.getElementById('loading-indicator');
+    const favMobile = document.getElementById('favicon-mobile');
+    if (_activeGradeTiles > 0) {
+        if (loadingEl) loadingEl.style.display = 'flex';
+        if (favMobile) favMobile.classList.add('loading');
+    } else {
+        if (loadingEl) loadingEl.style.display = 'none';
+        if (favMobile) favMobile.classList.remove('loading');
+    }
+}
+
+const GRADE_MVT_CACHE_NAME = 'grade-mvt-v1';
+const GRADE_MVT_MAX_TILES = 250;
+
+async function readGradeTileCache(cacheKeyUrl) {
+    if (typeof caches === 'undefined') return null;
+    try {
+        const cache = await caches.open(GRADE_MVT_CACHE_NAME);
+        const match = await cache.match(cacheKeyUrl);
+        if (!match) return null;
+        return await match.arrayBuffer();
+    } catch (_) {
+        return null;
+    }
+}
+
+async function writeGradeTileCache(cacheKeyUrl, buffer) {
+    if (typeof caches === 'undefined' || !buffer || buffer.byteLength === 0) return;
+    try {
+        const cache = await caches.open(GRADE_MVT_CACHE_NAME);
+        const keys = await cache.keys();
+        if (keys.length >= GRADE_MVT_MAX_TILES) {
+            const overflow = keys.length - GRADE_MVT_MAX_TILES + 1;
+            for (let i = 0; i < overflow; i++) {
+                await cache.delete(keys[i]);
+            }
+        }
+        await cache.put(cacheKeyUrl, new Response(buffer.slice(0), {
+            headers: { 'Content-Type': 'application/x-protobuf' }
+        }));
+    } catch (_) { }
+}
+
+maplibregl.addProtocol('grade', async (params, abortController) => {
+    const match = params.url.match(/grade:\/\/(\d+)\/(\d+)\/(\d+)/);
+    if (!match) return { data: new ArrayBuffer(0) };
+    const z = parseInt(match[1], 10);
+    const x = parseInt(match[2], 10);
+    const y = parseInt(match[3], 10);
+    const cacheKeyUrl = `https://grade-cache.local/${z}/${x}/${y}.pbf`;
+
+    const cachedBuffer = await readGradeTileCache(cacheKeyUrl);
+    if (cachedBuffer) {
+        return { data: cachedBuffer };
+    }
+    if (abortController.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+
+    setGradeLoadingState(1);
+    try {
+        const result = await buildGradeTileInWorker(z, x, y);
+        if (abortController.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        if (!result || result.error || !result.buffer) {
+            return { data: new ArrayBuffer(0) };
+        }
+        if (result.buffer.byteLength > 0) {
+            writeGradeTileCache(cacheKeyUrl, result.buffer);
+        }
+        return { data: result.buffer };
+    } finally {
+        setGradeLoadingState(-1);
+    }
+});
 
 // Sticky/locked popup state
 let stickySegmentId = null;
@@ -269,28 +354,29 @@ function buildSpatialNameIndex(nameFeatures) {
     return entries;
 }
 
-// Match a road's geometry against in-memory street name lines using spatial distance & directional alignment
+// Match a road's geometry against in-memory street name lines using midpoint distance & local directional alignment
 function matchStreetNameInMemory(roadCoords, nameEntries) {
     if (!roadCoords || roadCoords.length < 2 || !nameEntries || nameEntries.length === 0) return '';
-    const mid = getSegmentMidpoint(roadCoords);
+
+    const midIdx = Math.floor((roadCoords.length - 1) * 0.5);
+    const mid = roadCoords[midIdx];
     if (!mid) return '';
     const midLon = mid[0], midLat = mid[1];
 
-    // Search bounding box padding in degrees (~45 meters)
-    const pad = 0.00045;
-
-    // Road orientation vector (scaled by latitude factor ~1.27)
-    const p1 = roadCoords[0];
-    const p2 = roadCoords[roadCoords.length - 1];
-    const rdx = p2[0] - p1[0];
-    const rdy = (p2[1] - p1[1]) * 1.27;
+    // Local tangent at midpoint (handles curved roads accurately)
+    const tA = roadCoords[Math.max(0, midIdx - 1)];
+    const tB = roadCoords[Math.min(roadCoords.length - 1, midIdx + 1)];
+    const rdx = tB[0] - tA[0];
+    const rdy = (tB[1] - tA[1]) * 1.27;
     const rlen = Math.hypot(rdx, rdy);
+
+    // Search bounding box padding in degrees (~65 meters)
+    const pad = 0.00065;
 
     let bestScore = Infinity;
     let bestName = '';
 
     for (const entry of nameEntries) {
-        // Fast bounding box reject
         if (midLon < entry.minLon - pad || midLon > entry.maxLon + pad ||
             midLat < entry.minLat - pad || midLat > entry.maxLat + pad) {
             continue;
@@ -300,7 +386,6 @@ function matchStreetNameInMemory(roadCoords, nameEntries) {
         for (let i = 0; i < coords.length - 1; i++) {
             const a = coords[i];
             const b = coords[i + 1];
-
             const cdx = b[0] - a[0];
             const cdy = (b[1] - a[1]) * 1.27;
             const clen = Math.hypot(cdx, cdy);
@@ -308,29 +393,24 @@ function matchStreetNameInMemory(roadCoords, nameEntries) {
 
             let distMeters;
             if (l2 === 0) {
-                const ex = (midLon - a[0]) * 85000;
-                const ey = (midLat - a[1]) * 111000;
-                distMeters = Math.hypot(ex, ey);
+                distMeters = Math.hypot((midLon - a[0]) * 85000, (midLat - a[1]) * 111000);
             } else {
                 let t = ((midLon - a[0]) * cdx + (midLat - a[1]) * 1.27 * cdy) / l2;
                 t = Math.max(0, Math.min(1, t));
                 const projLon = a[0] + t * (b[0] - a[0]);
                 const projLat = a[1] + t * (b[1] - a[1]);
-                const ex = (midLon - projLon) * 85000;
-                const ey = (midLat - projLat) * 111000;
-                distMeters = Math.hypot(ex, ey);
+                distMeters = Math.hypot((midLon - projLon) * 85000, (midLat - projLat) * 111000);
             }
 
-            if (distMeters > 35) continue; // Further than 35 meters
+            if (distMeters > 40) continue;
 
-            // Directional alignment penalty
             let alignmentPenalty = 0;
-            if (rlen > 0.00003 && clen > 0.00003) {
+            if (rlen > 0.00002 && clen > 0.00002) {
                 const cosTheta = Math.abs(rdx * cdx + rdy * cdy) / (rlen * clen);
                 if (cosTheta < 0.35) {
-                    alignmentPenalty = 18; // Perpendicular cross-street
+                    alignmentPenalty = 14;
                 } else if (cosTheta > 0.75) {
-                    alignmentPenalty = -4; // Parallel alignment bonus
+                    alignmentPenalty = -5;
                 }
             }
 
@@ -342,14 +422,17 @@ function matchStreetNameInMemory(roadCoords, nameEntries) {
         }
     }
 
-    return (bestScore < 28) ? bestName : '';
+    return (bestScore < 34) ? bestName : '';
 }
 
 // Fallback street name finder for hover/click tooltips
 function findStreetName(cursorPoint, segmentCoordinates, zoom) {
     if (!segmentCoordinates || segmentCoordinates.length < 2) return '';
     try {
-        const nameFeatures = map.queryRenderedFeatures(null, { layers: ['carto-names-hidden'] }) || [];
+        const bbox = cursorPoint
+            ? [[cursorPoint.x - 80, cursorPoint.y - 80], [cursorPoint.x + 80, cursorPoint.y + 80]]
+            : null;
+        const nameFeatures = map.queryRenderedFeatures(bbox, { layers: ['carto-names-hidden'] }) || [];
         const index = buildSpatialNameIndex(nameFeatures);
         return matchStreetNameInMemory(segmentCoordinates, index);
     } catch (_) {
@@ -399,57 +482,12 @@ function setupGradeLayers() {
         });
     }
 
-    if (!map.getSource('carto-streets')) {
-        map.addSource('carto-streets', {
-            type: 'vector',
-            tiles: ['https://tiles.basemaps.cartocdn.com/vectortiles/carto.streets/v1/{z}/{x}/{y}.mvt'],
-            maxzoom: 14
-        });
-    }
-
-    if (!map.getLayer('carto-roads-hidden')) {
-        map.addLayer({
-            id: 'carto-roads-hidden',
-            type: 'line',
-            source: 'carto-streets',
-            'source-layer': 'transportation',
-            paint: {
-                'line-opacity': 0
-            },
-            filter: [
-                'all',
-                // Exclude rail/transit, ferry, aerialway, and raceway
-                ['!in', 'class', 'rail', 'transit', 'subway', 'ferry', 'aerialway', 'raceway'],
-                // Exclude pedestrian-only or foot-only ways and construction, but ALLOW cycleways/bike paths
-                [
-                    'any',
-                    // Allow all standard rideable road classes
-                    ['in', 'class', 'motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'minor', 'residential', 'living_street', 'unclassified'],
-                    // Allow designated cycleways or paths with bicycle access
-                    ['==', 'subclass', 'cycleway'],
-                    ['in', 'bicycle', 'yes', 'designated', 'permissive']
-                ]
-            ]
-        });
-    }
-
-    if (!map.getLayer('carto-names-hidden')) {
-        map.addLayer({
-            id: 'carto-names-hidden',
-            type: 'line',
-            source: 'carto-streets',
-            'source-layer': 'transportation_name',
-            paint: {
-                'line-opacity': 0.01,
-                'line-width': 12
-            }
-        });
-    }
-
     if (!map.getSource('grade-roads')) {
         map.addSource('grade-roads', {
-            type: 'geojson',
-            data: { type: 'FeatureCollection', features: [] }
+            type: 'vector',
+            tiles: ['grade://{z}/{x}/{y}'],
+            minzoom: 11,
+            maxzoom: 14
         });
     }
 
@@ -461,6 +499,8 @@ function setupGradeLayers() {
             id: 'grade-roads-layer',
             type: 'line',
             source: 'grade-roads',
+            'source-layer': 'grade-roads',
+            minzoom: 11.5,
             paint: {
                 'line-width': [
                     'interpolate', ['linear'], ['zoom'],
@@ -496,6 +536,8 @@ function setupGradeLayers() {
             id: 'grade-roads-hover-sensor',
             type: 'line',
             source: 'grade-roads',
+            'source-layer': 'grade-roads',
+            minzoom: 11.5,
             paint: {
                 'line-width': 18, // Wide invisible hover target
                 'line-color': 'rgba(0,0,0,0)',
@@ -545,13 +587,38 @@ function setupGradeLayers() {
                             feature.properties.name = streetName;
                         }
                     }
-                    const nameHtml = streetName ? `<div style="font-size:0.7rem;color:var(--text-muted);margin-bottom:3px;font-weight:normal;text-transform:capitalize;">${streetName}</div>` : '';
+                    const hoverNameId = `grade-hover-street-name-${hoveredSegmentId}`;
+                    const nameHtml = `<div id="${hoverNameId}" style="font-size:0.7rem;color:var(--text-muted);margin-bottom:3px;font-weight:normal;text-transform:capitalize;${streetName ? '' : 'display:none;'}">${streetName}</div>`;
                     hoverPopup.setLngLat(midpoint)
                         .setHTML(`<div style="font-family:'Inter',sans-serif;font-size:0.82rem;font-weight:600;background:var(--bg-panel);padding:4px 6px;">
                             ${nameHtml}
                             <div>Grade: <span style="color:${getGradeColor(gradePercent)};font-weight:700;">${formatted}</span></div>
                         </div>`)
                         .addTo(map);
+
+                    if (!streetName) {
+                        const segIdSnapshot = hoveredSegmentId;
+                        const lat = midpoint[1];
+                        const lng = midpoint[0];
+                        clearTimeout(window._gradeHoverRevTimer);
+                        window._gradeHoverRevTimer = setTimeout(() => {
+                            if (hoveredSegmentId !== segIdSnapshot && stickySegmentId !== segIdSnapshot) return;
+                            fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&zoom=17`)
+                                .then(r => r.ok ? r.json() : null)
+                                .then(data => {
+                                    const roadName = data?.address?.road || data?.address?.pedestrian || data?.address?.cycleway || data?.address?.path || '';
+                                    if (roadName) {
+                                        feature.properties.name = roadName;
+                                        const el = document.getElementById(hoverNameId);
+                                        if (el && (hoveredSegmentId === segIdSnapshot || stickySegmentId === segIdSnapshot)) {
+                                            el.textContent = roadName;
+                                            el.style.display = 'block';
+                                        }
+                                    }
+                                })
+                                .catch(() => {});
+                        }, 180);
+                    }
 
                     const el = hoverPopup.getElement();
                     if (el) el.classList.remove('locked');
@@ -589,7 +656,21 @@ function setupGradeLayers() {
                     if (midpoint) {
                         const lat = midpoint[1];
                         const lng = midpoint[0];
-                        const svUrl = `https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${lat},${lng}`;
+                        let heading = 0;
+                        if (geom.coordinates && geom.coordinates.length >= 2) {
+                            const a = geom.coordinates[0];
+                            const b = geom.coordinates[geom.coordinates.length - 1];
+                            const dLng = (b[0] - a[0]) * Math.PI / 180;
+                            const lat1 = a[1] * Math.PI / 180;
+                            const lat2 = b[1] * Math.PI / 180;
+                            const y = Math.sin(dLng) * Math.cos(lat2);
+                            const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+                            const computedHeading = ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
+                            if (Number.isFinite(computedHeading)) {
+                                heading = Math.round(computedHeading);
+                            }
+                        }
+                        const svUrl = `https://www.google.com/maps?layer=c&cbll=${lat},${lng}&cbp=12,${heading},0,0,0`;
                         
                         let streetName = feature.properties.name || '';
                         if (!streetName) {
@@ -598,7 +679,8 @@ function setupGradeLayers() {
                                 feature.properties.name = streetName;
                             }
                         }
-                        const nameHtml = streetName ? `<div style="font-size:0.7rem;color:var(--text-muted);margin-bottom:3px;font-weight:normal;text-transform:capitalize;">${streetName}</div>` : '';
+                        const nameElId = `grade-street-name-${Date.now()}`;
+                        const nameHtml = `<div id="${nameElId}" style="font-size:0.7rem;color:var(--text-muted);margin-bottom:3px;font-weight:normal;text-transform:capitalize;${streetName ? '' : 'display:none;'}">${streetName}</div>`;
 
                         hoverPopup.setLngLat(midpoint)
                             .setHTML(`<div style="font-family:'Inter',sans-serif;font-size:0.82rem;font-weight:600;background:var(--bg-panel);padding:6px 8px;border-bottom:2px solid ${getGradeColor(gradePercent)};">
@@ -623,6 +705,23 @@ function setupGradeLayers() {
                             </div>`)
                             .addTo(map);
 
+                        if (!streetName) {
+                            fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&zoom=17`)
+                                .then(r => r.ok ? r.json() : null)
+                                .then(data => {
+                                    const roadName = data?.address?.road || data?.address?.pedestrian || data?.address?.cycleway || data?.address?.path || '';
+                                    if (roadName) {
+                                        feature.properties.name = roadName;
+                                        const el = document.getElementById(nameElId);
+                                        if (el) {
+                                            el.textContent = roadName;
+                                            el.style.display = 'block';
+                                        }
+                                    }
+                                })
+                                .catch(() => {});
+                        }
+
                         const el = hoverPopup.getElement();
                         if (el) el.classList.add('locked');
                     }
@@ -645,6 +744,7 @@ function setupGradeLayers() {
             id: 'grade-roads-arrows',
             type: 'symbol',
             source: 'grade-roads',
+            'source-layer': 'grade-roads',
             minzoom: 16,
             layout: {
                 'symbol-placement': 'line',
@@ -672,257 +772,21 @@ function setupGradeLayers() {
     }
 }
 
-map.on('style.load', () => {
-    setupGradeLayers();
-    applyTerrain();
-    updateMapData();
-    fetchAndProcessViewport();
-});
-
-// Update the map line layer with cached features
-function updateMapData() {
-    if (!map.getSource('grade-roads')) return;
-
-    map.getSource('grade-roads').setData({
-        type: 'FeatureCollection',
-        features: deduplicatedFeatures
-    });
-}
-
-// Spatial tile tracking to prevent re-fetching or re-processing already loaded areas
-const loadedTiles = new Set();
-
-function lngToTileX(lng, z) {
-    return Math.floor((lng + 180) / 360 * Math.pow(2, z));
-}
-
-function latToTileY(lat, z) {
-    const rad = lat * Math.PI / 180;
-    return Math.floor((1 - Math.log(Math.tan(rad) + 1 / Math.cos(rad)) / Math.PI) / 2 * Math.pow(2, z));
-}
-
-function getTileKeysForBounds(bounds, z) {
-    const minX = lngToTileX(bounds.getWest(), z);
-    const maxX = lngToTileX(bounds.getEast(), z);
-    const minY = latToTileY(bounds.getNorth(), z);
-    const maxY = latToTileY(bounds.getSouth(), z);
-    const keys = [];
-    for (let x = Math.min(minX, maxX); x <= Math.max(minX, maxX); x++) {
-        for (let y = Math.min(minY, maxY); y <= Math.max(minY, maxY); y++) {
-            keys.push(`${z}/${x}/${y}`);
-        }
-    }
-    return keys;
-}
-
-// Fetch ways and process grades
-async function fetchAndProcessViewport() {
-    if (isFetching) {
-        needsRefetch = true;
-        return;
-    }
-
-    const zoom = map.getZoom();
+function updateZoomWarning() {
     const warning = document.getElementById('zoom-warning');
-    const loading = document.getElementById('loading-indicator');
-
-    // Ensure the vector street data source is loaded before we attempt queries
-    if (!map.getSource('carto-streets') || !map.isSourceLoaded('carto-streets')) {
-        return;
-    }
-
-    // Do not load anything if map tilt/pitch is greater than 30 degrees
-    if (map.getPitch() > 30) {
-        isFetching = false;
-        loading.style.display = 'none';
-        return;
-    }
-
-    // Allow loading road grade details further out (zoom 11.5+)
-    if (zoom < 11.5) {
+    if (!warning) return;
+    if (map.getZoom() < 11.5) {
         warning.classList.remove('hidden');
-        loading.style.display = 'none';
-        isFetching = false;
-        return;
     } else {
         warning.classList.add('hidden');
     }
-
-    // Fast check: if all tiles in the current viewport bounds are already loaded, exit immediately!
-    const tileZoom = Math.min(14, Math.floor(zoom));
-    const bounds = map.getBounds();
-    const viewportTileKeys = getTileKeysForBounds(bounds, tileZoom);
-
-    let allTilesLoaded = true;
-    for (const key of viewportTileKeys) {
-        if (!loadedTiles.has(key)) {
-            allTilesLoaded = false;
-            break;
-        }
-    }
-
-    if (allTilesLoaded) {
-        // Area is already completely loaded - exit instantly with zero DOM/GPU work
-        isFetching = false;
-        return;
-    }
-
-    isFetching = true;
-
-    try {
-        let features = [];
-        try {
-            features = map.queryRenderedFeatures(null, { layers: ['carto-roads-hidden'] }) || [];
-        } catch (e) {
-            return;
-        }
-
-        // Deduplicate rendered features from Carto vector tiles
-        const uniqueRoads = new Map();
-
-        for (const f of features) {
-            const props = f.properties || {};
-            // Safety guard: reject any rail, subway, transit, or train features
-            if (props.class === 'rail' || props.class === 'transit' || props.subclass === 'subway' || props.subclass === 'rail' || props.subclass === 'tram') {
-                continue;
-            }
-            if (f.geometry.type === 'LineString') {
-                const coords = f.geometry.coordinates;
-                if (!coords || coords.length < 2) continue;
-
-                const key = `${coords[0][0].toFixed(5)},${coords[0][1].toFixed(5)}_${coords[coords.length - 1][0].toFixed(5)},${coords[coords.length - 1][1].toFixed(5)}`;
-                if (!uniqueRoads.has(key)) {
-                    uniqueRoads.set(key, { coords, id: f.id });
-                }
-            } else if (f.geometry.type === 'MultiLineString') {
-                const parts = f.geometry.coordinates;
-                for (let pIdx = 0; pIdx < parts.length; pIdx++) {
-                    const coords = parts[pIdx];
-                    if (!coords || coords.length < 2) continue;
-
-                    const key = `${coords[0][0].toFixed(5)},${coords[0][1].toFixed(5)}_${coords[coords.length - 1][0].toFixed(5)},${coords[coords.length - 1][1].toFixed(5)}`;
-                    if (!uniqueRoads.has(key)) {
-                        const wayId = f.id ? `${f.id}_p${pIdx}` : `${key}_p${pIdx}`;
-                        uniqueRoads.set(key, { coords, id: wayId });
-                    }
-                }
-            }
-        }
-
-        // Identify new ways to process
-        const waysToResolve = [];
-        for (const [key, road] of uniqueRoads.entries()) {
-            const cacheKey = road.id || key;
-            if (!wayCache.has(cacheKey)) {
-                waysToResolve.push({
-                    cacheKey,
-                    coords: road.coords
-                });
-            }
-        }
-
-        // If all roads in this view are already in cache, mark tiles as loaded and exit cleanly
-        if (waysToResolve.length === 0) {
-            for (const key of viewportTileKeys) {
-                loadedTiles.add(key);
-            }
-            return;
-        }
-
-        // Only display spinner when we actually need to resolve new roads
-        loading.style.display = 'flex';
-
-        // Query rendered street name features ONCE for the whole viewport to avoid main-thread freeze
-        let nameEntries = [];
-        try {
-            const nameFeatures = map.queryRenderedFeatures(null, { layers: ['carto-names-hidden'] }) || [];
-            nameEntries = buildSpatialNameIndex(nameFeatures);
-        } catch (_) { }
-
-        const workerWays = [];
-        const roadNameMap = new Map();
-        for (const item of waysToResolve) {
-            const stName = matchStreetNameInMemory(item.coords, nameEntries);
-            roadNameMap.set(item.cacheKey, stName);
-            workerWays.push({
-                wayId: item.cacheKey,
-                geomCoords: item.coords
-            });
-        }
-
-        let newFeaturesAdded = 0;
-        const processedWays = await getProcessedSegmentsFromWorker(workerWays);
-        for (const item of processedWays) {
-            const stName = roadNameMap.get(item.wayId) || '';
-            wayCache.set(item.wayId, item.segments);
-
-            for (const seg of item.segments) {
-                const coords = seg.coordinates;
-                if (!coords || coords.length < 2) continue;
-
-                // Deduplicate segments by rounded start/end endpoints (approx 11m precision)
-                const p1 = coords[0];
-                const p2 = coords[coords.length - 1];
-                const lon1 = Math.min(p1[0], p2[0]).toFixed(4);
-                const lat1 = Math.min(p1[1], p2[1]).toFixed(4);
-                const lon2 = Math.max(p1[0], p2[0]).toFixed(4);
-                const lat2 = Math.max(p1[1], p2[1]).toFixed(4);
-                const key = `${lon1},${lat1}_${lon2},${lat2}`;
-
-                if (seenSegmentKeys.has(key)) continue;
-                seenSegmentKeys.add(key);
-
-                deduplicatedFeatures.push({
-                    type: 'Feature',
-                    id: seg.id,
-                    geometry: {
-                        type: 'LineString',
-                        coordinates: coords
-                    },
-                    properties: {
-                        id: seg.id,
-                        grade: seg.grade,
-                        gradePercent: seg.gradePercent,
-                        name: stName
-                    }
-                });
-                newFeaturesAdded++;
-            }
-        }
-
-        // Mark tiles as loaded now that all their roads are processed
-        for (const key of viewportTileKeys) {
-            loadedTiles.add(key);
-        }
-
-        if (newFeaturesAdded > 0) {
-            updateMapData();
-        }
-    } catch (err) {
-        console.error('Error fetching viewport data:', err);
-    } finally {
-        isFetching = false;
-        loading.style.display = 'none';
-        if (needsRefetch) {
-            needsRefetch = false;
-            setTimeout(() => {
-                fetchAndProcessViewport();
-            }, 100);
-        }
-    }
 }
 
-// Map event listeners
-let fetchDebounceTimer = null;
-function scheduleViewportFetch(delay = 180) {
-    if (isMapMoving || map.isMoving() || isMouseDown || isRightClickDragging) return;
-    clearTimeout(fetchDebounceTimer);
-    fetchDebounceTimer = setTimeout(() => {
-        if (!isMapMoving && !map.isMoving() && !isMouseDown && !isRightClickDragging) {
-            fetchAndProcessViewport();
-        }
-    }, delay);
-}
+map.on('style.load', () => {
+    setupGradeLayers();
+    applyTerrain();
+    updateZoomWarning();
+});
 
 map.on('movestart', () => {
     isMapMoving = true;
@@ -934,51 +798,25 @@ map.on('movestart', () => {
 
 map.on('moveend', () => {
     isMapMoving = false;
-    // Save map coordinates to match planner sync
     localStorage.setItem('last_map_center', JSON.stringify(map.getCenter()));
     localStorage.setItem('last_map_zoom', map.getZoom());
-
-    scheduleViewportFetch(150);
+    updateZoomWarning();
 });
 
-map.on('zoomend', () => {
-    scheduleViewportFetch(150);
-});
+map.on('zoomend', updateZoomWarning);
 
-map.on('idle', () => {
-    if (isMapMoving || map.isMoving() || isMouseDown || isRightClickDragging || map.getZoom() < 11.5 || map.getPitch() > 30) return;
-    if (!map.getSource('carto-streets') || !map.isSourceLoaded('carto-streets')) return;
-
-    // Check if any tile in the current viewport is not yet in loadedTiles
-    const tileZoom = Math.min(14, Math.floor(map.getZoom()));
-    const viewportTileKeys = getTileKeysForBounds(map.getBounds(), tileZoom);
-    const hasUnloaded = viewportTileKeys.some(k => !loadedTiles.has(k));
-    if (hasUnloaded) {
-        scheduleViewportFetch(100);
-    }
-});
-
-map.on('sourcedata', (e) => {
-    if (e.sourceId === 'carto-streets' && map.isSourceLoaded('carto-streets')) {
-        if (isMapMoving || map.isMoving() || isMouseDown || isRightClickDragging || map.getZoom() < 11.5 || map.getPitch() > 30) return;
-        const tileZoom = Math.min(14, Math.floor(map.getZoom()));
-        const viewportTileKeys = getTileKeysForBounds(map.getBounds(), tileZoom);
-        const hasUnloaded = viewportTileKeys.some(k => !loadedTiles.has(k));
-        if (hasUnloaded) {
-            scheduleViewportFetch(100);
-        }
-    }
-});
-
-// Initial fetch
 map.on('load', () => {
-    fetchAndProcessViewport();
+    updateZoomWarning();
+    applyTerrain();
 });
 
 // Settings syncing and interaction handlers
 document.getElementById('theme').addEventListener('change', (e) => {
-    localStorage.setItem('route_theme', e.target.value);
-    if (e.target.value === 'light') {
+    const val = e.target.value;
+    localStorage.setItem('route_theme', val);
+    if (window.applyAppTheme) {
+        window.applyAppTheme(val);
+    } else if (val === 'light') {
         document.body.classList.add('light-mode');
     } else {
         document.body.classList.remove('light-mode');
@@ -1004,40 +842,55 @@ document.getElementById('projection').addEventListener('change', (e) => {
 
 
 
-// Terrain switcher
-function applyTerrain() {
-    const val = document.getElementById('hillshade-select')?.value || 'off';
+// Terrain & Hillshade switcher (3D terrain automatically activates when pitch > 5 deg)
+function sync3DTerrainFromPitch(forceUpdate = false) {
+    if (!map || !map.getSource('terrain-source')) return;
     const exInput = document.getElementById('terrain-exaggeration');
+    let exVal = parseFloat(exInput?.value);
+    if (isNaN(exVal)) exVal = 1.7;
 
-    localStorage.setItem('route_hillshade', val);
-    let exVal = parseFloat(exInput.value);
-    if (isNaN(exVal)) exVal = 2.0;
-    localStorage.setItem('route_exaggeration', exVal);
-
-    if (!map.getLayer('hillshade-layer') || !map.getSource('terrain-source')) return;
-
-    if (val === 'off') {
-        map.setLayoutProperty('hillshade-layer', 'visibility', 'none');
-        if (map.getTerrain()) map.setTerrain(null);
-    } else if (val === 'hillshade') {
-        map.setLayoutProperty('hillshade-layer', 'visibility', 'visible');
-        map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', 0.5);
-        if (map.getTerrain()) map.setTerrain(null);
-    } else if (val === 'terrain') {
-        // Keep hillshade visible along with 3D terrain using separate sources to prevent warnings
-        map.setLayoutProperty('hillshade-layer', 'visibility', 'visible');
-        map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', 0.5);
+    const shouldEnable = map.getPitch() > 5;
+    const hasTerrain = Boolean(map.getTerrain());
+    if (shouldEnable && (!hasTerrain || forceUpdate)) {
         map.setTerrain({ source: 'terrain-source', exaggeration: exVal });
+    } else if (!shouldEnable && hasTerrain) {
+        map.setTerrain(null);
     }
 }
 
-document.getElementById('hillshade-select')?.addEventListener('change', applyTerrain);
+function applyTerrain() {
+    const hillshadeCheck = document.getElementById('hillshade-check');
+    const isHillshadeOn = hillshadeCheck ? hillshadeCheck.checked : false;
+    const exInput = document.getElementById('terrain-exaggeration');
+
+    localStorage.setItem('route_hillshade', isHillshadeOn ? 'hillshade' : 'off');
+    let exVal = parseFloat(exInput?.value);
+    if (isNaN(exVal)) exVal = 1.7;
+    localStorage.setItem('route_exaggeration', exVal);
+
+    if (map.getLayer('hillshade-layer')) {
+        if (isHillshadeOn) {
+            map.setLayoutProperty('hillshade-layer', 'visibility', 'visible');
+            map.setPaintProperty('hillshade-layer', 'hillshade-exaggeration', 0.5);
+        } else {
+            map.setLayoutProperty('hillshade-layer', 'visibility', 'none');
+        }
+    }
+
+    sync3DTerrainFromPitch(true);
+}
+
+document.getElementById('hillshade-check')?.addEventListener('change', applyTerrain);
 document.getElementById('terrain-exaggeration')?.addEventListener('change', applyTerrain);
+map.on('pitch', () => sync3DTerrainFromPitch(false));
+map.on('pitchend', () => sync3DTerrainFromPitch(false));
 
 // Sync settings UI on load
 const storedTheme = localStorage.getItem('route_theme') || 'dark';
 document.getElementById('theme').value = storedTheme;
-if (storedTheme === 'light') {
+if (window.applyAppTheme) {
+    window.applyAppTheme(storedTheme);
+} else if (storedTheme === 'light') {
     document.body.classList.add('light-mode');
 } else {
     document.body.classList.remove('light-mode');
@@ -1053,13 +906,22 @@ document.getElementById('projection').value = storedProjection;
 
 // Sync terrain settings on load
 const storedHillshade = localStorage.getItem('route_hillshade') || 'off';
-if (document.getElementById('hillshade-select')) {
-    document.getElementById('hillshade-select').value = storedHillshade;
+if (document.getElementById('hillshade-check')) {
+    document.getElementById('hillshade-check').checked = (storedHillshade === 'hillshade' || storedHillshade === 'terrain' || storedHillshade === 'true');
 }
-const storedExaggeration = localStorage.getItem('route_exaggeration') || '2.0';
+const storedExaggeration = localStorage.getItem('route_exaggeration') || '1.7';
 if (document.getElementById('terrain-exaggeration')) {
     document.getElementById('terrain-exaggeration').value = storedExaggeration;
 }
+
+// Compass reset & needle rotation
+document.getElementById('reset-orientation-btn')?.addEventListener('click', () => {
+    map.easeTo({ bearing: 0, pitch: 0, duration: 300 });
+});
+map.on('rotate', () => {
+    const compass = document.getElementById('compass-needle-svg');
+    if (compass) compass.style.transform = `rotate(${-map.getBearing()}deg)`;
+});
 
 // User location marker & tracking
 let userLocationMarker = null;
@@ -1085,29 +947,40 @@ function updateUserLocationPin() {
     if (!("geolocation" in navigator)) return;
 
     if (userLocationWatchId === null) {
+        const handlePos = (pos) => {
+            const lngLat = [pos.coords.longitude, pos.coords.latitude];
+            if (!userLocationMarker) {
+                const el = document.createElement('div');
+                el.style.width = '20px';
+                el.style.height = '20px';
+                el.style.backgroundColor = '#3b82f6';
+                el.style.border = '3px solid #ffffff';
+                el.style.borderRadius = '50%';
+                el.style.boxShadow = '0 0 6px rgba(0,0,0,0.4), 0 0 0 4px rgba(59, 130, 246, 0.4)';
+                el.style.cursor = 'default';
+                userLocationMarker = new maplibregl.Marker({ element: el, anchor: 'center' })
+                    .setLngLat(lngLat)
+                    .addTo(map);
+            } else {
+                userLocationMarker.setLngLat(lngLat);
+            }
+        };
+        navigator.geolocation.getCurrentPosition(handlePos, () => {}, { enableHighAccuracy: false, maximumAge: 30000, timeout: 5000 });
         userLocationWatchId = navigator.geolocation.watchPosition(
-            (pos) => {
-                const lngLat = [pos.coords.longitude, pos.coords.latitude];
-                if (!userLocationMarker) {
-                    const el = document.createElement('div');
-                    el.style.width = '20px';
-                    el.style.height = '20px';
-                    el.style.backgroundColor = '#3b82f6';
-                    el.style.border = '3px solid #ffffff';
-                    el.style.borderRadius = '50%';
-                    el.style.boxShadow = '0 0 6px rgba(0,0,0,0.4), 0 0 0 4px rgba(59, 130, 246, 0.4)';
-                    el.style.cursor = 'default';
-                    userLocationMarker = new maplibregl.Marker({ element: el, anchor: 'center' })
-                        .setLngLat(lngLat)
-                        .addTo(map);
-                } else {
-                    userLocationMarker.setLngLat(lngLat);
-                }
-            },
+            handlePos,
             () => {},
-            { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+            { enableHighAccuracy: true, timeout: 10000, maximumAge: 10000 }
         );
     }
+}
+
+// Sync Show My Location checkbox with main page & attach listener
+const storedShowLocation = localStorage.getItem('route_show_location_check');
+const showLocCheckEl = document.getElementById('show-location-check');
+if (showLocCheckEl) {
+    showLocCheckEl.checked = storedShowLocation !== null ? storedShowLocation === 'true' : true;
+    showLocCheckEl.addEventListener('change', updateUserLocationPin);
+    updateUserLocationPin();
 }
 
 function requestLocation(fly = true) {
@@ -1162,13 +1035,17 @@ function requestLocation(fly = true) {
     );
 }
 
-// Hook up current location button & setting
-document.getElementById('current-location-btn')?.addEventListener('click', () => requestLocation(true));
-const locationCheck = document.getElementById('show-location-check');
-if (locationCheck) {
-    const savedLoc = localStorage.getItem('route_show_location_check');
-    locationCheck.checked = savedLoc !== 'false'; // default on if supported
-    locationCheck.addEventListener('change', updateUserLocationPin);
-    updateUserLocationPin();
+// Dynamic Top Bar Height Sync (for perfect positioning of mobile overlays and warnings)
+function syncTopBarHeight() {
+    const topBar = document.getElementById('top-bar');
+    if (topBar) {
+        const height = topBar.getBoundingClientRect().height;
+        document.documentElement.style.setProperty('--top-bar-height', `${height}px`);
+    }
 }
+window.addEventListener('resize', syncTopBarHeight);
+window.addEventListener('orientationchange', syncTopBarHeight);
+syncTopBarHeight();
+setTimeout(syncTopBarHeight, 100);
+setTimeout(syncTopBarHeight, 500);
 

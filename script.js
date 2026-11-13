@@ -685,13 +685,13 @@ function isLeftHandDriving(lng, lat) {
 // both segments so they meet cleanly. Left turns (outside gap) are untouched.
 // Only modifies the display source — currentRouteGeoJSON is never changed.
 function miterInsideCorners(coords) {
-    if (coords.length < 3 || map.getZoom() < 14) {
+    if (coords.length < 3) {
         rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
         displayIndexToRawIndex = coords.map((_, i) => i);
         return coords;
     }
     const pxOffset = getPixelOffset(map.getZoom()) * (isRouteLeftHandDriving ? -1 : 1);
-    if (Math.abs(pxOffset) < 1.0) { // No visible offset at low zooms
+    if (Math.abs(pxOffset) < 0.5) { // No visible offset at very low zooms
         rawIndexToDisplayRange = coords.map((_, i) => [i, i]);
         displayIndexToRawIndex = coords.map((_, i) => i);
         return coords;
@@ -756,18 +756,46 @@ function miterInsideCorners(coords) {
         const isInside = (pxOffset > 0 && d > 0) || (pxOffset < 0 && d < 0);
 
         // Subdivide sharp turns into two smooth sub-bends around p2:
-        // - Inside corners (sharp right turns >= 110°): eliminates inside crossover loops.
+        // - Inside corners (sharp right turns >= 120°): eliminates inside crossover loops.
         // - Outside corners (sharp left turns >= 120°): bridges the acute outside corner seamlessly.
-        // - All turns < 120° (non-sharp left turns and 90° corners): stay completely sharp as untouched single points.
-        const shouldSubdivide = (isInside && Math.abs(d) >= 110 && Math.abs(d) < 170) ||
-            (!isInside && Math.abs(d) >= 120 && Math.abs(d) < 170);
+        // - Normal turns (< 120°, including 90° corners): stay completely sharp as untouched single points.
+        const shouldSubdivide = Math.abs(d) >= 120 && Math.abs(d) < 170;
 
         if (shouldSubdivide) {
             const d1 = haversineDistance(p1, p2);
             const d2 = haversineDistance(p2, p3);
-            const maxMeters = isInside ? Math.max(6 * metersPerPx, distMeters * 1.2) : 3 * metersPerPx;
-            const shift1 = Math.min(maxMeters, d1 * (isInside ? 0.8 : 0.4));
-            const shift2 = Math.min(maxMeters, d2 * (isInside ? 0.8 : 0.4));
+            const halfAngle = Math.abs(d) * Math.PI / 360;
+            const cosHalf = Math.max(0.15, Math.cos(halfAngle));
+            const tanQuarter = Math.tan(halfAngle / 2);
+
+            if (isInside) {
+                const requiredShift = (distMeters + 3 * metersPerPx) * tanQuarter / cosHalf;
+                const shift1 = Math.min(requiredShift, d1 * 0.85);
+                const shift2 = Math.min(requiredShift, d2 * 0.85);
+                const minChordLen = 2 * distMeters * tanQuarter;
+                const chordLen = 2 * Math.min(shift1, shift2) * cosHalf;
+
+                // Only emit the two-point bevel if the resulting segment is long enough
+                // not to invert/fold in MapLibre's line-offset shader; otherwise skip p2.
+                if (chordLen < minChordLen) {
+                    mapping.push([currentLen, currentLen]);
+                    continue;
+                }
+
+                const r1 = d1 > 0 ? shift1 / d1 : 0;
+                const r2 = d2 > 0 ? shift2 / d2 : 0;
+                const mPt1 = [p2[0] - r1 * (p2[0] - p1[0]), p2[1] - r1 * (p2[1] - p1[1])];
+                const mPt2 = [p2[0] + r2 * (p3[0] - p2[0]), p2[1] + r2 * (p3[1] - p2[1])];
+                result.push(mPt1);
+                result.push(mPt2);
+                mapping.push([currentLen, currentLen + 1]);
+                toRaw.push(i, i);
+                continue;
+            }
+
+            const maxMeters = 3 * metersPerPx;
+            const shift1 = Math.min(maxMeters, d1 * 0.4);
+            const shift2 = Math.min(maxMeters, d2 * 0.4);
 
             const r1 = d1 > 0 ? shift1 / d1 : 0;
             const r2 = d2 > 0 ? shift2 / d2 : 0;
@@ -1613,8 +1641,12 @@ function updateDistanceUI() {
     const hasRoute = waypoints.length >= 2;
     const shareBtn = document.getElementById('share-route-btn');
     const dlBtn = document.getElementById('gpx-download-btn');
+    const fitBtn = document.getElementById('fit-route-btn');
+    const revBtn = document.getElementById('reverse-route-btn');
     if (shareBtn) shareBtn.disabled = !hasRoute;
     if (dlBtn) dlBtn.disabled = !hasRoute;
+    if (fitBtn) fitBtn.disabled = waypoints.length < 1;
+    if (revBtn) revBtn.disabled = !hasRoute;
 
     if (!hasRoute) {
         document.getElementById('total-distance').textContent = currentUnits === 'metric' ? '0.00 km' : '0.00 mi';
@@ -2025,7 +2057,7 @@ function setupRouteLayers() {
             layout: {
                 'text-field': ['get', 'label'],
                 'text-size': 13,
-                'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+                'text-font': ['Noto Sans Bold'],
                 'text-allow-overlap': true,
                 'text-ignore-placement': true,
                 'text-offset': [0, -1.2]
@@ -2113,6 +2145,12 @@ map.on('style.load', () => {
         const now = performance.now();
         if (now - _lastDistMarkerUpdate > 32) {
             _lastDistMarkerUpdate = now;
+            const currentZoom = map.getZoom();
+            if (Math.abs(currentZoom - lastRebuildZoom) >= 0.15) {
+                lastRebuildZoom = currentZoom;
+                updateTurnaroundJoins();
+                rebuildMapGradient();
+            }
             updateDistanceMarkers();
         }
     });
@@ -2482,6 +2520,9 @@ function getOffsetScreenPt(ci) {
         ny = (n1y + n2y) / 2;
         const nlen = Math.sqrt(nx * nx + ny * ny) || 1;
         nx /= nlen; ny /= nlen;
+        const dot = nx * n1x + ny * n1y;
+        const miterScale = dot > 0.25 ? Math.min(4, 1 / dot) : 1;
+        nx *= miterScale; ny *= miterScale;
     } else if (p1) {
         const dx = p2.x - p1.x, dy = p2.y - p1.y;
         const len = Math.sqrt(dx * dx + dy * dy) || 1;
@@ -4008,6 +4049,56 @@ async function updateRoute() {
                 });
             }
         });
+        // Also detect U-turns / sharp turns at intermediate waypoint junctions (BRouter routes each segment separately)
+        if (waypointPathIndices && waypointPathIndices.length >= 3 && rawCoords.length >= 3) {
+            for (let w = 1; w < waypointPathIndices.length - 1; w++) {
+                const wpIdx = waypointPathIndices[w];
+                if (wpIdx <= 0 || wpIdx >= rawCoords.length - 1) continue;
+                if (segmentModes[w - 1] === 'transit' || segmentModes[w] === 'transit') continue;
+                if (routeTurnInstructions.some(inst => Math.abs(inst.rawIdx - wpIdx) <= 3)) continue;
+
+                let preIdx = wpIdx;
+                let preDist = 0;
+                while (preIdx > 0 && preDist < 15) {
+                    preDist += haversineDistance(rawCoords[preIdx - 1], rawCoords[preIdx]);
+                    preIdx--;
+                }
+                let postIdx = wpIdx;
+                let postDist = 0;
+                while (postIdx < rawCoords.length - 1 && postDist < 15) {
+                    postDist += haversineDistance(rawCoords[postIdx], rawCoords[postIdx + 1]);
+                    postIdx++;
+                }
+                if (preIdx === wpIdx || postIdx === wpIdx) continue;
+
+                const inBearing = calculateBearing(rawCoords[preIdx], rawCoords[wpIdx]);
+                const outBearing = calculateBearing(rawCoords[wpIdx], rawCoords[postIdx]);
+                const diff = (outBearing - inBearing + 540) % 360 - 180;
+
+                if (Math.abs(diff) >= 160) {
+                    routeTurnInstructions.push({
+                        rawIdx: wpIdx,
+                        coord: rawCoords[wpIdx],
+                        type: diff < 0 ? 'u-turn-left' : 'u-turn-right',
+                        text: diff < 0 ? 'Make a U-turn to the left' : 'Make a U-turn to the right',
+                        icon: diff < 0 ? 'uturn-left' : 'uturn-right',
+                        isIntersection: true
+                    });
+                } else if (Math.abs(diff) >= 55) {
+                    const isSharp = Math.abs(diff) >= 105;
+                    const isRight = diff > 0;
+                    routeTurnInstructions.push({
+                        rawIdx: wpIdx,
+                        coord: rawCoords[wpIdx],
+                        type: isSharp ? (isRight ? 'sharp-right' : 'sharp-left') : (isRight ? 'turn-right' : 'turn-left'),
+                        text: isSharp ? (isRight ? 'Turn sharp right' : 'Turn sharp left') : (isRight ? 'Turn right' : 'Turn left'),
+                        icon: isSharp ? (isRight ? 'sharp-right' : 'sharp-left') : (isRight ? 'right' : 'left'),
+                        isIntersection: true
+                    });
+                }
+            }
+        }
+
         routeTurnInstructions.sort((a, b) => a.rawIdx - b.rawIdx);
     }
 
@@ -4216,7 +4307,7 @@ function fitBoundsSmart(bounds, extraOptions = {}) {
 
     const padding = getFitBoundsPadding();
     if (is3D) {
-        const exaggeration = typeof getTerrainExaggeration === 'function' ? getTerrainExaggeration() : 2.0;
+        const exaggeration = typeof getTerrainExaggeration === 'function' ? getTerrainExaggeration() : 1.7;
         const extraPad = Math.round(35 * exaggeration);
         padding.top += extraPad;
         padding.bottom += extraPad;
@@ -4232,7 +4323,7 @@ function fitBoundsSmart(bounds, extraOptions = {}) {
     };
 
     if (is3D) {
-        const exaggeration = typeof getTerrainExaggeration === 'function' ? getTerrainExaggeration() : 2.0;
+        const exaggeration = typeof getTerrainExaggeration === 'function' ? getTerrainExaggeration() : 1.7;
         const maxZoom3D = Math.max(10, 16.0 - (exaggeration * 0.5));
         if (!options.maxZoom || options.maxZoom > maxZoom3D) {
             options.maxZoom = maxZoom3D;
@@ -5627,14 +5718,15 @@ function refreshMarkerPositions() {
 function sync3DTerrainFromPitch() {
     if (!map.getSource('terrain-source')) return;
     const exInput = document.getElementById('terrain-exaggeration');
-    let exVal = parseFloat(exInput ? exInput.value : 2.0);
-    if (isNaN(exVal)) exVal = 2.0;
+    let exVal = parseFloat(exInput ? exInput.value : 1.7);
+    if (isNaN(exVal)) exVal = 1.7;
 
     const shouldEnable = map.getPitch() > 5;
     const hasTerrain = Boolean(map.getTerrain());
     if (shouldEnable && !hasTerrain) {
         map.setTerrain({ source: 'terrain-source', exaggeration: exVal });
         refreshMarkerPositions();
+        setTimeout(refreshMarkerPositions, 250);
     } else if (!shouldEnable && hasTerrain) {
         map.setTerrain(null);
         refreshMarkerPositions();
@@ -5647,8 +5739,8 @@ function applyTerrain() {
     const exInput = document.getElementById('terrain-exaggeration');
 
     localStorage.setItem('route_hillshade', val);
-    let exVal = parseFloat(exInput ? exInput.value : 2.0);
-    if (isNaN(exVal)) exVal = 2.0;
+    let exVal = parseFloat(exInput ? exInput.value : 1.7);
+    if (isNaN(exVal)) exVal = 1.7;
     localStorage.setItem('route_exaggeration', exVal);
 
     // Guard: layers may not exist yet if called before map.on('load') completes
@@ -5979,7 +6071,7 @@ async function updateStatsUI(totalGainM, totalLossM, minElev, maxElev, smoothedS
             if (!map || !map.getTerrain()) return 1.0;
             const exInput = document.getElementById('terrain-exaggeration');
             const stored = localStorage.getItem('route_exaggeration');
-            const val = parseFloat(stored || (exInput ? exInput.value : '2.0'));
+            const val = parseFloat(stored || (exInput ? exInput.value : '1.7'));
             return (isNaN(val) || val < 0) ? 1.0 : val;
         }
 
@@ -7696,6 +7788,18 @@ if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App
             }
         }
     });
+
+    window.Capacitor.Plugins.App.addListener('backButton', ({ canGoBack }) => {
+        if (typeof undoStack !== 'undefined' && undoStack.length > 0) {
+            undo();
+            return;
+        }
+        if (canGoBack) {
+            window.history.back();
+        } else if (window.Capacitor.Plugins.App.minimizeApp) {
+            window.Capacitor.Plugins.App.minimizeApp();
+        }
+    });
 }
 
 function removeInitialCover() {
@@ -8687,7 +8791,7 @@ function offsetLngLat(lngLat, bearingDeg, distMeters) {
 }
 
 // Determine upcoming turn instruction ahead along route (alerting only at real intersection turns)
-function getUpcomingTurn(coords, fromIndex, maxLookaheadMeters = 500) {
+function getUpcomingTurn(coords, fromIndex, maxLookaheadMeters = Infinity) {
     if (!coords || fromIndex >= coords.length - 2) {
         return {
             type: 'arrive',
@@ -8778,11 +8882,11 @@ function getUpcomingTurn(coords, fromIndex, maxLookaheadMeters = 500) {
             }
         }
         return {
-            type: 'straight',
-            text: 'Continue on current route',
-            distMeters: 0,
-            icon: 'straight',
-            turnIndex: -1,
+            type: 'arrive',
+            text: 'Head to destination',
+            distMeters: totalDistToEnd,
+            icon: 'flag',
+            turnIndex: coords.length - 1,
             isIntersection: false
         };
     }
@@ -8873,11 +8977,11 @@ function getUpcomingTurn(coords, fromIndex, maxLookaheadMeters = 500) {
             let icon = 'right';
             let text = 'Turn right';
 
-            if (finalDiff >= 140) {
+            if (finalDiff >= 160) {
                 type = 'u-turn-right';
                 icon = 'uturn-right';
                 text = 'Make a U-turn to the right';
-            } else if (finalDiff <= -140) {
+            } else if (finalDiff <= -160) {
                 type = 'u-turn-left';
                 icon = 'uturn-left';
                 text = 'Make a U-turn to the left';
@@ -8916,11 +9020,11 @@ function getUpcomingTurn(coords, fromIndex, maxLookaheadMeters = 500) {
     }
 
     return {
-        type: 'straight',
-        text: 'Continue on current route',
-        distMeters: accumDist,
-        icon: 'straight',
-        turnIndex: -1,
+        type: 'arrive',
+        text: 'Head to destination',
+        distMeters: totalDistToEnd,
+        icon: 'flag',
+        turnIndex: coords.length - 1,
         isIntersection: false
     };
 }
@@ -9012,6 +9116,8 @@ let liveNavLastRouteIndex = null;
 let liveNavAccumGainMeters = 0;
 let liveNavAccumLossMeters = 0;
 let wasNavOffRoute = false;
+let isFirstNavGpsFix = false;
+let navLookaheadScale = 1.0;
 let cumulativeRouteGain = null;
 let liveNavTransitSegIndex = null;
 
@@ -9147,7 +9253,7 @@ function updateNavigationHUD(pos) {
     if (!isInitialNavCameraSet) {
         const savedZoom = parseFloat(localStorage.getItem('nav_user_zoom'));
         const savedPitch = parseFloat(localStorage.getItem('nav_user_pitch'));
-        targetZoom = (!isNaN(savedZoom) && savedZoom >= 10 && savedZoom <= 22) ? savedZoom : 17.5;
+        targetZoom = (!isNaN(savedZoom) && savedZoom >= 10 && savedZoom <= 22) ? savedZoom : 18.5;
         targetPitch = (!isNaN(savedPitch) && savedPitch >= 0 && savedPitch <= 85) ? savedPitch : 58;
         isInitialNavCameraSet = true;
     }
@@ -9165,9 +9271,42 @@ function updateNavigationHUD(pos) {
     // Only ease camera if user is not actively touching or adjusting zoom/pitch
     if (!isUserInteracting) {
         const latRad = gpsLngLat[1] * Math.PI / 180;
-        const metersPerPixel = (156543.03392 * Math.cos(latRad)) / Math.pow(2, targetZoom);
-        // Lookahead forward along heading so rider sits ~1/3 of the way up from screen bottom
-        const lookaheadMeters = metersPerPixel * 105;
+        // MapLibre uses 512px virtual tiles (78271.51696 m/px at equator zoom 0)
+        const metersPerPixel = (78271.51696 * Math.cos(latRad)) / Math.pow(2, targetZoom);
+        const mapHeight = map.getContainer()?.clientHeight || window.innerHeight || 700;
+        const targetOffsetPx = Math.min(150, Math.max(85, Math.round(mapHeight * 0.16)));
+        const pitchRad = (Math.min(75, Math.max(0, targetPitch)) * Math.PI) / 180;
+        let lookaheadMeters = metersPerPixel * targetOffsetPx * (1 + 0.45 * Math.sin(pitchRad));
+
+        // With centerClampedToGround: false, camera center is at z=0 while the dot sits at terrain height h.
+        // Add a bounded terrain-height offset, then use closed-loop screen projection to keep the dot in the lower third.
+        if (map.getTerrain && map.getTerrain() && targetPitch > 5) {
+            let effectiveHeight = (typeof map.queryTerrainElevation === 'function') ? map.queryTerrainElevation(gpsLngLat) : null;
+            if (effectiveHeight == null || isNaN(effectiveHeight)) {
+                const rawAlt = (pos.coords.altitude != null && !isNaN(pos.coords.altitude)) ? pos.coords.altitude : 0;
+                const exVal = parseFloat(document.getElementById('terrain-exaggeration')?.value) || 1.7;
+                effectiveHeight = rawAlt * exVal;
+            }
+            const cameraAltApprox = metersPerPixel * mapHeight * 1.54 * Math.max(0.25, Math.cos(pitchRad));
+            const elevShift = Math.min(cameraAltApprox * 0.45, Math.max(0, effectiveHeight) * Math.tan(pitchRad) * 0.5);
+            lookaheadMeters += elevShift;
+        }
+
+        if (isInitialNavCameraSet && Math.abs((map.getPitch() || 0) - targetPitch) < 3 && typeof map.project === 'function') {
+            try {
+                const proj = map.project(gpsLngLat);
+                if (proj && isFinite(proj.y)) {
+                    const desiredY = mapHeight * 0.66;
+                    const errPx = proj.y - desiredY;
+                    if (Math.abs(errPx) > 12) {
+                        const factor = Math.max(0.75, Math.min(1.25, 1 - (errPx / mapHeight) * 0.8));
+                        navLookaheadScale = Math.max(0.25, Math.min(2.2, navLookaheadScale * factor));
+                    }
+                }
+            } catch (_) {}
+        }
+
+        lookaheadMeters *= navLookaheadScale;
         const cameraTarget = offsetLngLat(gpsLngLat, heading, lookaheadMeters);
 
         map.easeTo({
@@ -9422,12 +9561,12 @@ function updateNavigationHUD(pos) {
         if (instructionEl) instructionEl.textContent = "Off route";
         if (distEl) distEl.textContent = `${distBackStr} to route`;
 
-        // Long buzz vibration once upon transitioning to off-route
+        // Long buzz vibration once upon transitioning to off-route (skip if navigation started already off-route)
         if (!wasNavOffRoute) {
             wasNavOffRoute = true;
             const vibrationCheck = document.getElementById('nav-vibration-check');
             const isVibrationEnabled = vibrationCheck ? vibrationCheck.checked : true;
-            if (isVibrationEnabled) {
+            if (!isFirstNavGpsFix && isVibrationEnabled) {
                 if (window.AndroidMaterialTheme?.vibratePhone) {
                     window.AndroidMaterialTheme.vibratePhone(1000); // 1000ms distinct long buzz
                 } else if (navigator.vibrate) {
@@ -9484,22 +9623,26 @@ function updateNavigationHUD(pos) {
             }
         }
 
-        // Turn Vibration: Vibrate ONLY when approaching an actual intersection turn (< 40m) if toggle is on
+        // Turn Vibration: Vibrate ONLY when approaching an actual intersection turn (< 40m) if toggle is on (skip if started already at turn/end)
         const vibrationCheck = document.getElementById('nav-vibration-check');
         const isVibrationEnabled = vibrationCheck ? vibrationCheck.checked : true;
         const isRealIntersectionTurn = turn.isIntersection && ['turn-right', 'turn-left', 'sharp-right', 'sharp-left', 'u-turn-right', 'u-turn-left', 'roundabout'].includes(turn.type);
-        if (isVibrationEnabled && turn.distMeters <= 40 && lastVibratedTurnIndex !== turn.turnIndex && isRealIntersectionTurn) {
+        if (turn.distMeters <= 40 && lastVibratedTurnIndex !== turn.turnIndex && isRealIntersectionTurn) {
             lastVibratedTurnIndex = turn.turnIndex;
-            if (window.AndroidMaterialTheme?.vibratePhone) {
-                window.AndroidMaterialTheme.vibratePhone(400);
-            } else if (navigator.vibrate) {
-                navigator.vibrate([200, 100, 200]);
+            if (!isFirstNavGpsFix && isVibrationEnabled) {
+                if (window.AndroidMaterialTheme?.vibratePhone) {
+                    window.AndroidMaterialTheme.vibratePhone(400);
+                } else if (navigator.vibrate) {
+                    navigator.vibrate([200, 100, 200]);
+                }
             }
         }
 
         // Persistent background notification
         window.AndroidMaterialTheme?.updateNavNotification?.(turn.text, notifDistText);
     }
+
+    isFirstNavGpsFix = false;
 
     // While routing, display live rider telemetry in top-right of elevation profile header (dist, elev, grade)
     if (currentHoverDispDist === null) {
@@ -9546,6 +9689,8 @@ function startLiveNavigation() {
     liveNavAccumGainMeters = 0;
     liveNavAccumLossMeters = 0;
     wasNavOffRoute = false;
+    isFirstNavGpsFix = true;
+    navLookaheadScale = 1.0;
     document.body.classList.add('routing-active');
 
     // Enable zooming and tilting up/down, but prevent moving around (pan) or manual rotation
@@ -9726,6 +9871,8 @@ function stopLiveNavigation() {
     liveNavAccumGainMeters = 0;
     liveNavAccumLossMeters = 0;
     wasNavOffRoute = false;
+    isFirstNavGpsFix = false;
+    navLookaheadScale = 1.0;
 }
 
 function toggleLiveNavigation() {
@@ -9761,12 +9908,15 @@ if (mapCanvas) {
     const onTouchStart = () => {
         isUserTouchingMap = true;
         if (userTouchTimeout) clearTimeout(userTouchTimeout);
+        if (isLiveNavActive && typeof map.stop === 'function') {
+            map.stop();
+        }
     };
     const onTouchEnd = () => {
         if (userTouchTimeout) clearTimeout(userTouchTimeout);
         userTouchTimeout = setTimeout(() => {
             isUserTouchingMap = false;
-        }, 300);
+        }, 500);
     };
     mapCanvas.addEventListener('touchstart', onTouchStart, { passive: true });
     mapCanvas.addEventListener('touchend', onTouchEnd, { passive: true });

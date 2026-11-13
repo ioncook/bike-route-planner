@@ -4,6 +4,188 @@
 // Supports Mapbox Terrain-RGB (high-res) and Mapzen Terrarium (fallback).
 
 const tilePixelCache = new Map();
+const inFlightTilePromises = new Map();
+
+async function fetchDemTile(key) {
+    if (tilePixelCache.has(key)) {
+        return tilePixelCache.get(key);
+    }
+    if (inFlightTilePromises.has(key)) {
+        return inFlightTilePromises.get(key);
+    }
+    const promise = (async () => {
+        let data = null;
+        const format = 'terrarium';
+        try {
+            const mzRes = await fetch(`https://elevation-tiles-prod.s3.amazonaws.com/terrarium/${key}.png`);
+            if (mzRes.ok) {
+                const blob = await mzRes.blob();
+                const img = await createImageBitmap(blob);
+                const canvas = new OffscreenCanvas(256, 256);
+                const ctx = canvas.getContext('2d', { willReadFrequently: true });
+                ctx.drawImage(img, 0, 0);
+                data = ctx.getImageData(0, 0, 256, 256).data;
+            }
+        } catch (_) { }
+        if (data) {
+            const entry = { data, format };
+            tilePixelCache.set(key, entry);
+            return entry;
+        }
+        return null;
+    })();
+    inFlightTilePromises.set(key, promise);
+    try {
+        return await promise;
+    } finally {
+        inFlightTilePromises.delete(key);
+    }
+}
+
+let gradeMvtDepsPromise = null;
+function getGradeMvtDeps() {
+    if (!gradeMvtDepsPromise) {
+        gradeMvtDepsPromise = Promise.all([
+            import('https://cdn.jsdelivr.net/npm/pbf@4.0.1/+esm'),
+            import('https://cdn.jsdelivr.net/npm/@mapbox/vector-tile@2.0.3/+esm'),
+            import('https://cdn.jsdelivr.net/npm/geojson-vt@3.2.1/+esm'),
+            import('https://cdn.jsdelivr.net/npm/vt-pbf@3.1.3/+esm')
+        ]).then(([pbfMod, vtMod, gjvtMod, vtpbfMod]) => ({
+            Pbf: pbfMod.default || pbfMod,
+            VectorTile: vtMod.VectorTile,
+            geojsonvt: gjvtMod.default || gjvtMod,
+            fromGeojsonVt: vtpbfMod.fromGeojsonVt
+        }));
+    }
+    return gradeMvtDepsPromise;
+}
+
+// Pre-warm MVT dependencies immediately when the worker starts
+getGradeMvtDeps().catch(() => {
+    gradeMvtDepsPromise = null;
+});
+
+function isRideableCartoRoad(props) {
+    if (!props) return false;
+    const cls = props.class || '';
+    const sub = props.subclass || '';
+    if (['rail', 'transit', 'subway', 'ferry', 'aerialway', 'raceway'].includes(cls) || ['rail', 'subway', 'tram'].includes(sub)) {
+        return false;
+    }
+    const allowedClasses = ['motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'minor', 'residential', 'living_street', 'unclassified'];
+    if (allowedClasses.includes(cls)) return true;
+    if (sub === 'cycleway') return true;
+    if (['yes', 'designated', 'permissive'].includes(props.bicycle)) return true;
+    return false;
+}
+
+function buildSpatialNameIndex(nameFeatures) {
+    const entries = [];
+    if (!nameFeatures || nameFeatures.length === 0) return entries;
+
+    for (const f of nameFeatures) {
+        const props = f.properties;
+        if (!props) continue;
+        const name = props.name || props.name_en || '';
+        const ref = props.ref || '';
+        if (!name && !ref) continue;
+
+        let displayName = name;
+        if (ref) {
+            if (!displayName) displayName = ref;
+            else if (!displayName.includes(ref)) displayName = `${displayName} (${ref})`;
+        }
+
+        const geom = f.geometry;
+        if (!geom) continue;
+        const parts = geom.type === 'LineString' ? [geom.coordinates] : (geom.type === 'MultiLineString' ? geom.coordinates : []);
+
+        for (const part of parts) {
+            if (part.length < 2) continue;
+            let minLon = Infinity, minLat = Infinity, maxLon = -Infinity, maxLat = -Infinity;
+            for (const pt of part) {
+                if (pt[0] < minLon) minLon = pt[0];
+                if (pt[0] > maxLon) maxLon = pt[0];
+                if (pt[1] < minLat) minLat = pt[1];
+                if (pt[1] > maxLat) maxLat = pt[1];
+            }
+            entries.push({
+                name: displayName,
+                coords: part,
+                minLon, minLat, maxLon, maxLat
+            });
+        }
+    }
+    return entries;
+}
+
+function matchStreetNameInMemory(roadCoords, nameEntries) {
+    if (!roadCoords || roadCoords.length < 2 || !nameEntries || nameEntries.length === 0) return '';
+
+    const midIdx = Math.floor((roadCoords.length - 1) * 0.5);
+    const mid = roadCoords[midIdx];
+    if (!mid) return '';
+    const midLon = mid[0], midLat = mid[1];
+
+    const tA = roadCoords[Math.max(0, midIdx - 1)];
+    const tB = roadCoords[Math.min(roadCoords.length - 1, midIdx + 1)];
+    const rdx = tB[0] - tA[0];
+    const rdy = (tB[1] - tA[1]) * 1.27;
+    const rlen = Math.hypot(rdx, rdy);
+
+    const pad = 0.00065;
+
+    let bestScore = Infinity;
+    let bestName = '';
+
+    for (const entry of nameEntries) {
+        if (midLon < entry.minLon - pad || midLon > entry.maxLon + pad ||
+            midLat < entry.minLat - pad || midLat > entry.maxLat + pad) {
+            continue;
+        }
+
+        const coords = entry.coords;
+        for (let i = 0; i < coords.length - 1; i++) {
+            const a = coords[i];
+            const b = coords[i + 1];
+            const cdx = b[0] - a[0];
+            const cdy = (b[1] - a[1]) * 1.27;
+            const clen = Math.hypot(cdx, cdy);
+            const l2 = cdx * cdx + cdy * cdy;
+
+            let distMeters;
+            if (l2 === 0) {
+                distMeters = Math.hypot((midLon - a[0]) * 85000, (midLat - a[1]) * 111000);
+            } else {
+                let t = ((midLon - a[0]) * cdx + (midLat - a[1]) * 1.27 * cdy) / l2;
+                t = Math.max(0, Math.min(1, t));
+                const projLon = a[0] + t * (b[0] - a[0]);
+                const projLat = a[1] + t * (b[1] - a[1]);
+                distMeters = Math.hypot((midLon - projLon) * 85000, (midLat - projLat) * 111000);
+            }
+
+            if (distMeters > 40) continue;
+
+            let alignmentPenalty = 0;
+            if (rlen > 0.00002 && clen > 0.00002) {
+                const cosTheta = Math.abs(rdx * cdx + rdy * cdy) / (rlen * clen);
+                if (cosTheta < 0.35) {
+                    alignmentPenalty = 14;
+                } else if (cosTheta > 0.75) {
+                    alignmentPenalty = -5;
+                }
+            }
+
+            const score = distMeters + alignmentPenalty;
+            if (score < bestScore) {
+                bestScore = score;
+                bestName = entry.name;
+            }
+        }
+    }
+
+    return (bestScore < 34) ? bestName : '';
+}
 
 function lngLatToTilePixel(lng, lat, zoom) {
     const n = Math.pow(2, zoom);
@@ -232,70 +414,47 @@ function splitWayIntoSegments(coords, wayId, maxLen = 80.0) {
     return segments;
 }
 
-self.onmessage = async (e) => {
-    const { id, type } = e.data;
-    const zoom = 15;
+async function computeWaysGrades(ways, zoom = 15) {
+    const uniqueCoordsMap = new Map();
+    const uniqueCoordsArray = [];
+    const getCoordKey = (coord) => `${coord[0].toFixed(6)},${coord[1].toFixed(6)}`;
 
-    if (type === 'process-grade-ways') {
-        const { ways } = e.data;
-        const uniqueCoordsMap = new Map();
-        const uniqueCoordsArray = [];
-        const getCoordKey = (coord) => `${coord[0].toFixed(6)},${coord[1].toFixed(6)}`;
-
-        // Densify coordinates and gather unique coordinates
-        for (const wayItem of ways) {
-            wayItem.denseCoords = densifyCoords(wayItem.geomCoords, 15.0);
-            for (const coord of wayItem.denseCoords) {
-                const key = getCoordKey(coord);
-                if (!uniqueCoordsMap.has(key)) {
-                    uniqueCoordsMap.set(key, uniqueCoordsArray.length);
-                    uniqueCoordsArray.push(coord);
-                }
+    // Densify coordinates and gather unique coordinates
+    for (const wayItem of ways) {
+        wayItem.denseCoords = densifyCoords(wayItem.geomCoords, 15.0);
+        for (const coord of wayItem.denseCoords) {
+            const key = getCoordKey(coord);
+            if (!uniqueCoordsMap.has(key)) {
+                uniqueCoordsMap.set(key, uniqueCoordsArray.length);
+                uniqueCoordsArray.push(coord);
             }
         }
+    }
 
-        // Determine tiles needed - ensure both primary tile and all potential bilinear neighbors are pre-fetched
-        const tilesNeeded = new Set();
-        for (const coord of uniqueCoordsArray) {
-            const { tileX, tileY, pxX, pxY } = lngLatToTilePixel(coord[0], coord[1], zoom);
-            tilesNeeded.add(`${zoom}/${tileX}/${tileY}`);
-            if (pxX >= 254) tilesNeeded.add(`${zoom}/${tileX + 1}/${tileY}`);
-            if (pxY >= 254) tilesNeeded.add(`${zoom}/${tileX}/${tileY + 1}`);
-            if (pxX >= 254 && pxY >= 254) tilesNeeded.add(`${zoom}/${tileX + 1}/${tileY + 1}`);
+    // Determine tiles needed - ensure both primary tile and all potential bilinear neighbors are pre-fetched
+    const tilesNeeded = new Set();
+    for (const coord of uniqueCoordsArray) {
+        const { tileX, tileY, pxX, pxY } = lngLatToTilePixel(coord[0], coord[1], zoom);
+        tilesNeeded.add(`${zoom}/${tileX}/${tileY}`);
+        if (pxX >= 254) tilesNeeded.add(`${zoom}/${tileX + 1}/${tileY}`);
+        if (pxY >= 254) tilesNeeded.add(`${zoom}/${tileX}/${tileY + 1}`);
+        if (pxX >= 254 && pxY >= 254) tilesNeeded.add(`${zoom}/${tileX + 1}/${tileY + 1}`);
+    }
+
+    // Fetch tiles and cache (deduplicating concurrent fetches)
+    const localCache = new Map();
+    await Promise.all([...tilesNeeded].map(async (key) => {
+        const entry = await fetchDemTile(key);
+        if (entry) {
+            localCache.set(key, entry);
         }
+    }));
 
-        // Fetch tiles and cache
-        const localCache = new Map();
-        await Promise.all([...tilesNeeded].map(async (key) => {
-            if (tilePixelCache.has(key)) {
-                localCache.set(key, tilePixelCache.get(key));
-                return;
-            }
-            let data = null;
-            let format = 'terrarium';
-            try {
-                const mzRes = await fetch(`https://elevation-tiles-prod.s3.amazonaws.com/terrarium/${key}.png`);
-                if (mzRes.ok) {
-                    const blob = await mzRes.blob();
-                    const img = await createImageBitmap(blob);
-                    const canvas = new OffscreenCanvas(256, 256);
-                    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-                    ctx.drawImage(img, 0, 0);
-                    data = ctx.getImageData(0, 0, 256, 256).data;
-                }
-            } catch (_) { }
-            if (data) {
-                const entry = { data, format };
-                tilePixelCache.set(key, entry);
-                localCache.set(key, entry);
-            }
-        }));
-
-        // Sample unique elevations
-        const uniqueElevations = new Array(uniqueCoordsArray.length).fill(null);
-        for (let i = 0; i < uniqueCoordsArray.length; i++) {
-            const { tileX, tileY, pxX, pxY } = lngLatToTilePixel(uniqueCoordsArray[i][0], uniqueCoordsArray[i][1], zoom);
-            uniqueElevations[i] = sampleElevationSync(localCache, zoom, tileX, tileY, pxX, pxY);
+    // Sample unique elevations
+    const uniqueElevations = new Array(uniqueCoordsArray.length).fill(null);
+    for (let i = 0; i < uniqueCoordsArray.length; i++) {
+        const { tileX, tileY, pxX, pxY } = lngLatToTilePixel(uniqueCoordsArray[i][0], uniqueCoordsArray[i][1], zoom);
+        uniqueElevations[i] = sampleElevationSync(localCache, zoom, tileX, tileY, pxX, pxY);
         }
 
         // Process ways and compute segments
@@ -396,6 +555,122 @@ self.onmessage = async (e) => {
             });
         }
 
+        return allProcessedSegments;
+}
+
+self.onmessage = async (e) => {
+    const { id, type } = e.data;
+    const zoom = 15;
+
+    if (type === 'build-grade-tile') {
+        const { z, x, y } = e.data;
+        try {
+            const [{ Pbf, VectorTile, geojsonvt, fromGeojsonVt }, resp] = await Promise.all([
+                getGradeMvtDeps(),
+                fetch(`https://tiles.basemaps.cartocdn.com/vectortiles/carto.streets/v1/${z}/${x}/${y}.mvt`)
+            ]);
+
+            if (!resp.ok) {
+                const empty = new ArrayBuffer(0);
+                self.postMessage({ id, type, buffer: empty }, [empty]);
+                return;
+            }
+
+            const buf = await resp.arrayBuffer();
+            const tile = new VectorTile(new Pbf(buf));
+            const transLayer = tile.layers.transportation;
+            if (!transLayer || transLayer.length === 0) {
+                const empty = new ArrayBuffer(0);
+                self.postMessage({ id, type, buffer: empty }, [empty]);
+                return;
+            }
+
+            const nameFeatures = [];
+            const nameLayer = tile.layers.transportation_name;
+            if (nameLayer) {
+                for (let i = 0; i < nameLayer.length; i++) {
+                    nameFeatures.push(nameLayer.feature(i).toGeoJSON(x, y, z));
+                }
+            }
+            const nameEntries = buildSpatialNameIndex(nameFeatures);
+
+            const workerWays = [];
+            const roadNameMap = new Map();
+            const seenTileRoads = new Set();
+
+            for (let i = 0; i < transLayer.length; i++) {
+                const tf = transLayer.feature(i);
+                const props = tf.properties || {};
+                if (!isRideableCartoRoad(props)) continue;
+
+                const geo = tf.toGeoJSON(x, y, z);
+                const geom = geo.geometry;
+                if (!geom) continue;
+
+                const parts = geom.type === 'LineString'
+                    ? [geom.coordinates]
+                    : (geom.type === 'MultiLineString' ? geom.coordinates : []);
+
+                for (let pIdx = 0; pIdx < parts.length; pIdx++) {
+                    const coords = parts[pIdx];
+                    if (!coords || coords.length < 2) continue;
+                    const dedupeKey = `${coords[0][0].toFixed(5)},${coords[0][1].toFixed(5)}_${coords[coords.length - 1][0].toFixed(5)},${coords[coords.length - 1][1].toFixed(5)}`;
+                    if (seenTileRoads.has(dedupeKey)) continue;
+                    seenTileRoads.add(dedupeKey);
+
+                    const wayId = `${z}_${x}_${y}_${i}_${pIdx}`;
+                    const stName = props.name || props.name_en || matchStreetNameInMemory(coords, nameEntries);
+                    roadNameMap.set(wayId, stName);
+                    workerWays.push({ wayId, geomCoords: coords });
+                }
+            }
+
+            if (workerWays.length === 0) {
+                const empty = new ArrayBuffer(0);
+                self.postMessage({ id, type, buffer: empty }, [empty]);
+                return;
+            }
+
+            const processedWays = await computeWaysGrades(workerWays, zoom);
+
+            const features = [];
+            let featSeq = 1;
+            for (const item of processedWays) {
+                const stName = roadNameMap.get(item.wayId) || '';
+                for (const seg of item.segments) {
+                    const coords = seg.coordinates;
+                    if (!coords || coords.length < 2) continue;
+                    features.push({
+                        type: 'Feature',
+                        id: featSeq++,
+                        geometry: { type: 'LineString', coordinates: coords },
+                        properties: {
+                            id: seg.id,
+                            grade: seg.grade,
+                            gradePercent: seg.gradePercent,
+                            name: stName
+                        }
+                    });
+                }
+            }
+
+            const tileIndex = geojsonvt(
+                { type: 'FeatureCollection', features },
+                { maxZoom: 14, indexMaxZoom: 14, indexMaxPoints: 0, extent: 4096, buffer: 64, tolerance: 2 }
+            );
+            const vtTile = tileIndex.getTile(z, x, y);
+            const pbfOut = fromGeojsonVt({ 'grade-roads': vtTile || { features: [] } }, { extent: 4096, version: 2 });
+            const outBuffer = pbfOut.buffer.slice(pbfOut.byteOffset, pbfOut.byteOffset + pbfOut.byteLength);
+            self.postMessage({ id, type, buffer: outBuffer }, [outBuffer]);
+        } catch (err) {
+            self.postMessage({ id, type, error: err && err.message ? err.message : 'Tile error' });
+        }
+        return;
+    }
+
+    if (type === 'process-grade-ways') {
+        const { ways } = e.data;
+        const allProcessedSegments = await computeWaysGrades(ways, zoom);
         self.postMessage({ id, type, processedWays: allProcessedSegments });
         return;
     }
@@ -414,26 +689,8 @@ self.onmessage = async (e) => {
 
     const localCache = new Map();
     await Promise.all([...tilesNeeded].map(async (key) => {
-        if (tilePixelCache.has(key)) {
-            localCache.set(key, tilePixelCache.get(key));
-            return;
-        }
-        let data = null;
-        let format = 'terrarium';
-        try {
-            const mzRes = await fetch(`https://elevation-tiles-prod.s3.amazonaws.com/terrarium/${key}.png`);
-            if (mzRes.ok) {
-                const blob = await mzRes.blob();
-                const img = await createImageBitmap(blob);
-                const canvas = new OffscreenCanvas(256, 256);
-                const ctx = canvas.getContext('2d', { willReadFrequently: true });
-                ctx.drawImage(img, 0, 0);
-                data = ctx.getImageData(0, 0, 256, 256).data;
-            }
-        } catch (_) { }
-        if (data) {
-            const entry = { data, format };
-            tilePixelCache.set(key, entry);
+        const entry = await fetchDemTile(key);
+        if (entry) {
             localCache.set(key, entry);
         }
     }));

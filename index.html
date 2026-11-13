@@ -119,7 +119,7 @@
                         </svg>
                     </button>
                     <div class="icon-btn-divider"></div>
-                    <button id="fit-route-btn" class="icon-btn" title="Fit route (F)" aria-label="Fit route">
+                    <button id="fit-route-btn" class="icon-btn" title="Fit route (F)" aria-label="Fit route" disabled>
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <polyline points="15 3 21 3 21 9" />
@@ -128,8 +128,8 @@
                             <line x1="3" y1="21" x2="10" y2="14" />
                         </svg>
                     </button>
-                    <button id="reverse-route-btn" class="icon-btn" title="Reverse route (V)"
-                        aria-label="Reverse route">
+                    <button id="reverse-route-btn" class="icon-btn" title="Reverse route (V)" aria-label="Reverse route"
+                        disabled>
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <polyline points="17 1 21 5 17 9" />
@@ -307,7 +307,7 @@
                         </div>
                         <div class="setting-row">
                             <span>3D Exaggeration</span>
-                            <input type="number" id="terrain-exaggeration" step="0.1" min="0" max="20" value="2.0"
+                            <input type="number" id="terrain-exaggeration" step="0.1" min="0" max="20" value="1.7"
                                 style="width: 60px; background:var(--bg-panel); color:var(--text-main); border:1px solid var(--border); border-radius:var(--radius-sm, 2px); padding:2px 5px;">
                         </div>
                         <hr style="border:0; border-top: 1px solid var(--border); margin: 8px 0;">
@@ -391,7 +391,7 @@
                         </button>
                         <button id="go-to-grade-map" class="btn btn-secondary"
                             style="width: 100%; font-size: 0.85rem; padding: 8px; margin-top: 5px;"
-                            onclick="window.location.href='grade/index.html'">
+                            onclick="window.location.href='grade'">
                             Go to Grade Map
                         </button>
                     </div>
@@ -492,7 +492,8 @@
                         <div id="live-nav-instruction" class="live-nav-instruction-text">Follow route</div>
                         <div id="live-nav-distance" class="live-nav-distance-text">Starting navigation...</div>
                     </div>
-                    <div id="live-nav-remain-container" class="live-nav-remain-col" title="Trip remaining & estimated arrival">
+                    <div id="live-nav-remain-container" class="live-nav-remain-col"
+                        title="Trip remaining & estimated arrival">
                         <div id="live-nav-remain-top" class="live-nav-remain-top">
                             <span id="nav-top-remain-val">--</span>
                             <span id="nav-top-remain-time" class="live-nav-remain-time"></span>
